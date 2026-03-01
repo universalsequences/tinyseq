@@ -1,0 +1,84 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "AudioGraphExample-arm64-apple-macosx15.0-debug.exe": ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe>"]
+  "AudioGraphExample-arm64-apple-macosx15.0-debug.module": ["<AudioGraphExample-arm64-apple-macosx15.0-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe>","<AudioGraphExample-arm64-apple-macosx15.0-debug.module>"]
+  "test": ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe>","<AudioGraphExample-arm64-apple-macosx15.0-debug.module>"]
+default: "main"
+nodes:
+  "/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/alecresende/code/swift/audiograph/swift_example/audiograph/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample":
+    is-mutated: true
+commands:
+  "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist":
+    tool: write-auxiliary-file
+    inputs: ["<entitlement-plist>","<com.apple.security.get-task-allow>"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist"]
+    description: "Write auxiliary file /Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist"
+
+  "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources"]
+    description: "Write auxiliary file /Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources"
+
+  "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList"
+
+  "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<AudioGraphExample-arm64-apple-macosx15.0-debug.exe>":
+    tool: phony
+    inputs: ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe-CodeSigning>"]
+    outputs: ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe>"]
+
+  "<AudioGraphExample-arm64-apple-macosx15.0-debug.module>":
+    tool: phony
+    inputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule"]
+    outputs: ["<AudioGraphExample-arm64-apple-macosx15.0-debug.module>"]
+
+  "C.AudioGraphExample-arm64-apple-macosx15.0-debug.exe":
+    tool: shell
+    inputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample"]
+    description: "Linking ./.build/arm64-apple-macosx/debug/AudioGraphExample"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug","-o","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample","-module-name","AudioGraphExample","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-alias","-Xlinker","_AudioGraphExample_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList","-Xlinker","-rpath","-Xlinker","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx","-target","arm64-apple-macosx10.15","-laudiograph","-L","./audiograph","-Xlinker","-rpath","-Xlinker","./audiograph","-Xlinker","-add_ast_path","-Xlinker","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "C.AudioGraphExample-arm64-apple-macosx15.0-debug.exe-entitlements":
+    tool: shell
+    inputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist"]
+    outputs: ["<AudioGraphExample-arm64-apple-macosx15.0-debug.exe-CodeSigning>"]
+    description: "Applying debug entitlements to ./.build/arm64-apple-macosx/debug/AudioGraphExample"
+    args: ["codesign","--force","--sign","-","--entitlements","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample"]
+
+  "C.AudioGraphExample-arm64-apple-macosx15.0-debug.module":
+    tool: shell
+    inputs: ["/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources"]
+    outputs: ["/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule"]
+    description: "Compiling Swift Module 'AudioGraphExample' (1 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","AudioGraphExample","-emit-dependencies","-emit-module","-emit-module-path","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule","-output-file-map","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/output-file-map.json","-incremental","-c","@/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources","-I","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx10.15","-enable-batch-mode","-index-store-path","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j10","-DSWIFT_PACKAGE","-DDEBUG","-Xcc","-fmodule-map-file=/Users/alecresende/code/swift/audiograph/swift_example/audiograph/module.modulemap","-module-cache-path","/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","AudioGraphExample_main","-color-diagnostics","-swift-version","5","-Xcc","-I/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/audiograph","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","swift_example"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/","/Users/alecresende/code/swift/audiograph/swift_example/audiograph/","/Users/alecresende/code/swift/audiograph/swift_example/Package.swift","/Users/alecresende/code/swift/audiograph/swift_example/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

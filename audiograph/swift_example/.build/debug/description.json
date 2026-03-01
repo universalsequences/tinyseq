@@ -1,0 +1,262 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.AudioGraphExample-arm64-apple-macosx15.0-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources",
+      "importPath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "AudioGraphExample",
+      "moduleOutputPath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule",
+      "objects" : [
+        "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx10.15",
+        "-enable-batch-mode",
+        "-index-store-path",
+        "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-Xcc",
+        "-fmodule-map-file=/Users/alecresende/code/swift/audiograph/swift_example/audiograph/module.modulemap",
+        "-module-cache-path",
+        "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "AudioGraphExample_main",
+        "-color-diagnostics",
+        "-swift-version",
+        "5",
+        "-Xcc",
+        "-I/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/audiograph",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift_example"
+      ],
+      "outputFileMapPath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules/AudioGraphExample.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift"
+      ],
+      "tempsPath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "AudioGraphExample" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "AudioGraphExample",
+      "-package-name",
+      "swift_example",
+      "-incremental",
+      "-c",
+      "/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift",
+      "-I",
+      "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx10.15",
+      "-enable-batch-mode",
+      "-index-store-path",
+      "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-Xcc",
+      "-fmodule-map-file=/Users/alecresende/code/swift/audiograph/swift_example/audiograph/module.modulemap",
+      "-module-cache-path",
+      "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "AudioGraphExample_main",
+      "-color-diagnostics",
+      "-swift-version",
+      "5",
+      "-Xcc",
+      "-I/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/audiograph",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift_example",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "AudioGraphExample" : [
+      "AudioGraph"
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "enableAllTraits" : false
+  },
+  "writeCommands" : {
+    "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample-entitlement.plist"
+    },
+    "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/Sources/AudioGraphExample/main.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/sources"
+    },
+    "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.build/main.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/AudioGraphExample.product/Objects.LinkFileList"
+    },
+    "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/alecresende/code/swift/audiograph/swift_example/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "sequencer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+cpal = "0.15"
+hound = "3.5"
+
+[build-dependencies]
+cc = "1.0"
