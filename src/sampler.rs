@@ -12,7 +12,10 @@ const STATE_VELOCITY: usize = 4;
 const STATE_SPEED: usize = 5;
 const STATE_GATE_SAMPLES: usize = 6; // absolute gate length in samples (computed by audio callback)
 const STATE_TRANSPOSE: usize = 7;
-const SAMPLER_STATE_SIZE: usize = 8;
+const STATE_ATTACK_SAMPLES: usize = 8;  // musical attack in samples
+const STATE_RELEASE_SAMPLES: usize = 9; // musical release in samples
+const STATE_GATE_MODE: usize = 10;      // 1.0=gate on, 0.0=gate off
+const SAMPLER_STATE_SIZE: usize = 11;
 
 // Param indices (match state layout for direct write)
 pub const PARAM_PLAYHEAD: u64 = STATE_PLAYHEAD as u64;
@@ -21,6 +24,9 @@ pub const PARAM_VELOCITY: u64 = STATE_VELOCITY as u64;
 pub const PARAM_SPEED: u64 = STATE_SPEED as u64;
 pub const PARAM_GATE_SAMPLES: u64 = STATE_GATE_SAMPLES as u64;
 pub const PARAM_TRANSPOSE: u64 = STATE_TRANSPOSE as u64;
+pub const PARAM_ATTACK_SAMPLES: u64 = STATE_ATTACK_SAMPLES as u64;
+pub const PARAM_RELEASE_SAMPLES: u64 = STATE_RELEASE_SAMPLES as u64;
+pub const PARAM_GATE_MODE: u64 = STATE_GATE_MODE as u64;
 
 pub struct SamplerTrack {
     pub name: String,
@@ -47,6 +53,9 @@ unsafe extern "C" fn sampler_init(
     *s.add(STATE_SPEED) = 1.0;
     *s.add(STATE_GATE_SAMPLES) = f32::MAX; // ungated by default until first trigger
     *s.add(STATE_TRANSPOSE) = 0.0;
+    *s.add(STATE_ATTACK_SAMPLES) = 0.0;
+    *s.add(STATE_RELEASE_SAMPLES) = 0.0;
+    *s.add(STATE_GATE_MODE) = 1.0; // gate on by default
 }
 
 /// extern "C" process — reads sample data from buffer, writes to output.
@@ -67,6 +76,9 @@ unsafe extern "C" fn sampler_process(
     let speed = *s.add(STATE_SPEED);
     let gate_samples = *s.add(STATE_GATE_SAMPLES);
     let transpose = *s.add(STATE_TRANSPOSE);
+    let musical_attack = *s.add(STATE_ATTACK_SAMPLES);
+    let musical_release = *s.add(STATE_RELEASE_SAMPLES);
+    let gate_mode = *s.add(STATE_GATE_MODE);
 
     let buf_desc = buffers as *const BufferDesc;
     let desc = &*buf_desc.add(buffer_id);
@@ -86,22 +98,30 @@ unsafe extern "C" fn sampler_process(
     // Compute effective playback rate: speed * 2^(transpose/12)
     let effective_rate = speed * (2.0_f32).powf(transpose / 12.0);
 
-    // Gate cutoff: min of gate time and sample end
-    let max_playhead = gate_samples.min(sample_len as f32);
+    // Gate cutoff depends on gate mode
+    let max_playhead = if gate_mode > 0.5 {
+        // Gate ON: respect duration gating
+        gate_samples.min(sample_len as f32)
+    } else {
+        // Gate OFF: play full sample
+        sample_len as f32
+    };
 
     // Amplitude: velocity * gain
     let amplitude = velocity * gain;
 
-    // Envelope: short fade-in/fade-out to avoid clicks (~3ms attack, ~6ms release at 44.1k)
-    const ATTACK_SAMPLES: f32 = 128.0;
-    const RELEASE_SAMPLES: f32 = 256.0;
-    let release_start = (max_playhead - RELEASE_SAMPLES).max(0.0);
+    // Click prevention envelope (always on, hardcoded)
+    const CLICK_ATTACK: f32 = 128.0;
+    const CLICK_RELEASE: f32 = 256.0;
+    let click_release_start = (max_playhead - CLICK_RELEASE).max(0.0);
+
+    // Musical envelope (user-controlled attack/release)
+    let mus_release_start = (max_playhead - musical_release).max(0.0);
 
     for i in 0..nf {
         if playhead >= max_playhead || playhead < 0.0 {
             *out0.add(i) = 0.0;
             *s.add(STATE_PLAYING) = 0.0;
-            // Keep writing silence for remaining frames
             for j in (i + 1)..nf {
                 *out0.add(j) = 0.0;
             }
@@ -125,16 +145,25 @@ unsafe extern "C" fn sampler_process(
 
         let sample = s0 + frac * (s1 - s0);
 
-        // Apply envelope
-        let env = if playhead < ATTACK_SAMPLES {
-            playhead / ATTACK_SAMPLES
-        } else if playhead > release_start {
-            ((max_playhead - playhead) / RELEASE_SAMPLES).max(0.0)
+        // Click prevention envelope
+        let click_env = if playhead < CLICK_ATTACK {
+            playhead / CLICK_ATTACK
+        } else if playhead > click_release_start {
+            ((max_playhead - playhead) / CLICK_RELEASE).max(0.0)
         } else {
             1.0
         };
 
-        *out0.add(i) = sample * amplitude * env;
+        // Musical envelope (only applies if attack or release > 0)
+        let mus_env = if musical_attack > 0.0 && playhead < musical_attack {
+            playhead / musical_attack
+        } else if musical_release > 0.0 && playhead > mus_release_start {
+            ((max_playhead - playhead) / musical_release).max(0.0)
+        } else {
+            1.0
+        };
+
+        *out0.add(i) = sample * amplitude * click_env * mus_env;
 
         playhead += effective_rate;
     }

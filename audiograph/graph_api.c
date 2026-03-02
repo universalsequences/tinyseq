@@ -588,3 +588,49 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
     *state_size = size;
   return result;
 }
+
+// Debug: dump graph topology to stderr
+void debug_dump_graph(LiveGraph *lg) {
+  if (!lg) return;
+  fprintf(stderr, "\n=== GRAPH DUMP (node_count=%d) ===\n", lg->node_count);
+  fprintf(stderr, "  scratch_null=%p\n", (void*)lg->scratch_null);
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *n = &lg->nodes[i];
+    if (n->vtable.process == NULL && n->nInputs == 0 && n->nOutputs == 0)
+      continue;
+    fprintf(stderr, "  Node %d: nIn=%d nOut=%d orphaned=%d cache_valid=%d\n",
+            i, n->nInputs, n->nOutputs,
+            lg->sched.is_orphaned[i], n->io_cache_valid);
+    if (n->inEdgeId) {
+      for (int p = 0; p < n->nInputs; p++) {
+        int eid = n->inEdgeId[p];
+        if (eid >= 0) {
+          fprintf(stderr, "    in[%d] edge=%d src_node=%d src_port=%d buf=%p\n",
+                  p, eid, lg->edges[eid].src_node, lg->edges[eid].src_port,
+                  (void*)lg->edges[eid].buf);
+        } else {
+          fprintf(stderr, "    in[%d] UNCONNECTED\n", p);
+        }
+      }
+    }
+    if (n->outEdgeId) {
+      for (int p = 0; p < n->nOutputs; p++) {
+        int eid = n->outEdgeId[p];
+        if (eid >= 0) {
+          fprintf(stderr, "    out[%d] edge=%d buf=%p\n",
+                  p, eid, (void*)lg->edges[eid].buf);
+        } else {
+          fprintf(stderr, "    out[%d] UNCONNECTED\n", p);
+        }
+      }
+    }
+    if (n->cached_outPtrs) {
+      for (int p = 0; p < n->nOutputs; p++) {
+        fprintf(stderr, "    cached_out[%d]=%p%s\n",
+                p, (void*)n->cached_outPtrs[p],
+                n->cached_outPtrs[p] == lg->scratch_null ? " (SCRATCH_NULL!)" : "");
+      }
+    }
+  }
+  fprintf(stderr, "=== END DUMP ===\n\n");
+}

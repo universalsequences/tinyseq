@@ -107,4 +107,7 @@ extern "C" {
 
     // Wrapper for the static-inline params_push
     pub fn params_push_wrapper(lg: *mut LiveGraph, m: ParamMsg) -> bool;
+
+    // Debug
+    pub fn debug_dump_graph(lg: *mut LiveGraph);
 }
