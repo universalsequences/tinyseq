@@ -1,9 +1,9 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio::TrackNodes;
 use crate::effects::{EffectType, FilterParam};
@@ -17,6 +17,7 @@ pub enum InputMode {
     Normal,
     ValueEntry,
     Dropdown,
+    PatternSelect,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -41,6 +42,17 @@ impl Region {
     }
 }
 
+#[derive(Default, Clone)]
+pub struct LayoutRects {
+    pub track_list: Rect,
+    pub param_tabs: Rect,
+    pub bars: Rect,
+    pub trigger_row: Rect,
+    pub track_params_inner: Rect,
+    pub effects_inner: Rect,
+    pub effects_block: Rect,
+}
+
 pub struct App {
     pub state: Arc<SequencerState>,
     pub tracks: Vec<String>,
@@ -60,6 +72,9 @@ pub struct App {
     pub effect_param_cursor: usize, // param index within focused effect
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
+    pub layout: LayoutRects,
+    last_step_click: Option<(usize, Instant)>, // (step, time) for double-click detection
+    pub pattern_clone_pending: bool,
 }
 
 impl App {
@@ -81,6 +96,9 @@ impl App {
             effect_param_cursor: 0,
             dropdown_open: false,
             dropdown_cursor: 0,
+            layout: LayoutRects::default(),
+            last_step_click: None,
+            pattern_clone_pending: false,
         }
     }
 
@@ -127,18 +145,154 @@ impl App {
 
     pub fn handle_input(&mut self) -> std::io::Result<()> {
         if event::poll(Duration::from_millis(33))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        return Ok(());
+                    }
+                    match self.input_mode {
+                        InputMode::Normal => self.handle_normal(key.code, key.modifiers),
+                        InputMode::ValueEntry => self.handle_value_entry(key.code),
+                        InputMode::Dropdown => self.handle_dropdown(key.code),
+                        InputMode::PatternSelect => self.handle_pattern_select(key.code),
+                    }
                 }
-                match self.input_mode {
-                    InputMode::Normal => self.handle_normal(key.code, key.modifiers),
-                    InputMode::ValueEntry => self.handle_value_entry(key.code),
-                    InputMode::Dropdown => self.handle_dropdown(key.code),
+                Event::Mouse(mouse) => {
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        self.handle_mouse_click(mouse.column, mouse.row);
+                    }
                 }
+                _ => {}
             }
         }
         Ok(())
+    }
+
+    fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        if self.input_mode != InputMode::Normal {
+            return;
+        }
+
+        let l = &self.layout;
+
+        // Track list: click selects track
+        if rect_contains(l.track_list, col, row) {
+            let idx = (row - l.track_list.y) as usize;
+            if idx < self.tracks.len() {
+                self.cursor_track = idx;
+                self.clamp_cursor_to_steps();
+                self.focused_region = Region::Cirklon;
+            }
+            return;
+        }
+
+        // Param tabs row: click selects active param
+        if rect_contains(l.param_tabs, col, row) {
+            let x_off = col.saturating_sub(l.param_tabs.x + 2);
+            let tab_idx = (x_off / 6) as usize;
+            if tab_idx < StepParam::ALL.len() {
+                self.active_param = StepParam::ALL[tab_idx];
+                self.focused_region = Region::Cirklon;
+            }
+            return;
+        }
+
+        // Bars area: click selects step, double-click toggles
+        if rect_contains(l.bars, col, row) {
+            if let Some(step) = self.step_from_click_x(col, l.bars.x) {
+                self.handle_step_click(step);
+            }
+            return;
+        }
+
+        // Trigger row: click selects step, double-click toggles
+        if rect_contains(l.trigger_row, col, row) {
+            if let Some(step) = self.step_from_click_x(col, l.trigger_row.x) {
+                self.handle_step_click(step);
+            }
+            return;
+        }
+
+        // Track params inner: click selects param row
+        if rect_contains(l.track_params_inner, col, row) {
+            let row_idx = (row - l.track_params_inner.y) as usize;
+            if row_idx <= 4 {
+                self.focused_region = Region::Params;
+                self.params_column = 0;
+                self.track_param_cursor = row_idx;
+            }
+            return;
+        }
+
+        // Effects block title row: click on effect tab
+        if row == l.effects_block.y && col >= l.effects_block.x && col < l.effects_block.x + l.effects_block.width {
+            if let Some(et) = self.effect_tab_from_click_x(col) {
+                self.effect_cursor = et;
+                self.effect_param_cursor = 0;
+                self.focused_region = Region::Params;
+                self.params_column = 1;
+            }
+            return;
+        }
+
+        // Effects inner: click selects effect param row
+        if rect_contains(l.effects_inner, col, row) {
+            let row_idx = (row - l.effects_inner.y) as usize;
+            if row_idx < self.effect_cursor.num_params() {
+                self.focused_region = Region::Params;
+                self.params_column = 1;
+                self.effect_param_cursor = row_idx;
+            }
+            return;
+        }
+    }
+
+    fn handle_step_click(&mut self, step: usize) {
+        let now = Instant::now();
+        let is_double = self
+            .last_step_click
+            .map(|(prev_step, prev_time)| prev_step == step && now.duration_since(prev_time).as_millis() < 400)
+            .unwrap_or(false);
+
+        self.cursor_step = step;
+        self.focused_region = Region::Cirklon;
+
+        if is_double && !self.tracks.is_empty() {
+            self.state.toggle_step_and_clear_plocks(self.cursor_track, step);
+            self.last_step_click = None;
+        } else {
+            self.last_step_click = Some((step, now));
+        }
+    }
+
+    fn step_from_click_x(&self, col: u16, area_x: u16) -> Option<usize> {
+        let x_offset = 2u16;
+        if col < area_x + x_offset {
+            return None;
+        }
+        let rel = col - area_x - x_offset;
+        let step_in_page = (rel / COL_WIDTH) as usize;
+        let (page_start, page_end) = self.page_range();
+        let step = page_start + step_in_page;
+        if step < page_end && step < self.num_steps() {
+            Some(step)
+        } else {
+            None
+        }
+    }
+
+    fn effect_tab_from_click_x(&self, col: u16) -> Option<EffectType> {
+        // Title starts at effects_block.x + 1 (after border)
+        let mut x = self.layout.effects_block.x + 1;
+        for et in EffectType::ALL {
+            let label_len = et.label().len() as u16;
+            let tab_width = label_len + 6; // "[< " + label + " >]"
+            if col >= x && col < x + tab_width {
+                return Some(et);
+            }
+            x += tab_width + 2; // 2-char separator
+        }
+        None
     }
 
     fn handle_normal(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -270,10 +424,72 @@ impl App {
                 self.value_buffer.push(c);
                 self.input_mode = InputMode::ValueEntry;
             }
+            KeyCode::Char('p') => {
+                self.input_mode = InputMode::PatternSelect;
+                self.value_buffer.clear();
+                self.pattern_clone_pending = false;
+            }
             KeyCode::Char(c) => {
                 if let Some(param) = StepParam::from_hotkey(c) {
                     self.active_param = param;
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_pattern_select(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if !self.pattern_clone_pending {
+                    self.value_buffer.push(c);
+                }
+            }
+            KeyCode::Char('c') => {
+                if self.value_buffer.is_empty() && !self.pattern_clone_pending {
+                    self.pattern_clone_pending = true;
+                    self.value_buffer = "clone".to_string();
+                }
+            }
+            KeyCode::Char('x') => {
+                let num_tracks = self.tracks.len();
+                self.state.delete_pattern(num_tracks);
+                self.clamp_cursor_to_steps();
+                self.value_buffer.clear();
+                self.pattern_clone_pending = false;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                if self.pattern_clone_pending {
+                    let num_tracks = self.tracks.len();
+                    self.state.clone_pattern(num_tracks);
+                } else if let Ok(n) = self.value_buffer.parse::<usize>() {
+                    if n >= 1 {
+                        let num_tracks = self.tracks.len();
+                        let num_patterns = self.state.num_patterns.load(Ordering::Relaxed) as usize;
+                        let idx = n - 1;
+                        if idx < num_patterns {
+                            self.state.switch_pattern(idx, num_tracks);
+                            self.clamp_cursor_to_steps();
+                        }
+                    }
+                }
+                self.value_buffer.clear();
+                self.pattern_clone_pending = false;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                if self.pattern_clone_pending {
+                    self.pattern_clone_pending = false;
+                    self.value_buffer.clear();
+                } else {
+                    self.value_buffer.pop();
+                }
+            }
+            KeyCode::Esc => {
+                self.value_buffer.clear();
+                self.pattern_clone_pending = false;
+                self.input_mode = InputMode::Normal;
             }
             _ => {}
         }
@@ -661,6 +877,10 @@ impl App {
     }
 }
 
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
 // ── Drawing ──
 
 fn param_color(param: StepParam) -> Color {
@@ -688,7 +908,7 @@ fn region_border_style(app: &App, region: Region) -> Style {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // 2 regions + help bar
@@ -709,7 +929,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 // ── Cirklon Region ──
 
-fn draw_cirklon_region(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .title(" Cirklon ")
         .borders(Borders::ALL)
@@ -730,6 +950,8 @@ fn draw_cirklon_region(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
+    app.layout.track_list = h_chunks[0];
+
     draw_track_list(frame, app, h_chunks[0]);
 
     // Sequencer content vertical layout
@@ -743,6 +965,10 @@ fn draw_cirklon_region(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(1),                      // value line
         ])
         .split(h_chunks[1]);
+
+    app.layout.param_tabs = seq_chunks[1];
+    app.layout.bars = seq_chunks[2];
+    app.layout.trigger_row = seq_chunks[3];
 
     draw_track_info(frame, app, seq_chunks[0]);
     draw_param_tabs(frame, app, seq_chunks[1]);
@@ -785,9 +1011,11 @@ fn draw_track_info(frame: &mut Frame, app: &App, area: Rect) {
     let display_step = (global_step % ns) + 1;
 
     // Line 1: pattern info
+    let cur_pat = app.state.current_pattern.load(Ordering::Relaxed) as usize + 1;
+    let num_pats = app.state.num_patterns.load(Ordering::Relaxed) as usize;
     let line1 = format!(
-        " [pat 1]  {} BPM  {}  step {}/{}",
-        bpm, playing, display_step, ns
+        " [pat {}/{}]  {} BPM  {}  step {}/{}",
+        cur_pat, num_pats, bpm, playing, display_step, ns
     );
     let span1 = Span::styled(
         line1,
@@ -1040,10 +1268,30 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let is_pattern_select = app.input_mode == InputMode::PatternSelect;
     let is_cirklon_entry = app.input_mode == InputMode::ValueEntry
         && app.focused_region == Region::Cirklon;
 
-    let line = if is_cirklon_entry {
+    let line = if is_pattern_select {
+        if app.pattern_clone_pending {
+            Line::from(vec![
+                Span::styled("  Clone pattern \u{2192} new  ", Style::default().fg(Color::Cyan)),
+                Span::styled("Enter: confirm  Esc: cancel", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("  Pattern: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}\u{2588}", app.value_buffer),
+                    Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                ),
+                Span::styled(
+                    "  Enter: go  c: clone  x: delete  Esc: cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        }
+    } else if is_cirklon_entry {
         let step_label = if app.has_selection() {
             let (lo, hi) = app.selected_range();
             format!("Steps {}-{}", lo + 1, hi + 1)
@@ -1094,7 +1342,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
 
 // ── Params Region (Track Params + Effects side by side) ──
 
-fn draw_params_region(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_params_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.focused_region == Region::Params;
 
     // Horizontal split: track params | effects
@@ -1110,7 +1358,7 @@ fn draw_params_region(frame: &mut Frame, app: &App, area: Rect) {
     draw_effects_column(frame, app, h_chunks[1], is_focused);
 }
 
-fn draw_track_params_column(frame: &mut Frame, app: &App, area: Rect, region_focused: bool) {
+fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region_focused: bool) {
     let col_focused = region_focused && app.params_column == 0;
     let border_style = if col_focused {
         Style::default().fg(Color::White)
@@ -1124,6 +1372,8 @@ fn draw_track_params_column(frame: &mut Frame, app: &App, area: Rect, region_foc
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    app.layout.track_params_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
         return;
@@ -1205,7 +1455,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &App, area: Rect, region_foc
     }
 }
 
-fn draw_effects_column(frame: &mut Frame, app: &App, area: Rect, region_focused: bool) {
+fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focused: bool) {
     let col_focused = region_focused && app.params_column == 1;
     let border_style = if col_focused {
         Style::default().fg(Color::White)
@@ -1239,6 +1489,9 @@ fn draw_effects_column(frame: &mut Frame, app: &App, area: Rect, region_focused:
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    app.layout.effects_block = area;
+    app.layout.effects_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
         return;
@@ -1446,7 +1699,13 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
 // ── Help Bar ──
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = match app.focused_region {
+    let lines = if app.input_mode == InputMode::PatternSelect {
+        vec![Line::from(Span::styled(
+            "  0-9: pattern number  c: clone  x: delete  Enter: confirm  Esc: cancel",
+            Style::default().fg(Color::Yellow),
+        ))]
+    } else {
+        match app.focused_region {
         Region::Cirklon => {
             if app.input_mode == InputMode::ValueEntry {
                 vec![Line::from(Span::styled(
@@ -1460,7 +1719,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ))]
             } else {
                 vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: step  Opt+\u{2190}\u{2192}: beat  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  d v s a b t c: param",
+                    "  \u{2190}\u{2192}: step  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  p: pattern  d v s a b t c: param",
                     Style::default().fg(Color::DarkGray),
                 ))]
             }
@@ -1478,7 +1737,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ))]
             }
         }
-    };
+    }};
 
     let text = Text::from(lines);
     let help = Paragraph::new(text).block(

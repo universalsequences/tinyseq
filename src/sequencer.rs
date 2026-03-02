@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use crate::effects::{EffectPLockData, TrackEffectDefaults};
+use crate::effects::{EffectPLockData, TrackEffectDefaults, TOTAL_EFFECT_PARAMS};
 
 pub const MAX_STEPS: usize = 64;
 pub const STEPS_PER_PAGE: usize = 16;
@@ -223,6 +224,14 @@ impl TrackPattern {
         assert!(step < MAX_STEPS);
         (self.bits.load(Ordering::Relaxed) >> step) & 1 == 1
     }
+
+    pub fn load_bits(&self) -> u64 {
+        self.bits.load(Ordering::Relaxed)
+    }
+
+    pub fn store_bits(&self, bits: u64) {
+        self.bits.store(bits, Ordering::Relaxed);
+    }
 }
 
 /// Per-track parameters (track-wide, not per-step).
@@ -292,6 +301,155 @@ impl TrackParams {
     }
 }
 
+// ── Pattern snapshot (for inactive patterns in the bank) ──
+
+#[derive(Clone)]
+pub struct TrackParamsSnapshot {
+    pub gate: bool,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub swing: f32,
+    pub num_steps: usize,
+}
+
+#[derive(Clone)]
+pub struct PatternSnapshot {
+    pub track_bits: Vec<u64>,
+    pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
+    pub track_params: Vec<TrackParamsSnapshot>,
+    pub effect_defaults: Vec<Vec<f32>>,
+    pub effect_plocks: Vec<Vec<[Option<f32>; TOTAL_EFFECT_PARAMS]>>,
+}
+
+impl PatternSnapshot {
+    pub fn capture(state: &SequencerState, num_tracks: usize) -> Self {
+        let mut track_bits = Vec::with_capacity(num_tracks);
+        let mut step_data = Vec::with_capacity(num_tracks);
+        let mut track_params = Vec::with_capacity(num_tracks);
+        let mut effect_defaults = Vec::with_capacity(num_tracks);
+        let mut effect_plocks = Vec::with_capacity(num_tracks);
+
+        for t in 0..num_tracks {
+            track_bits.push(state.patterns[t].load_bits());
+
+            let mut steps = Vec::with_capacity(MAX_STEPS);
+            for s in 0..MAX_STEPS {
+                let mut params = [0.0f32; NUM_PARAMS];
+                for p in StepParam::ALL {
+                    params[p.index()] = state.step_data[t].get(s, p);
+                }
+                steps.push(params);
+            }
+            step_data.push(steps);
+
+            let tp = &state.track_params[t];
+            track_params.push(TrackParamsSnapshot {
+                gate: tp.is_gate_on(),
+                attack_ms: tp.get_attack_ms(),
+                release_ms: tp.get_release_ms(),
+                swing: tp.get_swing(),
+                num_steps: tp.get_num_steps(),
+            });
+
+            let mut defaults = Vec::with_capacity(TOTAL_EFFECT_PARAMS);
+            for i in 0..TOTAL_EFFECT_PARAMS {
+                defaults.push(state.effect_defaults[t].get(i));
+            }
+            effect_defaults.push(defaults);
+
+            let mut plocks = Vec::with_capacity(MAX_STEPS);
+            for s in 0..MAX_STEPS {
+                let mut plock = [None; TOTAL_EFFECT_PARAMS];
+                for i in 0..TOTAL_EFFECT_PARAMS {
+                    plock[i] = state.effect_plocks[t].get(s, i);
+                }
+                plocks.push(plock);
+            }
+            effect_plocks.push(plocks);
+        }
+
+        Self { track_bits, step_data, track_params, effect_defaults, effect_plocks }
+    }
+
+    pub fn restore(&self, state: &SequencerState) {
+        let num_tracks = self.track_bits.len();
+        for t in 0..num_tracks {
+            state.patterns[t].store_bits(self.track_bits[t]);
+
+            for s in 0..MAX_STEPS {
+                for p in StepParam::ALL {
+                    state.step_data[t].set(s, p, self.step_data[t][s][p.index()]);
+                }
+            }
+
+            let tp = &state.track_params[t];
+            let snap = &self.track_params[t];
+            tp.gate.store(snap.gate, Ordering::Relaxed);
+            tp.set_attack_ms(snap.attack_ms);
+            tp.set_release_ms(snap.release_ms);
+            tp.set_swing(snap.swing);
+            tp.set_num_steps(snap.num_steps);
+
+            for i in 0..TOTAL_EFFECT_PARAMS {
+                state.effect_defaults[t].set(i, self.effect_defaults[t][i]);
+            }
+
+            for s in 0..MAX_STEPS {
+                for i in 0..TOTAL_EFFECT_PARAMS {
+                    match self.effect_plocks[t][s][i] {
+                        Some(val) => state.effect_plocks[t].set(s, i, val),
+                        None => state.effect_plocks[t].clear_param(s, i),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn new_default(num_tracks: usize) -> Self {
+        let mut track_bits = Vec::with_capacity(num_tracks);
+        let mut step_data = Vec::with_capacity(num_tracks);
+        let mut track_params = Vec::with_capacity(num_tracks);
+        let mut effect_defaults = Vec::with_capacity(num_tracks);
+        let mut effect_plocks = Vec::with_capacity(num_tracks);
+
+        for _ in 0..num_tracks {
+            track_bits.push(0u64);
+
+            let mut steps = Vec::with_capacity(MAX_STEPS);
+            for _ in 0..MAX_STEPS {
+                let mut params = [0.0f32; NUM_PARAMS];
+                for p in StepParam::ALL {
+                    params[p.index()] = p.default_value();
+                }
+                steps.push(params);
+            }
+            step_data.push(steps);
+
+            track_params.push(TrackParamsSnapshot {
+                gate: true,
+                attack_ms: 0.0,
+                release_ms: 0.0,
+                swing: 50.0,
+                num_steps: STEPS_PER_PAGE,
+            });
+
+            let mut defaults = Vec::with_capacity(TOTAL_EFFECT_PARAMS);
+            for i in 0..TOTAL_EFFECT_PARAMS {
+                defaults.push(crate::effects::effect_param_default(i));
+            }
+            effect_defaults.push(defaults);
+
+            let mut plocks = Vec::with_capacity(MAX_STEPS);
+            for _ in 0..MAX_STEPS {
+                plocks.push([None; TOTAL_EFFECT_PARAMS]);
+            }
+            effect_plocks.push(plocks);
+        }
+
+        Self { track_bits, step_data, track_params, effect_defaults, effect_plocks }
+    }
+}
+
 /// Shared state visible to both audio thread and UI thread.
 pub struct SequencerState {
     pub patterns: Vec<TrackPattern>,
@@ -306,6 +464,12 @@ pub struct SequencerState {
     pub peak_l: AtomicU32,
     /// Peak level for R channel (f32 bits, 0.0..1.0+), updated by audio thread.
     pub peak_r: AtomicU32,
+    /// Inactive patterns stored here (only accessed by UI thread during switches).
+    pub pattern_bank: Mutex<Vec<PatternSnapshot>>,
+    /// Index of the currently active pattern.
+    pub current_pattern: AtomicU32,
+    /// Total number of patterns.
+    pub num_patterns: AtomicU32,
 }
 
 impl SequencerState {
@@ -326,6 +490,9 @@ impl SequencerState {
             bpm: AtomicU32::new(DEFAULT_BPM),
             peak_l: AtomicU32::new(0.0_f32.to_bits()),
             peak_r: AtomicU32::new(0.0_f32.to_bits()),
+            pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(num_tracks)]),
+            current_pattern: AtomicU32::new(0),
+            num_patterns: AtomicU32::new(1),
         }
     }
 
@@ -339,6 +506,43 @@ impl SequencerState {
 
     pub fn toggle_play(&self) {
         self.playing.fetch_xor(true, Ordering::Relaxed);
+    }
+
+    pub fn switch_pattern(&self, new_idx: usize, num_tracks: usize) {
+        let mut bank = self.pattern_bank.lock().unwrap();
+        let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
+        if new_idx == cur || new_idx >= bank.len() {
+            return;
+        }
+        bank[cur] = PatternSnapshot::capture(self, num_tracks);
+        bank[new_idx].restore(self);
+        self.current_pattern.store(new_idx as u32, Ordering::Relaxed);
+    }
+
+    pub fn clone_pattern(&self, num_tracks: usize) -> usize {
+        let mut bank = self.pattern_bank.lock().unwrap();
+        let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
+        bank[cur] = PatternSnapshot::capture(self, num_tracks);
+        let cloned = bank[cur].clone();
+        bank.push(cloned);
+        let new_idx = bank.len() - 1;
+        self.current_pattern.store(new_idx as u32, Ordering::Relaxed);
+        self.num_patterns.store(bank.len() as u32, Ordering::Relaxed);
+        new_idx
+    }
+
+    pub fn delete_pattern(&self, _num_tracks: usize) -> bool {
+        let mut bank = self.pattern_bank.lock().unwrap();
+        if bank.len() <= 1 {
+            return false;
+        }
+        let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
+        bank.remove(cur);
+        let new_idx = cur.min(bank.len() - 1);
+        bank[new_idx].restore(self);
+        self.current_pattern.store(new_idx as u32, Ordering::Relaxed);
+        self.num_patterns.store(bank.len() as u32, Ordering::Relaxed);
+        true
     }
 
     /// Toggle a step. When toggling OFF, clear its effect p-locks.

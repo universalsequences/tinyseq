@@ -427,6 +427,11 @@ impl EffectPLockData {
         }
     }
 
+    /// Clear a single p-lock (set to NaN = no override).
+    pub fn clear_param(&self, step: usize, param_idx: usize) {
+        self.data[Self::index(step, param_idx)].store(NAN_BITS, Ordering::Relaxed);
+    }
+
     /// Check if a step has any p-locked value.
     pub fn step_has_any_plock(&self, step: usize) -> bool {
         for p in 0..TOTAL_EFFECT_PARAMS {
