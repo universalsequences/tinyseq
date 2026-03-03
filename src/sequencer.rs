@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::effects::{EffectDescriptor, EffectSlotSnapshot, EffectSlotState};
 
+pub const MAX_TRACKS: usize = 64;
 pub const MAX_STEPS: usize = 64;
 pub const STEPS_PER_PAGE: usize = 16;
 pub const NUM_PARAMS: usize = 7;
@@ -312,6 +313,18 @@ pub struct TrackParamsSnapshot {
     pub num_steps: usize,
 }
 
+impl Default for TrackParamsSnapshot {
+    fn default() -> Self {
+        Self {
+            gate: true,
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            swing: 50.0,
+            num_steps: STEPS_PER_PAGE,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PatternSnapshot {
     pub track_bits: Vec<u64>,
@@ -388,48 +401,69 @@ impl PatternSnapshot {
         }
     }
 
-    pub fn new_default(num_tracks: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Self {
-        let mut track_bits = Vec::with_capacity(num_tracks);
-        let mut step_data = Vec::with_capacity(num_tracks);
-        let mut track_params = Vec::with_capacity(num_tracks);
-        let mut effect_slots = Vec::with_capacity(num_tracks);
-
-        for t in 0..num_tracks {
-            track_bits.push(0u64);
-
-            let mut steps = Vec::with_capacity(MAX_STEPS);
-            for _ in 0..MAX_STEPS {
-                let mut params = [0.0f32; NUM_PARAMS];
-                for p in StepParam::ALL {
-                    params[p.index()] = p.default_value();
-                }
-                steps.push(params);
+    fn default_step_data() -> Vec<[f32; NUM_PARAMS]> {
+        (0..MAX_STEPS).map(|_| {
+            let mut params = [0.0f32; NUM_PARAMS];
+            for p in StepParam::ALL {
+                params[p.index()] = p.default_value();
             }
-            step_data.push(steps);
-
-            track_params.push(TrackParamsSnapshot {
-                gate: true,
-                attack_ms: 0.0,
-                release_ms: 0.0,
-                swing: 50.0,
-                num_steps: STEPS_PER_PAGE,
-            });
-
-            // Default effect slot snapshots — use descriptor defaults with node_id=0
-            // (node IDs will be set by live state, snapshots use 0 as placeholder)
-            if t < slot_descriptors.len() {
-                let slots: Vec<EffectSlotSnapshot> = slot_descriptors[t]
-                    .iter()
-                    .map(|desc| EffectSlotSnapshot::new_default(desc, 0))
-                    .collect();
-                effect_slots.push(slots);
-            } else {
-                effect_slots.push(Vec::new());
-            }
-        }
-
-        Self { track_bits, step_data, track_params, effect_slots }
+            params
+        }).collect()
     }
+
+    fn default_effect_slots(t: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Vec<EffectSlotSnapshot> {
+        if t < slot_descriptors.len() {
+            slot_descriptors[t]
+                .iter()
+                .map(|desc| EffectSlotSnapshot::new_default(desc, 0))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Push a single default track onto this snapshot.
+    fn push_default_track(&mut self, t: usize, slot_descriptors: &[Vec<EffectDescriptor>]) {
+        self.track_bits.push(0u64);
+        self.step_data.push(Self::default_step_data());
+        self.track_params.push(TrackParamsSnapshot::default());
+        self.effect_slots.push(Self::default_effect_slots(t, slot_descriptors));
+    }
+
+    pub fn new_default(num_tracks: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Self {
+        let mut snap = Self {
+            track_bits: Vec::with_capacity(num_tracks),
+            step_data: Vec::with_capacity(num_tracks),
+            track_params: Vec::with_capacity(num_tracks),
+            effect_slots: Vec::with_capacity(num_tracks),
+        };
+        for t in 0..num_tracks {
+            snap.push_default_track(t, slot_descriptors);
+        }
+        snap
+    }
+
+    /// Extend a snapshot to cover more tracks (for when tracks are dynamically added).
+    pub fn extend_to_tracks(&mut self, new_count: usize, slot_descriptors: &[Vec<EffectDescriptor>]) {
+        while self.track_bits.len() < new_count {
+            let t = self.track_bits.len();
+            self.push_default_track(t, slot_descriptors);
+        }
+    }
+}
+
+/// Build a default empty effect chain for unused track slots.
+pub fn default_empty_effect_chain() -> Vec<EffectSlotState> {
+    use crate::lisp_effect::MAX_CUSTOM_FX;
+    let filter_desc = EffectDescriptor::builtin_filter();
+    let delay_desc = EffectDescriptor::builtin_delay();
+    let filter_slot = EffectSlotState::new(&filter_desc, 0);
+    let delay_slot = EffectSlotState::new(&delay_desc, 0);
+    let mut chain = vec![filter_slot, delay_slot];
+    for _ in 0..MAX_CUSTOM_FX {
+        chain.push(EffectSlotState::empty());
+    }
+    chain
 }
 
 /// Shared state visible to both audio thread and UI thread.
@@ -453,42 +487,53 @@ pub struct SequencerState {
     pub current_pattern: AtomicU32,
     /// Total number of patterns.
     pub num_patterns: AtomicU32,
+    /// Live track count, read by audio thread.
+    pub num_tracks: AtomicU32,
+    /// Sampler node logical IDs, pre-allocated to MAX_TRACKS.
+    pub sampler_lids: Vec<AtomicU64>,
+    /// Delay node logical IDs, pre-allocated to MAX_TRACKS.
+    pub delay_lids: Vec<AtomicU64>,
 }
 
 impl SequencerState {
     pub fn new(num_tracks: usize, initial_chains: Vec<Vec<EffectSlotState>>) -> Self {
-        let patterns = (0..num_tracks).map(|_| TrackPattern::new()).collect();
-        let step_data = (0..num_tracks).map(|_| StepData::new()).collect();
-        let track_params = (0..num_tracks).map(|_| TrackParams::new()).collect();
+        let patterns: Vec<TrackPattern> = (0..MAX_TRACKS).map(|_| TrackPattern::new()).collect();
+        let step_data: Vec<StepData> = (0..MAX_TRACKS).map(|_| StepData::new()).collect();
+        let track_params: Vec<TrackParams> = (0..MAX_TRACKS).map(|_| TrackParams::new()).collect();
+        let trigger_flash: Vec<AtomicU32> = (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect();
+
+        let mut effect_chains = initial_chains;
+        for _ in effect_chains.len()..MAX_TRACKS {
+            effect_chains.push(default_empty_effect_chain());
+        }
 
         // Build slot descriptors for default pattern snapshot
-        let slot_descriptors: Vec<Vec<EffectDescriptor>> = initial_chains
-            .iter()
-            .map(|chain| {
-                let mut descs = EffectDescriptor::default_chain();
-                // Add empty descriptors for custom slots to match chain length
-                for _ in descs.len()..chain.len() {
-                    descs.push(EffectDescriptor::empty_custom_slot());
-                }
-                descs
-            })
+        let slot_descriptors: Vec<Vec<EffectDescriptor>> = (0..num_tracks)
+            .map(|_| EffectDescriptor::default_full_chain())
             .collect();
 
         Self {
             patterns,
             step_data,
             track_params,
-            effect_chains: initial_chains,
+            effect_chains,
             playhead: AtomicU32::new(0),
             playing: AtomicBool::new(false),
             bpm: AtomicU32::new(DEFAULT_BPM),
             peak_l: AtomicU32::new(0.0_f32.to_bits()),
             peak_r: AtomicU32::new(0.0_f32.to_bits()),
-            trigger_flash: (0..num_tracks).map(|_| AtomicU32::new(0)).collect(),
+            trigger_flash,
             pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(num_tracks, &slot_descriptors)]),
             current_pattern: AtomicU32::new(0),
             num_patterns: AtomicU32::new(1),
+            num_tracks: AtomicU32::new(num_tracks as u32),
+            sampler_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
+            delay_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    pub fn active_track_count(&self) -> usize {
+        self.num_tracks.load(Ordering::Acquire) as usize
     }
 
     pub fn current_step(&self) -> usize {

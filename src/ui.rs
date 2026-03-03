@@ -1,15 +1,16 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::ffi::CString;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::audio::TrackNodes;
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::{EffectDescriptor, EffectSlotState, BUILTIN_SLOT_COUNT};
 use crate::lisp_effect::{self, LoadedDGenLib, MAX_CUSTOM_FX};
-use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, STEPS_PER_PAGE};
+use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, MAX_TRACKS, STEPS_PER_PAGE};
 
 const BAR_HEIGHT: usize = 8;
 const COL_WIDTH: u16 = 3;
@@ -21,6 +22,7 @@ pub enum InputMode {
     Dropdown,
     PatternSelect,
     EffectPicker,
+    SampleBrowser,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -65,6 +67,140 @@ pub struct TrackNodeIds {
     pub delay_id: i32,
 }
 
+// ── Sample Browser tree ──
+
+pub struct BrowserEntry {
+    pub depth: usize,
+    pub is_dir: bool,
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub expanded: bool,
+}
+
+pub struct BrowserNode {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub is_dir: bool,
+    pub children: Vec<BrowserNode>,
+    pub expanded: bool,
+}
+
+impl BrowserNode {
+    /// Recursively scan a directory, including only dirs that contain .wav descendants and .wav files.
+    pub fn scan_root(root: &str) -> Vec<BrowserNode> {
+        let root_path = std::path::Path::new(root);
+        if !root_path.is_dir() {
+            return Vec::new();
+        }
+        Self::scan_dir(root_path)
+    }
+
+    fn scan_dir(dir: &std::path::Path) -> Vec<BrowserNode> {
+        let mut nodes = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return nodes,
+        };
+
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if path.is_dir() {
+                let children = Self::scan_dir(&path);
+                if !children.is_empty() {
+                    nodes.push(BrowserNode {
+                        name,
+                        path,
+                        is_dir: true,
+                        children,
+                        expanded: false,
+                    });
+                }
+            } else if path.extension()
+                .map(|ext| ext.to_ascii_lowercase() == "wav")
+                .unwrap_or(false)
+            {
+                nodes.push(BrowserNode {
+                    name,
+                    path,
+                    is_dir: false,
+                    children: Vec::new(),
+                    expanded: false,
+                });
+            }
+        }
+        nodes
+    }
+
+    /// Flatten the tree respecting expanded/collapsed state.
+    pub fn flatten_visible(nodes: &[BrowserNode], depth: usize) -> Vec<BrowserEntry> {
+        let mut result = Vec::new();
+        for node in nodes {
+            result.push(BrowserEntry {
+                depth, is_dir: node.is_dir, name: node.name.clone(),
+                path: node.path.clone(), expanded: node.expanded,
+            });
+            if node.is_dir && node.expanded {
+                result.extend(Self::flatten_visible(&node.children, depth + 1));
+            }
+        }
+        result
+    }
+
+    /// Flatten with search filter — show matching .wav files with their ancestor context (auto-expanded).
+    pub fn flatten_filtered(nodes: &[BrowserNode], filter_lower: &str, depth: usize) -> Vec<BrowserEntry> {
+        let mut result = Vec::new();
+        for node in nodes {
+            if node.is_dir {
+                let child_results = Self::flatten_filtered(&node.children, filter_lower, depth + 1);
+                if !child_results.is_empty() {
+                    result.push(BrowserEntry {
+                        depth, is_dir: true, name: node.name.clone(),
+                        path: node.path.clone(), expanded: true,
+                    });
+                    result.extend(child_results);
+                }
+            } else if node.name.to_lowercase().contains(filter_lower) {
+                result.push(BrowserEntry {
+                    depth, is_dir: false, name: node.name.clone(),
+                    path: node.path.clone(), expanded: false,
+                });
+            }
+        }
+        result
+    }
+
+    /// Toggle expanded state for a node at a given path in the tree.
+    pub fn toggle_expanded(nodes: &mut [BrowserNode], target_path: &std::path::Path) {
+        for node in nodes.iter_mut() {
+            if node.path == target_path && node.is_dir {
+                node.expanded = !node.expanded;
+                return;
+            }
+            if node.is_dir && node.expanded {
+                Self::toggle_expanded(&mut node.children, target_path);
+            }
+        }
+    }
+
+    /// Set expanded state for a node.
+    pub fn set_expanded(nodes: &mut [BrowserNode], target_path: &std::path::Path, expanded: bool) {
+        for node in nodes.iter_mut() {
+            if node.path == target_path && node.is_dir {
+                node.expanded = expanded;
+                return;
+            }
+            if node.is_dir {
+                Self::set_expanded(&mut node.children, target_path, expanded);
+            }
+        }
+    }
+}
+
 pub struct App {
     pub state: Arc<SequencerState>,
     pub tracks: Vec<String>,
@@ -107,43 +243,45 @@ pub struct App {
 
     // Status message (shown briefly in help bar)
     pub status_message: Option<(String, Instant)>,
+
+    // BPM entry mode
+    pub bpm_entry: bool,
+
+    // Bus node IDs for wiring new tracks
+    pub bus_l_id: i32,
+    pub bus_r_id: i32,
+
+    // Sample browser
+    pub browser_tree: Vec<BrowserNode>,
+    pub browser_cursor: usize,
+    pub browser_filter: String,
+    pub browser_scroll_offset: usize,
 }
 
 impl App {
     pub fn new(
         state: Arc<SequencerState>,
-        tracks: &[TrackNodes],
         lg: LiveGraphPtr,
         sample_rate: u32,
+        bus_l_id: i32,
+        bus_r_id: i32,
     ) -> Self {
-        let num_tracks = tracks.len();
-        let track_node_ids: Vec<TrackNodeIds> = tracks
-            .iter()
-            .map(|t| TrackNodeIds {
-                sampler_id: t.sampler_lid as i32,
-                filter_id: t.filter_lid as i32,
-                delay_id: t.delay_lid as i32,
-            })
-            .collect();
+        // Auto-open sample browser when starting with 0 tracks
+        let input_mode = if state.active_track_count() == 0 {
+            InputMode::SampleBrowser
+        } else {
+            InputMode::Normal
+        };
 
-        // Initialize per-track effect descriptors: [Filter, Delay, empty*4] for each track
-        let effect_descriptors: Vec<Vec<EffectDescriptor>> = (0..num_tracks)
-            .map(|_| {
-                let mut chain = EffectDescriptor::default_chain();
-                for _ in 0..MAX_CUSTOM_FX {
-                    chain.push(EffectDescriptor::empty_custom_slot());
-                }
-                chain
-            })
-            .collect();
+        let browser_tree = BrowserNode::scan_root("samples");
 
         Self {
             state,
-            tracks: tracks.iter().map(|t| t.name.clone()).collect(),
+            tracks: Vec::new(),
             cursor_step: 0,
             cursor_track: 0,
             active_param: StepParam::Velocity,
-            input_mode: InputMode::Normal,
+            input_mode,
             value_buffer: String::new(),
             selection_anchor: None,
             should_quit: false,
@@ -157,9 +295,9 @@ impl App {
             layout: LayoutRects::default(),
             last_step_click: None,
             pattern_clone_pending: false,
-            effect_descriptors,
+            effect_descriptors: Vec::new(),
             lg,
-            track_node_ids,
+            track_node_ids: Vec::new(),
             sample_rate,
             pending_lisp_edit: false,
             pending_lisp_slot: BUILTIN_SLOT_COUNT,
@@ -169,7 +307,95 @@ impl App {
             picker_filter: String::new(),
             picker_items: Vec::new(),
             status_message: None,
+            bpm_entry: false,
+            bus_l_id,
+            bus_r_id,
+            browser_tree,
+            browser_cursor: 0,
+            browser_filter: String::new(),
+            browser_scroll_offset: 0,
         }
+    }
+
+    /// Add a new track from a .wav file path. Returns the track index.
+    pub fn add_track(&mut self, wav_path: &Path) -> Result<usize, String> {
+        let idx = self.state.active_track_count();
+        if idx >= MAX_TRACKS {
+            return Err("Maximum number of tracks reached".to_string());
+        }
+
+        // Load WAV and create sampler node
+        let sampler_track = crate::sampler::create_sampler_track(self.lg.0, wav_path)?;
+        let track_name = sampler_track.name.clone();
+
+        // Create filter node (1 in, 1 out)
+        let filter_name = CString::new(format!("{}_filter", track_name)).unwrap();
+        let filter_id = unsafe {
+            crate::audiograph::add_node(
+                self.lg.0,
+                crate::filter::filter_vtable(),
+                crate::filter::FILTER_STATE_SIZE * std::mem::size_of::<f32>(),
+                filter_name.as_ptr(),
+                1, 1,
+                std::ptr::null(),
+                0,
+            )
+        };
+
+        // Create delay node (1 in, 2 out — stereo)
+        let delay_name = CString::new(format!("{}_delay", track_name)).unwrap();
+        let delay_id = unsafe {
+            crate::audiograph::add_node(
+                self.lg.0,
+                crate::delay::delay_vtable(),
+                crate::delay::DELAY_STATE_SIZE * std::mem::size_of::<f32>(),
+                delay_name.as_ptr(),
+                1, 2,
+                std::ptr::null(),
+                0,
+            )
+        };
+
+        // Wire: sampler → filter → delay → bus_L/bus_R
+        unsafe {
+            crate::audiograph::graph_connect(self.lg.0, sampler_track.node_id, 0, filter_id, 0);
+            crate::audiograph::graph_connect(self.lg.0, filter_id, 0, delay_id, 0);
+            crate::audiograph::graph_connect(self.lg.0, delay_id, 0, self.bus_l_id, 0);
+            crate::audiograph::graph_connect(self.lg.0, delay_id, 1, self.bus_r_id, 0);
+        }
+
+        // Store node IDs in state for audio thread
+        self.state.sampler_lids[idx].store(sampler_track.logical_id, Ordering::Release);
+        self.state.delay_lids[idx].store(delay_id as u64, Ordering::Release);
+
+        // Initialize effect chain for this track slot
+        let filter_desc = EffectDescriptor::builtin_filter();
+        let delay_desc = EffectDescriptor::builtin_delay();
+        let chain = &self.state.effect_chains[idx];
+        chain[0].apply_descriptor(&filter_desc, filter_id as u32);
+        chain[1].apply_descriptor(&delay_desc, delay_id as u32);
+
+        // Push to App's UI-side tracking
+        self.tracks.push(track_name);
+        self.track_node_ids.push(TrackNodeIds {
+            sampler_id: sampler_track.node_id,
+            filter_id,
+            delay_id,
+        });
+        self.effect_descriptors.push(EffectDescriptor::default_full_chain());
+
+        // Extend all pattern bank snapshots to cover the new track
+        {
+            let mut bank = self.state.pattern_bank.lock().unwrap();
+            for snap in bank.iter_mut() {
+                snap.extend_to_tracks(idx + 1, &self.effect_descriptors);
+            }
+        }
+
+        // Make the new track visible to the audio thread (Release ordering)
+        self.state.num_tracks.store((idx + 1) as u32, Ordering::Release);
+
+        Ok(idx)
     }
 
     fn selected_range(&self) -> (usize, usize) {
@@ -302,6 +528,37 @@ impl App {
         self.next_free_custom_slot().is_some()
     }
 
+    /// Compute wiring info for a custom slot at `slot_idx`.
+    fn resolve_custom_slot_wiring(&self, track: usize, slot_idx: usize) -> (usize, i32, i32, Option<i32>) {
+        let offset = slot_idx - BUILTIN_SLOT_COUNT;
+        let slot_id = track * MAX_CUSTOM_FX + offset;
+        let predecessor_id = self.find_custom_slot_predecessor(track, offset);
+        let successor_id = self.find_custom_slot_successor(track, offset);
+        let existing_node = self.state.effect_chains[track]
+            .get(slot_idx)
+            .map(|slot| slot.node_id.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let existing = if existing_node != 0 { Some(existing_node as i32) } else { None };
+        (slot_id, predecessor_id, successor_id, existing)
+    }
+
+    /// Apply a loaded effect's metadata to the slot state and descriptor.
+    fn apply_effect_to_slot(&mut self, track: usize, slot_idx: usize, node_id: i32, name: &str, params: &[lisp_effect::DGenParam]) {
+        let desc = EffectDescriptor::from_lisp_manifest(name, params);
+        self.effect_descriptors[track][slot_idx] = desc;
+
+        let slot = &self.state.effect_chains[track][slot_idx];
+        slot.node_id.store(node_id as u32, Ordering::Relaxed);
+        slot.num_params.store(params.len() as u32, Ordering::Relaxed);
+        for (i, p) in params.iter().enumerate() {
+            slot.defaults.set(i, p.default);
+            if i < slot.param_node_indices.len() {
+                let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
+                slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn handle_input(&mut self) -> std::io::Result<()> {
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
@@ -315,6 +572,7 @@ impl App {
                         InputMode::Dropdown => self.handle_dropdown(key.code),
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
+                        InputMode::SampleBrowser => self.handle_sample_browser(key.code),
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -330,8 +588,8 @@ impl App {
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.input_mode != InputMode::Normal {
-            // Close picker on click outside
-            if self.input_mode == InputMode::EffectPicker {
+            // Close overlays on click outside
+            if self.input_mode == InputMode::EffectPicker || self.input_mode == InputMode::SampleBrowser {
                 self.input_mode = InputMode::Normal;
             }
             return;
@@ -477,20 +735,8 @@ impl App {
         }
         let track = self.cursor_track;
         let slot_idx = self.pending_lisp_slot;
-        let offset = slot_idx - BUILTIN_SLOT_COUNT;
-        let slot_id = track * MAX_CUSTOM_FX + offset;
-        let predecessor_id = self.find_custom_slot_predecessor(track, offset);
-        let successor_id = self.find_custom_slot_successor(track, offset);
-
-        let existing_node = self.state.effect_chains[track]
-            .get(slot_idx)
-            .map(|slot| slot.node_id.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        let existing = if existing_node != 0 {
-            Some(existing_node as i32)
-        } else {
-            None
-        };
+        let (slot_id, predecessor_id, successor_id, existing) =
+            self.resolve_custom_slot_wiring(track, slot_idx);
 
         // Load source: from file (if editing existing) or empty for new
         let last_source = match &self.pending_lisp_name {
@@ -513,25 +759,7 @@ impl App {
         );
 
         if let Some(r) = result {
-            // Build descriptor using the user-chosen name
-            let desc = EffectDescriptor::from_lisp_manifest(&r.name, &r.params);
-            self.effect_descriptors[track][slot_idx] = desc;
-
-            // Update effect chain state
-            let chain = &self.state.effect_chains[track];
-            if slot_idx < chain.len() {
-                let slot = &chain[slot_idx];
-                slot.node_id.store(r.node_id as u32, Ordering::Relaxed);
-                slot.num_params.store(r.params.len() as u32, Ordering::Relaxed);
-                for (i, p) in r.params.iter().enumerate() {
-                    slot.defaults.set(i, p.default);
-                    if i < slot.param_node_indices.len() {
-                        let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
-                        slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
-                    }
-                }
-            }
-
+            self.apply_effect_to_slot(track, slot_idx, r.node_id, &r.name, &r.params);
             self.effect_slot_cursor = slot_idx;
             self.effect_param_cursor = 0;
             self.focused_region = Region::Params;
@@ -552,17 +780,8 @@ impl App {
         let lib = lisp_effect::load_dylib(&manifest.dylib_path)?;
 
         let track = self.cursor_track;
-        let offset = slot_idx - BUILTIN_SLOT_COUNT;
-        let slot_id = track * MAX_CUSTOM_FX + offset;
-        let pred = self.find_custom_slot_predecessor(track, offset);
-        let succ = self.find_custom_slot_successor(track, offset);
-
-        let existing = {
-            let nid = self.state.effect_chains[track][slot_idx]
-                .node_id
-                .load(Ordering::Relaxed);
-            if nid != 0 { Some(nid as i32) } else { None }
-        };
+        let (slot_id, pred, succ, existing) =
+            self.resolve_custom_slot_wiring(track, slot_idx);
 
         let node_id = unsafe {
             lisp_effect::add_effect_to_chain_at(
@@ -570,35 +789,16 @@ impl App {
             )?
         };
 
-        // Update descriptor
-        let desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
-        self.effect_descriptors[track][slot_idx] = desc;
-
-        // Update chain state
-        let slot = &self.state.effect_chains[track][slot_idx];
-        slot.node_id.store(node_id as u32, Ordering::Relaxed);
-        slot.num_params
-            .store(manifest.params.len() as u32, Ordering::Relaxed);
-        for (i, p) in manifest.params.iter().enumerate() {
-            slot.defaults.set(i, p.default);
-            if i < slot.param_node_indices.len() {
-                let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
-                slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
-            }
-        }
-
+        self.apply_effect_to_slot(track, slot_idx, node_id, name, &manifest.params);
         self.lisp_libs.push(lib);
         Ok(())
     }
 
     fn filtered_picker_items(&self) -> Vec<String> {
         let mut items = vec!["+ New effect".to_string()];
+        let filter_lower = self.picker_filter.to_lowercase();
         for name in &self.picker_items {
-            if self.picker_filter.is_empty()
-                || name
-                    .to_lowercase()
-                    .contains(&self.picker_filter.to_lowercase())
-            {
+            if filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower) {
                 items.push(name.clone());
             }
         }
@@ -664,6 +864,105 @@ impl App {
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn browser_visible_items(&self) -> Vec<BrowserEntry> {
+        if self.browser_filter.is_empty() {
+            BrowserNode::flatten_visible(&self.browser_tree, 0)
+        } else {
+            let filter_lower = self.browser_filter.to_lowercase();
+            BrowserNode::flatten_filtered(&self.browser_tree, &filter_lower, 0)
+        }
+    }
+
+    fn handle_sample_browser(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => {
+                self.browser_filter.push(c);
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+            }
+            KeyCode::Backspace => {
+                self.browser_filter.pop();
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+            }
+            KeyCode::Up => {
+                if self.browser_cursor > 0 {
+                    self.browser_cursor -= 1;
+                    if self.browser_cursor < self.browser_scroll_offset {
+                        self.browser_scroll_offset = self.browser_cursor;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor + 1 < items.len() {
+                    self.browser_cursor += 1;
+                    let max_visible = 20usize;
+                    if self.browser_cursor >= self.browser_scroll_offset + max_visible {
+                        self.browser_scroll_offset = self.browser_cursor + 1 - max_visible;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                // Expand folder
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    if item.is_dir && !item.expanded {
+                        let path = item.path.clone();
+                        BrowserNode::set_expanded(&mut self.browser_tree, &path, true);
+                    }
+                }
+            }
+            KeyCode::Left => {
+                // Collapse folder
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    if item.is_dir && item.expanded {
+                        let path = item.path.clone();
+                        BrowserNode::set_expanded(&mut self.browser_tree, &path, false);
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    let path = item.path.clone();
+                    if item.is_dir {
+                        // Toggle expand/collapse
+                        BrowserNode::toggle_expanded(&mut self.browser_tree, &path);
+                    } else {
+                        // Add sample as track (stay open)
+                        match self.add_track(&path) {
+                            Ok(idx) => {
+                                self.cursor_track = idx;
+                                self.status_message = Some((
+                                    format!("Added track {}", idx + 1),
+                                    Instant::now(),
+                                ));
+                            }
+                            Err(e) => {
+                                self.status_message = Some((
+                                    format!("Error: {}", e),
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.browser_filter.clear();
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
             }
             _ => {}
         }
@@ -827,10 +1126,22 @@ impl App {
                 self.value_buffer.push(c);
                 self.input_mode = InputMode::ValueEntry;
             }
+            KeyCode::Char('b') => {
+                self.bpm_entry = true;
+                self.value_buffer.clear();
+                self.input_mode = InputMode::ValueEntry;
+            }
             KeyCode::Char('p') => {
                 self.input_mode = InputMode::PatternSelect;
                 self.value_buffer.clear();
                 self.pattern_clone_pending = false;
+            }
+            KeyCode::Char('n') => {
+                self.browser_tree = BrowserNode::scan_root("samples");
+                self.browser_cursor = 0;
+                self.browser_filter.clear();
+                self.browser_scroll_offset = 0;
+                self.input_mode = InputMode::SampleBrowser;
             }
             KeyCode::Char(c) => {
                 if let Some(param) = StepParam::from_hotkey(c) {
@@ -1232,6 +1543,7 @@ impl App {
             KeyCode::Backspace => {
                 self.value_buffer.pop();
                 if self.value_buffer.is_empty() {
+                    self.bpm_entry = false;
                     self.input_mode = InputMode::Normal;
                 }
             }
@@ -1240,10 +1552,12 @@ impl App {
                     self.apply_value_entry(val);
                 }
                 self.value_buffer.clear();
+                self.bpm_entry = false;
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
                 self.value_buffer.clear();
+                self.bpm_entry = false;
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -1251,6 +1565,13 @@ impl App {
     }
 
     fn apply_value_entry(&mut self, val: f32) {
+        if self.bpm_entry {
+            let bpm = (val as u32).clamp(20, 999);
+            self.state.bpm.store(bpm, Ordering::Relaxed);
+            self.bpm_entry = false;
+            return;
+        }
+
         if self.tracks.is_empty() {
             return;
         }
@@ -1426,6 +1747,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw picker overlay on top of everything
     if app.input_mode == InputMode::EffectPicker {
         draw_effect_picker(frame, app, area);
+    }
+    if app.input_mode == InputMode::SampleBrowser {
+        draw_sample_browser(frame, app, area);
     }
 }
 
@@ -1854,10 +2178,24 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let is_pattern_select = app.input_mode == InputMode::PatternSelect;
+    let is_bpm_entry = app.input_mode == InputMode::ValueEntry && app.bpm_entry;
     let is_cirklon_entry = app.input_mode == InputMode::ValueEntry
+        && !app.bpm_entry
         && app.focused_region == Region::Cirklon;
 
-    let line = if is_pattern_select {
+    let line = if is_bpm_entry {
+        Line::from(vec![
+            Span::styled("  BPM: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}\u{2588}", app.value_buffer),
+                Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
+            ),
+            Span::styled(
+                "  Enter: set  Esc: cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if is_pattern_select {
         if app.pattern_clone_pending {
             Line::from(vec![
                 Span::styled("  Clone pattern \u{2192} new  ", Style::default().fg(Color::Cyan)),
@@ -2058,13 +2396,10 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             }
             let desc = &descs[i];
             let is_selected = i == app.effect_slot_cursor;
-            let is_custom = i >= BUILTIN_SLOT_COUNT;
             let style = if is_selected && col_focused {
                 Style::default().fg(Color::Black).bg(Color::White).bold()
             } else if is_selected {
                 Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
-            } else if is_custom {
-                Style::default().fg(Color::Gray)
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -2104,8 +2439,8 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     let track = app.cursor_track;
     let slot_idx = app.effect_slot_cursor;
 
-    // Check if this is an empty lisp slot with no effect loaded
-    let is_lisp_slot = slot_idx >= BUILTIN_SLOT_COUNT;
+    // Check if this is an empty custom slot with no effect loaded
+    let is_custom_slot = slot_idx >= BUILTIN_SLOT_COUNT;
     let chain = &app.state.effect_chains[track];
     let has_node = if slot_idx < chain.len() {
         chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
@@ -2113,7 +2448,7 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         false
     };
 
-    if is_lisp_slot && !has_node {
+    if is_custom_slot && !has_node {
         // No effect loaded — show hint
         let hint = Line::from(vec![
             Span::styled("  Ctrl+L", Style::default().fg(Color::White).bold()),
@@ -2410,8 +2745,97 @@ fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
+    let items = if app.browser_filter.is_empty() {
+        BrowserNode::flatten_visible(&app.browser_tree, 0)
+    } else {
+        let filter_lower = app.browser_filter.to_lowercase();
+        BrowserNode::flatten_filtered(&app.browser_tree, &filter_lower, 0)
+    };
+
+    let max_visible = 20usize;
+    let list_height = items.len().min(max_visible) as u16;
+    let w = 50u16.min(area.width.saturating_sub(4));
+    let h = list_height + 4; // border top + filter line + list + border bottom
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let picker_area = Rect::new(x, y, w, h);
+
+    // Clear background
+    let bg = Style::default().bg(Color::Rgb(20, 20, 20));
+    for row in 0..h {
+        let row_area = Rect::new(x, y + row, w, 1);
+        frame.render_widget(Paragraph::new(" ".repeat(w as usize)).style(bg), row_area);
+    }
+
+    let block = Block::default()
+        .title(" Samples ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+
+    // Filter input line
+    let filter_text = format!("> {}\u{2588}", app.browser_filter);
+    let filter_line = Line::from(Span::styled(
+        filter_text,
+        Style::default().fg(Color::White),
+    ));
+    let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(Paragraph::new(filter_line), filter_area);
+
+    // Item list
+    let list_start_y = inner.y + 1;
+    let scroll = app.browser_scroll_offset;
+
+    for (vi, i) in (scroll..items.len()).enumerate() {
+        if vi >= max_visible {
+            break;
+        }
+        let row_y = list_start_y + vi as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+
+        let entry = &items[i];
+        let is_cursor = i == app.browser_cursor;
+
+        let indent = "  ".repeat(entry.depth);
+        let icon = if entry.is_dir {
+            if entry.expanded { "\u{25bc} " } else { "\u{25b6} " }
+        } else {
+            "  "
+        };
+
+        let max_name_width = (inner.width as usize).saturating_sub(indent.len() + icon.len() + 1);
+        let truncated: String = entry.name.chars().take(max_name_width).collect();
+        let text = format!("{}{}{}", indent, icon, truncated);
+
+        let style = if is_cursor {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else if entry.is_dir {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let padded = format!("{:<width$}", text, width = inner.width as usize);
+        let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+        frame.render_widget(Paragraph::new(padded).style(style), row_area);
+    }
+}
+
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if app.input_mode == InputMode::EffectPicker {
+    let lines = if app.input_mode == InputMode::SampleBrowser {
+        vec![Line::from(Span::styled(
+            "  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  Enter: select  Esc: close",
+            Style::default().fg(Color::Yellow),
+        ))]
+    } else if app.input_mode == InputMode::EffectPicker {
         vec![Line::from(Span::styled(
             "  Type to filter  \u{2191}\u{2193}: navigate  Enter: select  Esc: cancel",
             Style::default().fg(Color::Yellow),
@@ -2436,7 +2860,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ))]
             } else {
                 vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: step  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  p: pattern  d v s a b t c: param",
+                    "  \u{2190}\u{2192}: step  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  p: pat  n: add  d v s a b t c: param",
                     Style::default().fg(Color::DarkGray),
                 ))]
             }

@@ -257,6 +257,15 @@ impl EffectDescriptor {
         vec![Self::builtin_filter(), Self::builtin_delay()]
     }
 
+    /// Full default chain: [Filter, Delay] + MAX_CUSTOM_FX empty slots.
+    pub fn default_full_chain() -> Vec<Self> {
+        let mut chain = Self::default_chain();
+        for _ in 0..crate::lisp_effect::MAX_CUSTOM_FX {
+            chain.push(Self::empty_custom_slot());
+        }
+        chain
+    }
+
     /// Empty custom slot placeholder (name is empty, no params).
     pub fn empty_custom_slot() -> Self {
         Self {
@@ -444,6 +453,18 @@ impl EffectSlotState {
             param_node_indices: (0..MAX_SLOT_PARAMS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
+        }
+    }
+
+    /// Overwrite this pre-allocated slot in-place from a descriptor and node ID.
+    pub fn apply_descriptor(&self, desc: &EffectDescriptor, node_id: u32) {
+        self.node_id.store(node_id, Ordering::Relaxed);
+        self.num_params.store(desc.params.len() as u32, Ordering::Relaxed);
+        for (i, p) in desc.params.iter().enumerate() {
+            self.defaults.set(i, p.default);
+            if i < self.param_node_indices.len() {
+                self.param_node_indices[i].store(p.node_param_idx, Ordering::Relaxed);
+            }
         }
     }
 }

@@ -32,7 +32,7 @@ type DGenProcessFn = unsafe extern "C" fn(
 // Each track can have up to MAX_CUSTOM_FX custom effects.
 // The process fn pointer is stored here, indexed by slot_id = track * MAX_CUSTOM_FX + offset.
 
-const MAX_TRACKS: usize = 16;
+use crate::sequencer::MAX_TRACKS;
 pub const MAX_CUSTOM_FX: usize = 4;
 const REGISTRY_SIZE: usize = MAX_TRACKS * MAX_CUSTOM_FX;
 static DGEN_PROCESS_FNS: [AtomicUsize; REGISTRY_SIZE] = {
@@ -74,6 +74,11 @@ unsafe extern "C" fn dgenlisp_wrapper_process(
     }
 }
 
+/// Initial state message format (compact, not full-size):
+///   [0] = slot_id
+///   [1] = total_memory_slots
+///   [2] = num_entries (N)
+///   [3..3+2N] = pairs of (index, value)
 unsafe extern "C" fn dgenlisp_init(
     state: *mut c_void,
     _sample_rate: c_int,
@@ -84,10 +89,20 @@ unsafe extern "C" fn dgenlisp_init(
         return;
     }
     let src = initial_state as *const f32;
-    let total_memory_slots = (*src.add(1)) as usize;
-    let total_slots = HEADER_SLOTS + total_memory_slots;
     let dst = state as *mut f32;
-    std::ptr::copy_nonoverlapping(src, dst, total_slots);
+
+    // Copy header
+    *dst = *src;                // slot_id
+    *dst.add(1) = *src.add(1); // total_memory_slots
+
+    // Apply sparse index/value pairs into the memory region
+    let num_entries = (*src.add(2)) as usize;
+    let mem = dst.add(HEADER_SLOTS);
+    for i in 0..num_entries {
+        let idx = (*src.add(3 + i * 2)) as usize;
+        let val = *src.add(3 + i * 2 + 1);
+        *mem.add(idx) = val;
+    }
 }
 
 fn dgenlisp_vtable() -> NodeVTable {
@@ -137,15 +152,17 @@ unsafe impl Sync for LoadedDGenLib {}
 
 // ── Effect library storage ──
 
+const EFFECTS_DIR: &str = "effects";
+
 pub fn save_effect(name: &str, source: &str) -> io::Result<()> {
-    let dir = Path::new("effects");
+    let dir = Path::new(EFFECTS_DIR);
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.lisp", name));
     std::fs::write(&path, source)
 }
 
 pub fn list_saved_effects() -> Vec<String> {
-    let dir = Path::new("effects");
+    let dir = Path::new(EFFECTS_DIR);
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()
         .map(|entries| {
@@ -167,7 +184,7 @@ pub fn list_saved_effects() -> Vec<String> {
 }
 
 pub fn load_effect_source(name: &str) -> io::Result<String> {
-    let path = Path::new("effects").join(format!("{}.lisp", name));
+    let path = Path::new(EFFECTS_DIR).join(format!("{}.lisp", name));
     std::fs::read_to_string(&path)
 }
 
@@ -318,35 +335,39 @@ pub fn load_dylib(path: &Path) -> Result<LoadedDGenLib, String> {
     }
 }
 
-// ── Build initial state ──
+// ── Build initial state message (compact) ──
 
-fn build_initial_state(slot_id: usize, manifest: &DGenManifest) -> Vec<f32> {
-    let total_slots = HEADER_SLOTS + manifest.total_memory_slots;
-    let mut state = vec![0.0f32; total_slots];
+/// Build a compact init message: [slot_id, total_memory_slots, num_entries, idx0, val0, idx1, val1, ...]
+/// The engine zeroes state; init only needs to set non-zero values.
+fn build_init_message(slot_id: usize, manifest: &DGenManifest) -> Vec<f32> {
+    // Collect all non-zero index/value pairs
+    let mut entries: Vec<(usize, f32)> = Vec::new();
 
-    // Header
-    state[0] = slot_id as f32;
-    state[1] = manifest.total_memory_slots as f32;
-
-    // Default param values
-    let mem = &mut state[HEADER_SLOTS..];
     for param in &manifest.params {
-        if param.cell_id < manifest.total_memory_slots {
-            mem[param.cell_id] = param.default;
+        if param.cell_id < manifest.total_memory_slots && param.default != 0.0 {
+            entries.push((param.cell_id, param.default));
         }
     }
 
-    // Tensor init data
     for tensor in &manifest.tensor_init_data {
         for (i, &val) in tensor.data.iter().enumerate() {
             let idx = tensor.offset + i;
-            if idx < manifest.total_memory_slots {
-                mem[idx] = val;
+            if idx < manifest.total_memory_slots && val != 0.0 {
+                entries.push((idx, val));
             }
         }
     }
 
-    state
+    // Header (3) + pairs (2 * N)
+    let mut msg = Vec::with_capacity(3 + entries.len() * 2);
+    msg.push(slot_id as f32);
+    msg.push(manifest.total_memory_slots as f32);
+    msg.push(entries.len() as f32);
+    for (idx, val) in &entries {
+        msg.push(*idx as f32);
+        msg.push(*val);
+    }
+    msg
 }
 
 // ── Add effect to track's audio chain ──
@@ -383,9 +404,12 @@ pub unsafe fn add_effect_to_chain_at(
     // Register process function
     set_dgen_process_fn(slot_id, lib.process_fn);
 
-    // Build initial state
-    let initial_state = build_initial_state(slot_id, manifest);
-    let state_size = manifest.total_memory_slots * std::mem::size_of::<f32>();
+    // Full state allocation (header + memory buffer), zeroed by the engine
+    let state_size = (HEADER_SLOTS + manifest.total_memory_slots) * std::mem::size_of::<f32>();
+
+    // Compact init message: only header + non-zero index/value pairs
+    let init_msg = build_init_message(slot_id, manifest);
+    let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
 
     let name = CString::new(format!("dgenlisp_fx_{}", slot_id)).unwrap();
 
@@ -396,8 +420,8 @@ pub unsafe fn add_effect_to_chain_at(
         name.as_ptr(),
         manifest.n_inputs as c_int,
         1, // mono output for insert chain
-        initial_state.as_ptr() as *const c_void,
-        state_size,
+        init_msg.as_ptr() as *const c_void,
+        init_msg_size,
     );
 
     if node_id < 0 {
