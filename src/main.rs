@@ -17,6 +17,7 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use crate::audio::TrackNodes;
+use crate::effects::{EffectDescriptor, EffectSlotState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Scan samples/ directory for .wav files
@@ -141,8 +142,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audiograph::engine_start_workers(0);
     }
 
+    // Build initial effect chains from track nodes
+    let initial_chains: Vec<Vec<EffectSlotState>> = track_nodes
+        .iter()
+        .map(|tn| {
+            let filter_desc = EffectDescriptor::builtin_filter();
+            let delay_desc = EffectDescriptor::builtin_delay();
+            let filter_slot = EffectSlotState::new(&filter_desc, tn.filter_lid as u32);
+            let delay_slot = EffectSlotState::new(&delay_desc, tn.delay_lid as u32);
+            // Pre-allocate an empty lisp slot
+            let lisp_slot = EffectSlotState::empty();
+            vec![filter_slot, delay_slot, lisp_slot]
+        })
+        .collect();
+
     // Create shared sequencer state
-    let state = Arc::new(sequencer::SequencerState::new(track_nodes.len()));
+    let state = Arc::new(sequencer::SequencerState::new(track_nodes.len(), initial_chains));
 
     // Build cpal audio stream
     let _stream = audio::build_output_stream(

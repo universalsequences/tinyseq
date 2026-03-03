@@ -5,8 +5,6 @@ use std::sync::Arc;
 
 use crate::audiograph::*;
 use crate::delay;
-use crate::effects::TOTAL_EFFECT_PARAMS;
-use crate::lisp_effect::HEADER_SLOTS;
 use crate::sampler::{
     PARAM_ATTACK_SAMPLES, PARAM_GATE_MODE, PARAM_GATE_SAMPLES, PARAM_PLAYHEAD,
     PARAM_RELEASE_SAMPLES, PARAM_SPEED, PARAM_TRANSPOSE, PARAM_TRIGGER, PARAM_VELOCITY,
@@ -59,7 +57,6 @@ struct AudioCallbackData {
 /// Minimal copy of node IDs needed in audio thread.
 struct TrackNodeIds {
     sampler_lid: u64,
-    filter_lid: u64,
     delay_lid: u64,
 }
 
@@ -148,78 +145,32 @@ unsafe fn send_trigger(
     );
 }
 
-/// Dispatch effect p-locks for a given step on a single track.
-/// Only called on ON (active) steps so that p-locked values persist until the next ON step.
-unsafe fn dispatch_effect_plocks_for_track(
+/// Dispatch effect p-locks for all slots in a track's effect chain.
+unsafe fn dispatch_effect_chain_for_track(
     lg: *mut LiveGraph,
     state: &SequencerState,
-    tn: &TrackNodeIds,
     track_idx: usize,
     step: usize,
 ) {
-    {
-        let plocks = &state.effect_plocks[track_idx];
-        let defaults = &state.effect_defaults[track_idx];
-
-        for param_idx in 0..TOTAL_EFFECT_PARAMS {
-            let value = plocks
-                .get(step, param_idx)
-                .unwrap_or_else(|| defaults.get(param_idx));
-
-            // Route to filter (0..4) or delay (4..10)
-            if param_idx < crate::effects::NUM_FILTER_PARAMS {
-                let filter_param = param_idx as u64;
-                params_push_wrapper(
-                    lg,
-                    ParamMsg {
-                        idx: filter_param,
-                        logical_id: tn.filter_lid,
-                        fvalue: value,
-                    },
-                );
-            } else {
-                let delay_param = (param_idx - crate::effects::NUM_FILTER_PARAMS) as u64;
-                params_push_wrapper(
-                    lg,
-                    ParamMsg {
-                        idx: delay_param,
-                        logical_id: tn.delay_lid,
-                        fvalue: value,
-                    },
-                );
-            }
+    for slot in &state.effect_chains[track_idx] {
+        let node_id = slot.node_id.load(Ordering::Relaxed);
+        if node_id == 0 {
+            continue;
         }
-    }
-}
-
-/// Dispatch lisp effect p-locks for a given step on a single track.
-unsafe fn dispatch_lisp_plocks_for_track(
-    lg: *mut LiveGraph,
-    state: &SequencerState,
-    track_idx: usize,
-    step: usize,
-) {
-    let node_id = state.lisp_node_ids[track_idx].load(Ordering::Relaxed);
-    if node_id == 0 {
-        return;
-    }
-    let param_count = state.lisp_param_count[track_idx].load(Ordering::Relaxed) as usize;
-    let logical_id = node_id as u64;
-
-    for i in 0..param_count {
-        let value = state.lisp_plocks[track_idx]
-            .get(step, i)
-            .unwrap_or_else(|| state.lisp_defaults[track_idx].get(i));
-        let cell_id = state.lisp_cell_id(track_idx, i);
-        let idx = (HEADER_SLOTS + cell_id as usize) as u64;
-        params_push_wrapper(
-            lg,
-            ParamMsg {
-                idx,
-                logical_id,
-                fvalue: value,
-            },
-        );
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        for param_idx in 0..num_params {
+            let value = slot.plocks.get(step, param_idx)
+                .unwrap_or_else(|| slot.defaults.get(param_idx));
+            let idx = slot.resolve_node_idx(param_idx);
+            params_push_wrapper(
+                lg,
+                ParamMsg {
+                    idx,
+                    logical_id: node_id as u64,
+                    fvalue: value,
+                },
+            );
+        }
     }
 }
 
@@ -277,7 +228,7 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     let triggers = data.clock.process_block(nframes, &data.state);
     let samples_per_step = data.clock.current_samples_per_step();
 
-    // Push BPM to all delay nodes for synced mode
+    // Push BPM to all delay nodes (slot index 1 by convention)
     let bpm = data.state.bpm.load(Ordering::Relaxed) as f32;
     for tn in &data.track_nodes {
         unsafe {
@@ -298,16 +249,14 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
             let num_steps = data.state.track_params[track_idx].get_num_steps();
             let local_step = trigger.step % num_steps;
             if data.state.patterns[track_idx].is_active(local_step) {
-                // Dispatch effect p-locks only on ON steps so values persist until next ON step
+                // Dispatch unified effect chain p-locks
                 unsafe {
-                    dispatch_effect_plocks_for_track(
+                    dispatch_effect_chain_for_track(
                         data.lg.0,
                         &data.state,
-                        &data.track_nodes[track_idx],
                         track_idx,
                         local_step,
                     );
-                    dispatch_lisp_plocks_for_track(data.lg.0, &data.state, track_idx, local_step);
                 }
 
                 let tp = &data.state.track_params[track_idx];
@@ -413,7 +362,6 @@ pub fn build_output_stream(
         .iter()
         .map(|tn| TrackNodeIds {
             sampler_lid: tn.sampler_lid,
-            filter_lid: tn.filter_lid,
             delay_lid: tn.delay_lid,
         })
         .collect();

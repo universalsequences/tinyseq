@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::effects::{EffectPLockData, LispPLockData, LispParamDefaults, TrackEffectDefaults, TOTAL_EFFECT_PARAMS, MAX_LISP_PARAMS};
+use crate::effects::{EffectDescriptor, EffectSlotSnapshot, EffectSlotState};
 
 pub const MAX_STEPS: usize = 64;
 pub const STEPS_PER_PAGE: usize = 16;
@@ -317,10 +317,7 @@ pub struct PatternSnapshot {
     pub track_bits: Vec<u64>,
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<TrackParamsSnapshot>,
-    pub effect_defaults: Vec<Vec<f32>>,
-    pub effect_plocks: Vec<Vec<[Option<f32>; TOTAL_EFFECT_PARAMS]>>,
-    pub lisp_defaults: Vec<Vec<f32>>,
-    pub lisp_plocks: Vec<Vec<[Option<f32>; MAX_LISP_PARAMS]>>,
+    pub effect_slots: Vec<Vec<EffectSlotSnapshot>>,
 }
 
 impl PatternSnapshot {
@@ -328,10 +325,7 @@ impl PatternSnapshot {
         let mut track_bits = Vec::with_capacity(num_tracks);
         let mut step_data = Vec::with_capacity(num_tracks);
         let mut track_params = Vec::with_capacity(num_tracks);
-        let mut effect_defaults = Vec::with_capacity(num_tracks);
-        let mut effect_plocks = Vec::with_capacity(num_tracks);
-        let mut lisp_defaults = Vec::with_capacity(num_tracks);
-        let mut lisp_plocks = Vec::with_capacity(num_tracks);
+        let mut effect_slots = Vec::with_capacity(num_tracks);
 
         for t in 0..num_tracks {
             track_bits.push(state.patterns[t].load_bits());
@@ -355,42 +349,15 @@ impl PatternSnapshot {
                 num_steps: tp.get_num_steps(),
             });
 
-            let mut defaults = Vec::with_capacity(TOTAL_EFFECT_PARAMS);
-            for i in 0..TOTAL_EFFECT_PARAMS {
-                defaults.push(state.effect_defaults[t].get(i));
-            }
-            effect_defaults.push(defaults);
-
-            let mut plocks = Vec::with_capacity(MAX_STEPS);
-            for s in 0..MAX_STEPS {
-                let mut plock = [None; TOTAL_EFFECT_PARAMS];
-                for i in 0..TOTAL_EFFECT_PARAMS {
-                    plock[i] = state.effect_plocks[t].get(s, i);
-                }
-                plocks.push(plock);
-            }
-            effect_plocks.push(plocks);
-
-            // Lisp defaults
-            let mut ld = Vec::with_capacity(MAX_LISP_PARAMS);
-            for i in 0..MAX_LISP_PARAMS {
-                ld.push(state.lisp_defaults[t].get(i));
-            }
-            lisp_defaults.push(ld);
-
-            // Lisp plocks
-            let mut lp = Vec::with_capacity(MAX_STEPS);
-            for s in 0..MAX_STEPS {
-                let mut plock = [None; MAX_LISP_PARAMS];
-                for i in 0..MAX_LISP_PARAMS {
-                    plock[i] = state.lisp_plocks[t].get(s, i);
-                }
-                lp.push(plock);
-            }
-            lisp_plocks.push(lp);
+            // Capture effect chain
+            let chain: Vec<EffectSlotSnapshot> = state.effect_chains[t]
+                .iter()
+                .map(|slot| EffectSlotSnapshot::capture(slot))
+                .collect();
+            effect_slots.push(chain);
         }
 
-        Self { track_bits, step_data, track_params, effect_defaults, effect_plocks, lisp_defaults, lisp_plocks }
+        Self { track_bits, step_data, track_params, effect_slots }
     }
 
     pub fn restore(&self, state: &SequencerState) {
@@ -412,46 +379,22 @@ impl PatternSnapshot {
             tp.set_swing(snap.swing);
             tp.set_num_steps(snap.num_steps);
 
-            for i in 0..TOTAL_EFFECT_PARAMS {
-                state.effect_defaults[t].set(i, self.effect_defaults[t][i]);
-            }
-
-            for s in 0..MAX_STEPS {
-                for i in 0..TOTAL_EFFECT_PARAMS {
-                    match self.effect_plocks[t][s][i] {
-                        Some(val) => state.effect_plocks[t].set(s, i, val),
-                        None => state.effect_plocks[t].clear_param(s, i),
-                    }
-                }
-            }
-
-            // Restore lisp defaults
-            for i in 0..MAX_LISP_PARAMS {
-                state.lisp_defaults[t].set(i, self.lisp_defaults[t][i]);
-            }
-
-            // Restore lisp plocks
-            for s in 0..MAX_STEPS {
-                for i in 0..MAX_LISP_PARAMS {
-                    match self.lisp_plocks[t][s][i] {
-                        Some(val) => state.lisp_plocks[t].set(s, i, val),
-                        None => state.lisp_plocks[t].clear_param(s, i),
-                    }
+            // Restore effect chain slots
+            for (slot_idx, slot_snap) in self.effect_slots[t].iter().enumerate() {
+                if slot_idx < state.effect_chains[t].len() {
+                    slot_snap.restore(&state.effect_chains[t][slot_idx]);
                 }
             }
         }
     }
 
-    pub fn new_default(num_tracks: usize) -> Self {
+    pub fn new_default(num_tracks: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Self {
         let mut track_bits = Vec::with_capacity(num_tracks);
         let mut step_data = Vec::with_capacity(num_tracks);
         let mut track_params = Vec::with_capacity(num_tracks);
-        let mut effect_defaults = Vec::with_capacity(num_tracks);
-        let mut effect_plocks = Vec::with_capacity(num_tracks);
-        let mut lisp_defaults = Vec::with_capacity(num_tracks);
-        let mut lisp_plocks = Vec::with_capacity(num_tracks);
+        let mut effect_slots = Vec::with_capacity(num_tracks);
 
-        for _ in 0..num_tracks {
+        for t in 0..num_tracks {
             track_bits.push(0u64);
 
             let mut steps = Vec::with_capacity(MAX_STEPS);
@@ -472,28 +415,20 @@ impl PatternSnapshot {
                 num_steps: STEPS_PER_PAGE,
             });
 
-            let mut defaults = Vec::with_capacity(TOTAL_EFFECT_PARAMS);
-            for i in 0..TOTAL_EFFECT_PARAMS {
-                defaults.push(crate::effects::effect_param_default(i));
+            // Default effect slot snapshots — use descriptor defaults with node_id=0
+            // (node IDs will be set by live state, snapshots use 0 as placeholder)
+            if t < slot_descriptors.len() {
+                let slots: Vec<EffectSlotSnapshot> = slot_descriptors[t]
+                    .iter()
+                    .map(|desc| EffectSlotSnapshot::new_default(desc, 0))
+                    .collect();
+                effect_slots.push(slots);
+            } else {
+                effect_slots.push(Vec::new());
             }
-            effect_defaults.push(defaults);
-
-            let mut plocks = Vec::with_capacity(MAX_STEPS);
-            for _ in 0..MAX_STEPS {
-                plocks.push([None; TOTAL_EFFECT_PARAMS]);
-            }
-            effect_plocks.push(plocks);
-
-            lisp_defaults.push(vec![0.0f32; MAX_LISP_PARAMS]);
-
-            let mut lp = Vec::with_capacity(MAX_STEPS);
-            for _ in 0..MAX_STEPS {
-                lp.push([None; MAX_LISP_PARAMS]);
-            }
-            lisp_plocks.push(lp);
         }
 
-        Self { track_bits, step_data, track_params, effect_defaults, effect_plocks, lisp_defaults, lisp_plocks }
+        Self { track_bits, step_data, track_params, effect_slots }
     }
 }
 
@@ -502,8 +437,7 @@ pub struct SequencerState {
     pub patterns: Vec<TrackPattern>,
     pub step_data: Vec<StepData>,
     pub track_params: Vec<TrackParams>,
-    pub effect_defaults: Vec<TrackEffectDefaults>,
-    pub effect_plocks: Vec<EffectPLockData>,
+    pub effect_chains: Vec<Vec<EffectSlotState>>,
     pub playhead: AtomicU32,
     pub playing: AtomicBool,
     pub bpm: AtomicU32,
@@ -517,48 +451,33 @@ pub struct SequencerState {
     pub current_pattern: AtomicU32,
     /// Total number of patterns.
     pub num_patterns: AtomicU32,
-    // ── Lisp effect p-lock state ──
-    pub lisp_plocks: Vec<LispPLockData>,
-    pub lisp_defaults: Vec<LispParamDefaults>,
-    /// Per-track node ID for the lisp effect (0 = no effect). Audio thread reads this.
-    pub lisp_node_ids: Vec<AtomicU32>,
-    /// Number of active params per track's lisp effect.
-    pub lisp_param_count: Vec<AtomicU32>,
-    /// Flat cell ID lookup: track * MAX_LISP_PARAMS + param_idx.
-    pub lisp_cell_ids: Vec<AtomicU32>,
 }
 
 impl SequencerState {
-    pub fn new(num_tracks: usize) -> Self {
+    pub fn new(num_tracks: usize, initial_chains: Vec<Vec<EffectSlotState>>) -> Self {
         let patterns = (0..num_tracks).map(|_| TrackPattern::new()).collect();
         let step_data = (0..num_tracks).map(|_| StepData::new()).collect();
         let track_params = (0..num_tracks).map(|_| TrackParams::new()).collect();
-        let effect_defaults = (0..num_tracks).map(|_| TrackEffectDefaults::new()).collect();
-        let effect_plocks = (0..num_tracks).map(|_| EffectPLockData::new()).collect();
-        let lisp_plocks = (0..num_tracks).map(|_| LispPLockData::new()).collect();
-        let lisp_defaults = (0..num_tracks).map(|_| LispParamDefaults::new()).collect();
-        let lisp_node_ids = (0..num_tracks).map(|_| AtomicU32::new(0)).collect();
-        let lisp_param_count = (0..num_tracks).map(|_| AtomicU32::new(0)).collect();
-        let lisp_cell_ids = (0..num_tracks * MAX_LISP_PARAMS).map(|_| AtomicU32::new(0)).collect();
+
+        // Build slot descriptors for default pattern snapshot
+        let slot_descriptors: Vec<Vec<EffectDescriptor>> = initial_chains
+            .iter()
+            .map(|_| EffectDescriptor::default_chain())
+            .collect();
+
         Self {
             patterns,
             step_data,
             track_params,
-            effect_defaults,
-            effect_plocks,
+            effect_chains: initial_chains,
             playhead: AtomicU32::new(0),
             playing: AtomicBool::new(false),
             bpm: AtomicU32::new(DEFAULT_BPM),
             peak_l: AtomicU32::new(0.0_f32.to_bits()),
             peak_r: AtomicU32::new(0.0_f32.to_bits()),
-            pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(num_tracks)]),
+            pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(num_tracks, &slot_descriptors)]),
             current_pattern: AtomicU32::new(0),
             num_patterns: AtomicU32::new(1),
-            lisp_plocks,
-            lisp_defaults,
-            lisp_node_ids,
-            lisp_param_count,
-            lisp_cell_ids,
         }
     }
 
@@ -611,23 +530,15 @@ impl SequencerState {
         true
     }
 
-    /// Toggle a step. When toggling OFF, clear its effect and lisp p-locks.
+    /// Toggle a step. When toggling OFF, clear all effect slot p-locks.
     pub fn toggle_step_and_clear_plocks(&self, track: usize, step: usize) {
         let was_active = self.patterns[track].is_active(step);
         self.patterns[track].toggle_step(step);
         if was_active {
-            // Toggled off — clear p-locks
-            self.effect_plocks[track].clear_step(step);
-            self.lisp_plocks[track].clear_step(step);
+            for slot in &self.effect_chains[track] {
+                slot.plocks.clear_step(step);
+            }
         }
-    }
-
-    pub fn lisp_cell_id(&self, track: usize, param_idx: usize) -> u32 {
-        self.lisp_cell_ids[track * MAX_LISP_PARAMS + param_idx].load(Ordering::Relaxed)
-    }
-
-    pub fn set_lisp_cell_id(&self, track: usize, param_idx: usize, val: u32) {
-        self.lisp_cell_ids[track * MAX_LISP_PARAMS + param_idx].store(val, Ordering::Relaxed);
     }
 }
 

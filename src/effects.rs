@@ -2,252 +2,553 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::sequencer::MAX_STEPS;
 
-// Total effect params: 4 filter + 6 delay = 10
-pub const NUM_FILTER_PARAMS: usize = 4;
-pub const NUM_DELAY_PARAMS: usize = 6;
-pub const TOTAL_EFFECT_PARAMS: usize = NUM_FILTER_PARAMS + NUM_DELAY_PARAMS;
+/// Maximum number of parameters per effect slot.
+pub const MAX_SLOT_PARAMS: usize = 16;
+
+/// Number of built-in effect slots (Filter, Delay). Slots at this index or higher are custom/lisp.
+pub const BUILTIN_SLOT_COUNT: usize = 2;
 
 /// NaN sentinel stored as bits — means "no p-lock override".
 const NAN_BITS: u32 = f32::NAN.to_bits();
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum EffectType {
-    Filter = 0,
-    Delay = 1,
+// ── ParamKind ──
+
+#[derive(Clone, Debug)]
+pub enum ParamKind {
+    Continuous { unit: Option<String> }, // e.g., "Hz", "ms", "%"
+    Boolean,                             // 0.0 = off, 1.0 = on
+    Enum { labels: Vec<String> },        // value = index as f32
 }
 
-impl EffectType {
-    pub const ALL: [EffectType; 2] = [EffectType::Filter, EffectType::Delay];
+// ── ParamScaling ──
 
-    pub fn label(self) -> &'static str {
-        match self {
-            EffectType::Filter => "Filter",
-            EffectType::Delay => "Delay",
-        }
-    }
-
-    pub fn next(self) -> EffectType {
-        match self {
-            EffectType::Filter => EffectType::Delay,
-            EffectType::Delay => EffectType::Filter,
-        }
-    }
-
-    pub fn prev(self) -> EffectType {
-        self.next() // only 2 variants
-    }
-
-    /// Number of params for this effect type.
-    pub fn num_params(self) -> usize {
-        match self {
-            EffectType::Filter => NUM_FILTER_PARAMS,
-            EffectType::Delay => NUM_DELAY_PARAMS,
-        }
-    }
-
-    /// Global param index offset for this effect type.
-    pub fn param_offset(self) -> usize {
-        match self {
-            EffectType::Filter => 0,
-            EffectType::Delay => NUM_FILTER_PARAMS,
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamScaling {
+    Linear,
+    Exponential, // log-space steps: ideal for frequency-like params
 }
 
-// ── Filter params ──
+// ── ParamDescriptor ──
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FilterParam {
-    Enabled = 0,
-    Mode = 1,
-    Cutoff = 2,
-    Resonance = 3,
+#[derive(Clone, Debug)]
+pub struct ParamDescriptor {
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub kind: ParamKind,
+    pub scaling: ParamScaling,
+    pub node_param_idx: u32, // index into audio node's state array
 }
 
-impl FilterParam {
-    pub const ALL: [FilterParam; NUM_FILTER_PARAMS] = [
-        FilterParam::Enabled,
-        FilterParam::Mode,
-        FilterParam::Cutoff,
-        FilterParam::Resonance,
-    ];
-
-    pub fn global_index(self) -> usize {
-        self as usize
-    }
-
-    pub fn default_value(self) -> f32 {
-        match self {
-            FilterParam::Enabled => 0.0,   // off
-            FilterParam::Mode => 0.0,      // LP
-            FilterParam::Cutoff => 1000.0, // Hz
-            FilterParam::Resonance => 1.0,
+impl ParamDescriptor {
+    /// Step size for +/- adjustment.
+    pub fn increment(&self, current_val: f32) -> f32 {
+        match &self.kind {
+            ParamKind::Boolean | ParamKind::Enum { .. } => 1.0,
+            ParamKind::Continuous { .. } => match self.scaling {
+                ParamScaling::Linear => (self.max - self.min) * 0.01,
+                ParamScaling::Exponential => {
+                    let step = current_val.abs() * 0.02;
+                    let floor = (self.max - self.min) * 0.001;
+                    step.max(floor)
+                }
+            },
         }
     }
 
-    pub fn min(self) -> f32 {
-        match self {
-            FilterParam::Enabled => 0.0,
-            FilterParam::Mode => 0.0,
-            FilterParam::Cutoff => 20.0,
-            FilterParam::Resonance => 0.5,
+    pub fn clamp(&self, val: f32) -> f32 {
+        val.clamp(self.min, self.max)
+    }
+
+    /// Normalize value to 0.0..1.0 for display (linear or log-space).
+    pub fn normalize(&self, val: f32) -> f32 {
+        let range = self.max - self.min;
+        if range <= 0.0 {
+            return 0.0;
+        }
+        match self.scaling {
+            ParamScaling::Linear => ((val - self.min) / range).clamp(0.0, 1.0),
+            ParamScaling::Exponential => {
+                if self.min <= 0.0 || self.max <= 0.0 {
+                    return ((val - self.min) / range).clamp(0.0, 1.0);
+                }
+                let log_min = self.min.ln();
+                let log_max = self.max.ln();
+                let log_range = log_max - log_min;
+                if log_range <= 0.0 {
+                    return 0.0;
+                }
+                ((val.max(self.min).ln() - log_min) / log_range).clamp(0.0, 1.0)
+            }
         }
     }
 
-    pub fn max(self) -> f32 {
-        match self {
-            FilterParam::Enabled => 1.0,
-            FilterParam::Mode => 2.0,   // LP=0, HP=1, BP=2
-            FilterParam::Cutoff => 20000.0,
-            FilterParam::Resonance => 10.0,
+    pub fn is_boolean(&self) -> bool {
+        matches!(self.kind, ParamKind::Boolean)
+    }
+
+    pub fn is_enum(&self) -> bool {
+        matches!(self.kind, ParamKind::Enum { .. })
+    }
+
+    /// Returns true if this param is displayed as percentage but stored 0.0-1.0.
+    pub fn is_percent(&self) -> bool {
+        matches!(&self.kind, ParamKind::Continuous { unit: Some(u) } if u == "%")
+    }
+
+    /// Convert user-entered value to stored value (handles % → /100).
+    pub fn user_input_to_stored(&self, val: f32) -> f32 {
+        if self.is_percent() {
+            val / 100.0
+        } else {
+            val
         }
     }
 
-    pub fn increment(self) -> f32 {
-        match self {
-            FilterParam::Enabled => 1.0,
-            FilterParam::Mode => 1.0,
-            FilterParam::Cutoff => 50.0,
-            FilterParam::Resonance => 0.1,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            FilterParam::Enabled => "enabled",
-            FilterParam::Mode => "mode",
-            FilterParam::Cutoff => "cutoff",
-            FilterParam::Resonance => "resonance",
-        }
-    }
-
-    pub fn is_boolean(self) -> bool {
-        matches!(self, FilterParam::Enabled)
-    }
-
-    pub fn is_enum(self) -> bool {
-        matches!(self, FilterParam::Mode)
-    }
-
-    pub fn format_value(self, val: f32) -> String {
-        match self {
-            FilterParam::Enabled => {
+    pub fn format_value(&self, val: f32) -> String {
+        match &self.kind {
+            ParamKind::Boolean => {
                 if val > 0.5 { "ON".to_string() } else { "OFF".to_string() }
             }
-            FilterParam::Mode => {
-                match val.round() as i32 {
-                    0 => "lowpass".to_string(),
-                    1 => "highpass".to_string(),
-                    2 => "bandpass".to_string(),
-                    _ => "lowpass".to_string(),
+            ParamKind::Enum { labels } => {
+                let idx = val.round() as usize;
+                labels.get(idx).cloned().unwrap_or_else(|| format!("{}", idx))
+            }
+            ParamKind::Continuous { unit } => {
+                let display_val = if self.is_percent() { val * 100.0 } else { val };
+                match unit.as_deref() {
+                    Some("Hz") => format!("{:.0} Hz", display_val),
+                    Some("ms") => format!("{:.0} ms", display_val),
+                    Some("%") => format!("{:.0}%", display_val),
+                    Some(u) => format!("{:.2} {}", display_val, u),
+                    None => format!("{:.2}", display_val),
                 }
             }
-            FilterParam::Cutoff => format!("{:.0} Hz", val),
-            FilterParam::Resonance => format!("{:.1}", val),
         }
     }
 }
 
-// ── Delay params ──
+// ── EffectDescriptor ──
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DelayParam {
-    Wet = 0,
-    Synced = 1,
-    DelayTime = 2,
-    Feedback = 3,
-    Dampening = 4,
-    StereoWidth = 5,
+#[derive(Clone, Debug)]
+pub struct EffectDescriptor {
+    pub name: String,
+    pub params: Vec<ParamDescriptor>,
 }
 
-impl DelayParam {
-    pub const ALL: [DelayParam; NUM_DELAY_PARAMS] = [
-        DelayParam::Wet,
-        DelayParam::Synced,
-        DelayParam::DelayTime,
-        DelayParam::Feedback,
-        DelayParam::Dampening,
-        DelayParam::StereoWidth,
-    ];
-
-    pub fn global_index(self) -> usize {
-        NUM_FILTER_PARAMS + self as usize
-    }
-
-    pub fn default_value(self) -> f32 {
-        match self {
-            DelayParam::Wet => 0.0,
-            DelayParam::Synced => 0.0,       // off
-            DelayParam::DelayTime => 250.0,   // ms
-            DelayParam::Feedback => 0.3,
-            DelayParam::Dampening => 0.5,
-            DelayParam::StereoWidth => 1.0,
+impl EffectDescriptor {
+    /// Built-in filter effect descriptor.
+    pub fn builtin_filter() -> Self {
+        Self {
+            name: "Filter".to_string(),
+            params: vec![
+                ParamDescriptor {
+                    name: "enabled".to_string(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                    kind: ParamKind::Boolean,
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 0,
+                },
+                ParamDescriptor {
+                    name: "mode".to_string(),
+                    min: 0.0,
+                    max: 2.0,
+                    default: 0.0,
+                    kind: ParamKind::Enum {
+                        labels: vec![
+                            "lowpass".to_string(),
+                            "highpass".to_string(),
+                            "bandpass".to_string(),
+                        ],
+                    },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 1,
+                },
+                ParamDescriptor {
+                    name: "cutoff".to_string(),
+                    min: 20.0,
+                    max: 20000.0,
+                    default: 1000.0,
+                    kind: ParamKind::Continuous { unit: Some("Hz".to_string()) },
+                    scaling: ParamScaling::Exponential,
+                    node_param_idx: 2,
+                },
+                ParamDescriptor {
+                    name: "resonance".to_string(),
+                    min: 0.5,
+                    max: 10.0,
+                    default: 1.0,
+                    kind: ParamKind::Continuous { unit: None },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 3,
+                },
+            ],
         }
     }
 
-    pub fn min(self) -> f32 {
-        match self {
-            DelayParam::Wet => 0.0,
-            DelayParam::Synced => 0.0,
-            DelayParam::DelayTime => 1.0,
-            DelayParam::Feedback => 0.0,
-            DelayParam::Dampening => 0.0,
-            DelayParam::StereoWidth => 0.0,
+    /// Built-in delay effect descriptor.
+    pub fn builtin_delay() -> Self {
+        Self {
+            name: "Delay".to_string(),
+            params: vec![
+                ParamDescriptor {
+                    name: "wet".to_string(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                    kind: ParamKind::Continuous { unit: Some("%".to_string()) },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 0,
+                },
+                ParamDescriptor {
+                    name: "synced".to_string(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.0,
+                    kind: ParamKind::Boolean,
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 1,
+                },
+                ParamDescriptor {
+                    name: "time".to_string(),
+                    min: 1.0,
+                    max: 2000.0,
+                    default: 250.0,
+                    kind: ParamKind::Continuous { unit: Some("ms".to_string()) },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 2,
+                },
+                ParamDescriptor {
+                    name: "feedback".to_string(),
+                    min: 0.0,
+                    max: 0.95,
+                    default: 0.3,
+                    kind: ParamKind::Continuous { unit: None },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 3,
+                },
+                ParamDescriptor {
+                    name: "dampening".to_string(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    kind: ParamKind::Continuous { unit: None },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 4,
+                },
+                ParamDescriptor {
+                    name: "width".to_string(),
+                    min: 0.0,
+                    max: 2.0,
+                    default: 1.0,
+                    kind: ParamKind::Continuous { unit: None },
+                    scaling: ParamScaling::Linear,
+                    node_param_idx: 5,
+                },
+            ],
         }
     }
 
-    pub fn max(self) -> f32 {
-        match self {
-            DelayParam::Wet => 1.0,
-            DelayParam::Synced => 1.0,
-            DelayParam::DelayTime => 2000.0,  // ms
-            DelayParam::Feedback => 0.95,
-            DelayParam::Dampening => 1.0,
-            DelayParam::StereoWidth => 2.0,
+    /// Default effect chain descriptors: [Filter, Delay].
+    pub fn default_chain() -> Vec<Self> {
+        vec![Self::builtin_filter(), Self::builtin_delay()]
+    }
+
+    /// Construct from a lisp effect manifest.
+    pub fn from_lisp_manifest(name: &str, params: &[crate::lisp_effect::DGenParam]) -> Self {
+        let descriptors = params
+            .iter()
+            .map(|p| ParamDescriptor {
+                name: p.name.clone(),
+                min: p.min,
+                max: p.max,
+                default: p.default,
+                kind: ParamKind::Continuous { unit: p.unit.clone() },
+                scaling: ParamScaling::Linear,
+                node_param_idx: p.cell_id as u32,
+            })
+            .collect();
+        Self {
+            name: name.to_string(),
+            params: descriptors,
+        }
+    }
+}
+
+// ── SlotPLockData (replaces EffectPLockData and LispPLockData) ──
+
+/// Per-slot per-step parameter overrides.
+/// NaN = no override (use slot default).
+/// No internal clamping — callers pass clamped values.
+pub struct SlotPLockData {
+    data: Vec<AtomicU32>,
+    max_params: usize,
+}
+
+impl SlotPLockData {
+    pub fn new(max_params: usize) -> Self {
+        let size = MAX_STEPS * max_params;
+        let data: Vec<AtomicU32> = (0..size)
+            .map(|_| AtomicU32::new(NAN_BITS))
+            .collect();
+        Self { data, max_params }
+    }
+
+    fn index(&self, step: usize, param_idx: usize) -> usize {
+        step * self.max_params + param_idx
+    }
+
+    pub fn get(&self, step: usize, param_idx: usize) -> Option<f32> {
+        let idx = self.index(step, param_idx);
+        if idx >= self.data.len() {
+            return None;
+        }
+        let bits = self.data[idx].load(Ordering::Relaxed);
+        let val = f32::from_bits(bits);
+        if val.is_nan() { None } else { Some(val) }
+    }
+
+    pub fn set(&self, step: usize, param_idx: usize, val: f32) {
+        let idx = self.index(step, param_idx);
+        if idx < self.data.len() {
+            self.data[idx].store(val.to_bits(), Ordering::Relaxed);
         }
     }
 
-    pub fn increment(self) -> f32 {
-        match self {
-            DelayParam::Wet => 0.05,
-            DelayParam::Synced => 1.0,
-            DelayParam::DelayTime => 10.0,
-            DelayParam::Feedback => 0.05,
-            DelayParam::Dampening => 0.05,
-            DelayParam::StereoWidth => 0.1,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            DelayParam::Wet => "wet",
-            DelayParam::Synced => "synced",
-            DelayParam::DelayTime => "time",
-            DelayParam::Feedback => "feedback",
-            DelayParam::Dampening => "dampening",
-            DelayParam::StereoWidth => "width",
-        }
-    }
-
-    pub fn is_boolean(self) -> bool {
-        matches!(self, DelayParam::Synced)
-    }
-
-    pub fn format_value(self, val: f32) -> String {
-        match self {
-            DelayParam::Wet => format!("{:.0}%", val * 100.0),
-            DelayParam::Synced => {
-                if val > 0.5 { "ON".to_string() } else { "OFF".to_string() }
+    pub fn clear_step(&self, step: usize) {
+        for p in 0..self.max_params {
+            let idx = self.index(step, p);
+            if idx < self.data.len() {
+                self.data[idx].store(NAN_BITS, Ordering::Relaxed);
             }
-            DelayParam::DelayTime => format!("{:.0} ms", val),
-            DelayParam::Feedback => format!("{:.2}", val),
-            DelayParam::Dampening => format!("{:.2}", val),
-            DelayParam::StereoWidth => format!("{:.1}", val),
+        }
+    }
+
+    pub fn clear_param(&self, step: usize, param_idx: usize) {
+        let idx = self.index(step, param_idx);
+        if idx < self.data.len() {
+            self.data[idx].store(NAN_BITS, Ordering::Relaxed);
+        }
+    }
+
+    pub fn step_has_any_plock(&self, step: usize, num_params: usize) -> bool {
+        for p in 0..num_params.min(self.max_params) {
+            let idx = self.index(step, p);
+            if idx < self.data.len() {
+                let bits = self.data[idx].load(Ordering::Relaxed);
+                if !f32::from_bits(bits).is_nan() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// ── SlotParamDefaults (replaces TrackEffectDefaults and LispParamDefaults) ──
+
+pub struct SlotParamDefaults {
+    data: Vec<AtomicU32>,
+}
+
+impl SlotParamDefaults {
+    pub fn new_from_descriptor(desc: &EffectDescriptor) -> Self {
+        let data: Vec<AtomicU32> = desc
+            .params
+            .iter()
+            .map(|p| AtomicU32::new(p.default.to_bits()))
+            .collect();
+        Self { data }
+    }
+
+    pub fn new_zeroed(count: usize) -> Self {
+        let data: Vec<AtomicU32> = (0..count)
+            .map(|_| AtomicU32::new(0.0_f32.to_bits()))
+            .collect();
+        Self { data }
+    }
+
+    pub fn get(&self, idx: usize) -> f32 {
+        if idx < self.data.len() {
+            f32::from_bits(self.data[idx].load(Ordering::Relaxed))
+        } else {
+            0.0
+        }
+    }
+
+    pub fn set(&self, idx: usize, val: f32) {
+        if idx < self.data.len() {
+            self.data[idx].store(val.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+// ── EffectSlotState (runtime state for one effect in a track's chain) ──
+
+pub struct EffectSlotState {
+    pub node_id: AtomicU32,                // audio graph node (0 = empty)
+    pub plocks: SlotPLockData,
+    pub defaults: SlotParamDefaults,
+    pub num_params: AtomicU32,
+    pub param_node_indices: Vec<AtomicU32>, // per-param: idx field for ParamMsg
+}
+
+impl EffectSlotState {
+    pub fn new(desc: &EffectDescriptor, node_id: u32) -> Self {
+        let num_params = desc.params.len();
+        let param_node_indices: Vec<AtomicU32> = desc
+            .params
+            .iter()
+            .map(|p| AtomicU32::new(p.node_param_idx))
+            .collect();
+        Self {
+            node_id: AtomicU32::new(node_id),
+            plocks: SlotPLockData::new(MAX_SLOT_PARAMS),
+            defaults: SlotParamDefaults::new_from_descriptor(desc),
+            num_params: AtomicU32::new(num_params as u32),
+            param_node_indices,
+        }
+    }
+
+    /// Resolve the audio graph param index for a given param.
+    pub fn resolve_node_idx(&self, param_idx: usize) -> u64 {
+        if param_idx < self.param_node_indices.len() {
+            self.param_node_indices[param_idx].load(Ordering::Relaxed) as u64
+        } else {
+            param_idx as u64
+        }
+    }
+
+    /// Create an empty slot (no effect loaded).
+    pub fn empty() -> Self {
+        Self {
+            node_id: AtomicU32::new(0),
+            plocks: SlotPLockData::new(MAX_SLOT_PARAMS),
+            defaults: SlotParamDefaults::new_zeroed(MAX_SLOT_PARAMS),
+            num_params: AtomicU32::new(0),
+            param_node_indices: (0..MAX_SLOT_PARAMS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
         }
     }
 }
 
-// ── Sync divisions ──
+// ── EffectSlotSnapshot (for pattern save/restore) ──
+
+#[derive(Clone)]
+pub struct EffectSlotSnapshot {
+    pub node_id: u32,
+    pub num_params: u32,
+    pub defaults: Vec<f32>,
+    pub plocks: Vec<Vec<Option<f32>>>,
+    pub param_node_indices: Vec<u32>,
+}
+
+impl EffectSlotSnapshot {
+    pub fn capture(slot: &EffectSlotState) -> Self {
+        let node_id = slot.node_id.load(Ordering::Relaxed);
+        let num_params = slot.num_params.load(Ordering::Relaxed);
+        let np = num_params as usize;
+
+        let mut defaults = Vec::with_capacity(np);
+        for i in 0..np {
+            defaults.push(slot.defaults.get(i));
+        }
+
+        let mut plocks = Vec::with_capacity(MAX_STEPS);
+        for s in 0..MAX_STEPS {
+            let mut step_plocks = Vec::with_capacity(np);
+            for i in 0..np {
+                step_plocks.push(slot.plocks.get(s, i));
+            }
+            plocks.push(step_plocks);
+        }
+
+        let mut param_node_indices = Vec::with_capacity(np);
+        for i in 0..np {
+            if i < slot.param_node_indices.len() {
+                param_node_indices.push(slot.param_node_indices[i].load(Ordering::Relaxed));
+            } else {
+                param_node_indices.push(0);
+            }
+        }
+
+        Self {
+            node_id,
+            num_params,
+            defaults,
+            plocks,
+            param_node_indices,
+        }
+    }
+
+    pub fn restore(&self, slot: &EffectSlotState) {
+        slot.node_id.store(self.node_id, Ordering::Relaxed);
+        slot.num_params.store(self.num_params, Ordering::Relaxed);
+        let np = self.num_params as usize;
+
+        for i in 0..np {
+            if i < self.defaults.len() {
+                slot.defaults.set(i, self.defaults[i]);
+            }
+        }
+
+        for s in 0..MAX_STEPS {
+            if s < self.plocks.len() {
+                for i in 0..np {
+                    if i < self.plocks[s].len() {
+                        match self.plocks[s][i] {
+                            Some(val) => slot.plocks.set(s, i, val),
+                            None => slot.plocks.clear_param(s, i),
+                        }
+                    }
+                }
+            }
+        }
+
+        for i in 0..np {
+            if i < self.param_node_indices.len() && i < slot.param_node_indices.len() {
+                slot.param_node_indices[i].store(self.param_node_indices[i], Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn new_default(desc: &EffectDescriptor, node_id: u32) -> Self {
+        let np = desc.params.len();
+        let defaults: Vec<f32> = desc.params.iter().map(|p| p.default).collect();
+        let plocks: Vec<Vec<Option<f32>>> = (0..MAX_STEPS)
+            .map(|_| vec![None; np])
+            .collect();
+        let param_node_indices: Vec<u32> = desc.params.iter().map(|p| p.node_param_idx).collect();
+
+        Self {
+            node_id,
+            num_params: np as u32,
+            defaults,
+            plocks,
+            param_node_indices,
+        }
+    }
+
+    pub fn new_empty() -> Self {
+        Self {
+            node_id: 0,
+            num_params: 0,
+            defaults: Vec::new(),
+            plocks: (0..MAX_STEPS).map(|_| Vec::new()).collect(),
+            param_node_indices: Vec::new(),
+        }
+    }
+}
+
+// ── Sync divisions (kept — orthogonal to effect system) ──
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SyncDivision {
@@ -314,235 +615,5 @@ impl SyncDivision {
 
     pub fn from_index(idx: usize) -> SyncDivision {
         SyncDivision::ALL[idx.min(SyncDivision::ALL.len() - 1)]
-    }
-}
-
-// ── Generic helpers for effect param access by global index ──
-
-/// Get default for a global effect param index (0..TOTAL_EFFECT_PARAMS).
-pub fn effect_param_default(global_idx: usize) -> f32 {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].default_value()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].default_value()
-    }
-}
-
-pub fn effect_param_min(global_idx: usize) -> f32 {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].min()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].min()
-    }
-}
-
-pub fn effect_param_max(global_idx: usize) -> f32 {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].max()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].max()
-    }
-}
-
-pub fn effect_param_increment(global_idx: usize) -> f32 {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].increment()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].increment()
-    }
-}
-
-pub fn effect_param_label(global_idx: usize) -> &'static str {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].label()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].label()
-    }
-}
-
-pub fn effect_param_is_boolean(global_idx: usize) -> bool {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].is_boolean()
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].is_boolean()
-    }
-}
-
-/// Returns true if this param is displayed as a percentage (0-100) but stored as 0.0-1.0.
-pub fn effect_param_is_percent(global_idx: usize) -> bool {
-    if global_idx >= NUM_FILTER_PARAMS {
-        matches!(DelayParam::ALL[global_idx - NUM_FILTER_PARAMS], DelayParam::Wet)
-    } else {
-        false
-    }
-}
-
-pub fn effect_param_format(global_idx: usize, val: f32) -> String {
-    if global_idx < NUM_FILTER_PARAMS {
-        FilterParam::ALL[global_idx].format_value(val)
-    } else {
-        DelayParam::ALL[global_idx - NUM_FILTER_PARAMS].format_value(val)
-    }
-}
-
-// ── P-lock data ──
-
-/// Per-track per-step effect parameter overrides.
-/// NaN = no override (use track default).
-pub struct EffectPLockData {
-    data: Vec<AtomicU32>,
-}
-
-impl EffectPLockData {
-    pub fn new() -> Self {
-        let size = MAX_STEPS * TOTAL_EFFECT_PARAMS;
-        let data: Vec<AtomicU32> = (0..size)
-            .map(|_| AtomicU32::new(NAN_BITS))
-            .collect();
-        Self { data }
-    }
-
-    fn index(step: usize, param_idx: usize) -> usize {
-        step * TOTAL_EFFECT_PARAMS + param_idx
-    }
-
-    /// Get p-locked value, or None if NaN (no override).
-    pub fn get(&self, step: usize, param_idx: usize) -> Option<f32> {
-        let bits = self.data[Self::index(step, param_idx)].load(Ordering::Relaxed);
-        let val = f32::from_bits(bits);
-        if val.is_nan() { None } else { Some(val) }
-    }
-
-    pub fn set(&self, step: usize, param_idx: usize, val: f32) {
-        let min = effect_param_min(param_idx);
-        let max = effect_param_max(param_idx);
-        let clamped = val.clamp(min, max);
-        self.data[Self::index(step, param_idx)].store(clamped.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Clear all p-locks for a step (set all to NaN).
-    pub fn clear_step(&self, step: usize) {
-        for p in 0..TOTAL_EFFECT_PARAMS {
-            self.data[Self::index(step, p)].store(NAN_BITS, Ordering::Relaxed);
-        }
-    }
-
-    /// Clear a single p-lock (set to NaN = no override).
-    pub fn clear_param(&self, step: usize, param_idx: usize) {
-        self.data[Self::index(step, param_idx)].store(NAN_BITS, Ordering::Relaxed);
-    }
-
-    /// Check if a step has any p-locked value.
-    pub fn step_has_any_plock(&self, step: usize) -> bool {
-        for p in 0..TOTAL_EFFECT_PARAMS {
-            let bits = self.data[Self::index(step, p)].load(Ordering::Relaxed);
-            if !f32::from_bits(bits).is_nan() {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-// ── Lisp effect p-lock types ──
-
-pub const MAX_LISP_PARAMS: usize = 16;
-
-/// Per-track per-step lisp effect parameter overrides.
-/// NaN = no override (use track default).
-/// Unlike EffectPLockData, does NOT clamp internally (min/max are dynamic per-effect; UI clamps).
-pub struct LispPLockData {
-    data: Vec<AtomicU32>,
-}
-
-impl LispPLockData {
-    pub fn new() -> Self {
-        let size = MAX_STEPS * MAX_LISP_PARAMS;
-        let data: Vec<AtomicU32> = (0..size)
-            .map(|_| AtomicU32::new(NAN_BITS))
-            .collect();
-        Self { data }
-    }
-
-    fn index(step: usize, param_idx: usize) -> usize {
-        step * MAX_LISP_PARAMS + param_idx
-    }
-
-    pub fn get(&self, step: usize, param_idx: usize) -> Option<f32> {
-        let bits = self.data[Self::index(step, param_idx)].load(Ordering::Relaxed);
-        let val = f32::from_bits(bits);
-        if val.is_nan() { None } else { Some(val) }
-    }
-
-    pub fn set(&self, step: usize, param_idx: usize, val: f32) {
-        self.data[Self::index(step, param_idx)].store(val.to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn clear_step(&self, step: usize) {
-        for p in 0..MAX_LISP_PARAMS {
-            self.data[Self::index(step, p)].store(NAN_BITS, Ordering::Relaxed);
-        }
-    }
-
-    pub fn clear_param(&self, step: usize, param_idx: usize) {
-        self.data[Self::index(step, param_idx)].store(NAN_BITS, Ordering::Relaxed);
-    }
-
-    pub fn step_has_any_plock(&self, step: usize, num_params: usize) -> bool {
-        for p in 0..num_params.min(MAX_LISP_PARAMS) {
-            let bits = self.data[Self::index(step, p)].load(Ordering::Relaxed);
-            if !f32::from_bits(bits).is_nan() {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-/// Per-track lisp effect default parameter values.
-pub struct LispParamDefaults {
-    data: [AtomicU32; MAX_LISP_PARAMS],
-}
-
-impl LispParamDefaults {
-    pub fn new() -> Self {
-        let data: [AtomicU32; MAX_LISP_PARAMS] = std::array::from_fn(|_| {
-            AtomicU32::new(0.0_f32.to_bits())
-        });
-        Self { data }
-    }
-
-    pub fn get(&self, idx: usize) -> f32 {
-        f32::from_bits(self.data[idx].load(Ordering::Relaxed))
-    }
-
-    pub fn set(&self, idx: usize, val: f32) {
-        self.data[idx].store(val.to_bits(), Ordering::Relaxed);
-    }
-}
-
-// ── Track-level effect defaults ──
-
-pub struct TrackEffectDefaults {
-    data: [AtomicU32; TOTAL_EFFECT_PARAMS],
-}
-
-impl TrackEffectDefaults {
-    pub fn new() -> Self {
-        let data: [AtomicU32; TOTAL_EFFECT_PARAMS] = std::array::from_fn(|i| {
-            AtomicU32::new(effect_param_default(i).to_bits())
-        });
-        Self { data }
-    }
-
-    pub fn get(&self, param_idx: usize) -> f32 {
-        f32::from_bits(self.data[param_idx].load(Ordering::Relaxed))
-    }
-
-    pub fn set(&self, param_idx: usize, val: f32) {
-        let min = effect_param_min(param_idx);
-        let max = effect_param_max(param_idx);
-        let clamped = val.clamp(min, max);
-        self.data[param_idx].store(clamped.to_bits(), Ordering::Relaxed);
     }
 }

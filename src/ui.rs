@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::TrackNodes;
 use crate::audiograph::LiveGraphPtr;
-use crate::effects::{EffectType, FilterParam};
+use crate::effects::{EffectDescriptor, EffectSlotState, BUILTIN_SLOT_COUNT};
 use crate::lisp_effect::{self, LoadedDGenLib};
 use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, STEPS_PER_PAGE};
 
@@ -79,13 +79,16 @@ pub struct App {
     pub focused_region: Region,
     pub params_column: usize, // 0 = track params (left), 1 = effects (right)
     pub track_param_cursor: usize, // 0=gate, 1=attack, 2=release, 3=swing, 4=steps
-    pub effect_cursor: EffectType,
-    pub effect_param_cursor: usize, // param index within focused effect
+    pub effect_slot_cursor: usize,  // index into effect_descriptors[track]
+    pub effect_param_cursor: usize, // param index within focused slot
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
     pub layout: LayoutRects,
     last_step_click: Option<(usize, Instant)>, // (step, time) for double-click detection
     pub pattern_clone_pending: bool,
+
+    // Per-track effect descriptors (metadata for UI rendering)
+    pub effect_descriptors: Vec<Vec<EffectDescriptor>>,
 
     // DGenLisp integration
     pub lg: LiveGraphPtr,
@@ -93,11 +96,6 @@ pub struct App {
     pub sample_rate: u32,
     pub pending_lisp_edit: bool,
     pub lisp_sources: Vec<String>,                          // per-track last edited source
-    pub lisp_effects: Vec<Option<i32>>,                     // per-track custom effect node ID
-    pub lisp_params: Vec<Option<Vec<lisp_effect::DGenParam>>>, // per-track manifest params
-    pub lisp_tab_active: bool,                              // true = Lisp tab selected
-    pub lisp_param_cursor: usize,                           // cursor within lisp params
-    pub lisp_param_values: Vec<Vec<f32>>,                   // per-track current param values
     lisp_libs: Vec<LoadedDGenLib>,                          // keep loaded dylibs alive
 }
 
@@ -118,6 +116,11 @@ impl App {
             })
             .collect();
 
+        // Initialize per-track effect descriptors: [Filter, Delay] for each track
+        let effect_descriptors: Vec<Vec<EffectDescriptor>> = (0..num_tracks)
+            .map(|_| EffectDescriptor::default_chain())
+            .collect();
+
         Self {
             state,
             tracks: tracks.iter().map(|t| t.name.clone()).collect(),
@@ -131,23 +134,19 @@ impl App {
             focused_region: Region::Cirklon,
             params_column: 0,
             track_param_cursor: 0,
-            effect_cursor: EffectType::Filter,
+            effect_slot_cursor: 0,
             effect_param_cursor: 0,
             dropdown_open: false,
             dropdown_cursor: 0,
             layout: LayoutRects::default(),
             last_step_click: None,
             pattern_clone_pending: false,
+            effect_descriptors,
             lg,
             track_node_ids,
             sample_rate,
             pending_lisp_edit: false,
             lisp_sources: vec![String::new(); num_tracks],
-            lisp_effects: vec![None; num_tracks],
-            lisp_params: vec![None; num_tracks],
-            lisp_tab_active: false,
-            lisp_param_cursor: 0,
-            lisp_param_values: vec![Vec::new(); num_tracks],
             lisp_libs: Vec::new(),
         }
     }
@@ -191,6 +190,37 @@ impl App {
         if self.cursor_step >= ns {
             self.cursor_step = ns - 1;
         }
+    }
+
+    /// Get the current slot's descriptor, if available.
+    fn current_slot_descriptor(&self) -> Option<&EffectDescriptor> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        self.effect_descriptors
+            .get(self.cursor_track)
+            .and_then(|descs| descs.get(self.effect_slot_cursor))
+    }
+
+    /// Get the current slot's runtime state, if available.
+    fn current_slot(&self) -> Option<&EffectSlotState> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        self.state.effect_chains
+            .get(self.cursor_track)
+            .and_then(|chain| chain.get(self.effect_slot_cursor))
+    }
+
+    /// Number of slots for the current track.
+    fn num_effect_slots(&self) -> usize {
+        if self.tracks.is_empty() {
+            return 0;
+        }
+        self.effect_descriptors
+            .get(self.cursor_track)
+            .map(|d| d.len())
+            .unwrap_or(0)
     }
 
     pub fn handle_input(&mut self) -> std::io::Result<()> {
@@ -274,18 +304,11 @@ impl App {
             return;
         }
 
-        // Effects block title row: click on effect tab
+        // Effects block title row: click on effect slot tab
         if row == l.effects_block.y && col >= l.effects_block.x && col < l.effects_block.x + l.effects_block.width {
-            let (et, is_lisp) = self.effect_tab_from_click_x(col);
-            if let Some(et) = et {
-                self.effect_cursor = et;
+            if let Some(slot_idx) = self.effect_tab_from_click_x(col) {
+                self.effect_slot_cursor = slot_idx;
                 self.effect_param_cursor = 0;
-                self.lisp_tab_active = false;
-                self.focused_region = Region::Params;
-                self.params_column = 1;
-            } else if is_lisp {
-                self.lisp_tab_active = true;
-                self.lisp_param_cursor = 0;
                 self.focused_region = Region::Params;
                 self.params_column = 1;
             }
@@ -295,20 +318,12 @@ impl App {
         // Effects inner: click selects effect param row
         if rect_contains(l.effects_inner, col, row) {
             let row_idx = (row - l.effects_inner.y) as usize;
-            if self.lisp_tab_active {
-                let max = self.lisp_params[self.cursor_track]
-                    .as_ref()
-                    .map(|p| p.len())
-                    .unwrap_or(0);
-                if row_idx < max {
+            if let Some(desc) = self.current_slot_descriptor() {
+                if row_idx < desc.params.len() {
                     self.focused_region = Region::Params;
                     self.params_column = 1;
-                    self.lisp_param_cursor = row_idx;
+                    self.effect_param_cursor = row_idx;
                 }
-            } else if row_idx < self.effect_cursor.num_params() {
-                self.focused_region = Region::Params;
-                self.params_column = 1;
-                self.effect_param_cursor = row_idx;
             }
             return;
         }
@@ -348,25 +363,22 @@ impl App {
         }
     }
 
-    /// Returns (Some(effect_type), false) for Filter/Delay tabs,
-    /// (None, true) for Lisp tab, (None, false) for no match.
-    fn effect_tab_from_click_x(&self, col: u16) -> (Option<EffectType>, bool) {
-        // Title starts at effects_block.x + 1 (after border)
+    /// Returns the slot index for a click on the effect tab bar, or None.
+    fn effect_tab_from_click_x(&self, col: u16) -> Option<usize> {
+        let num_slots = self.num_effect_slots();
+        if num_slots == 0 {
+            return None;
+        }
         let mut x = self.layout.effects_block.x + 1;
-        for et in EffectType::ALL {
-            let label_len = et.label().len() as u16;
-            let tab_width = label_len + 6; // "[< " + label + " >]"
+        for (i, desc) in self.effect_descriptors.get(self.cursor_track)?.iter().enumerate() {
+            let label_len = desc.name.len() as u16;
+            let tab_width = label_len + 6;
             if col >= x && col < x + tab_width {
-                return (Some(et), false);
+                return Some(i);
             }
-            x += tab_width + 2; // 2-char separator
+            x += tab_width + 2;
         }
-        // Check Lisp tab
-        let lisp_width = 4u16 + 6; // "Lisp" + brackets
-        if col >= x && col < x + lisp_width {
-            return (None, true);
-        }
-        (None, false)
+        None
     }
 
     /// Called from main loop after terminal is suspended.
@@ -378,7 +390,11 @@ impl App {
         let ids = &self.track_node_ids[track];
         let sampler_id = ids.sampler_id;
         let filter_id = ids.filter_id;
-        let existing = self.lisp_effects[track];
+        let existing_node = self.state.effect_chains[track]
+            .get(BUILTIN_SLOT_COUNT)
+            .map(|slot| slot.node_id.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let existing = if existing_node != 0 { Some(existing_node as i32) } else { None };
         let last_source = self.lisp_sources[track].clone();
         let track_name = self.tracks[track].clone();
 
@@ -394,21 +410,39 @@ impl App {
         );
 
         if let Some(r) = result {
-            self.lisp_effects[track] = Some(r.node_id);
             self.lisp_sources[track] = r.source;
-            self.lisp_param_values[track] = r.params.iter().map(|p| p.default).collect();
 
-            // Write metadata to shared SequencerState for audio thread
-            self.state.lisp_node_ids[track].store(r.node_id as u32, Ordering::Relaxed);
-            self.state.lisp_param_count[track].store(r.params.len() as u32, Ordering::Relaxed);
-            for (i, p) in r.params.iter().enumerate() {
-                self.state.set_lisp_cell_id(track, i, p.cell_id as u32);
-                self.state.lisp_defaults[track].set(i, p.default);
+            // Build descriptor from manifest params
+            let desc = EffectDescriptor::from_lisp_manifest("Lisp", &r.params);
+
+            // Find if we already have a lisp slot, or append
+            let lisp_slot_idx = if self.effect_descriptors[track].len() > BUILTIN_SLOT_COUNT {
+                // Replace existing lisp slot
+                self.effect_descriptors[track][BUILTIN_SLOT_COUNT] = desc.clone();
+                BUILTIN_SLOT_COUNT
+            } else {
+                // Append new lisp slot
+                self.effect_descriptors[track].push(desc.clone());
+                self.effect_descriptors[track].len() - 1
+            };
+
+            // Update effect chain state
+            let chain = &self.state.effect_chains[track];
+            if lisp_slot_idx < chain.len() {
+                let slot = &chain[lisp_slot_idx];
+                slot.node_id.store(r.node_id as u32, Ordering::Relaxed);
+                slot.num_params.store(r.params.len() as u32, Ordering::Relaxed);
+                for (i, p) in r.params.iter().enumerate() {
+                    slot.defaults.set(i, p.default);
+                    if i < slot.param_node_indices.len() {
+                        let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
+                        slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
+                    }
+                }
             }
 
-            self.lisp_params[track] = Some(r.params);
-            self.lisp_tab_active = true;
-            self.lisp_param_cursor = 0;
+            self.effect_slot_cursor = lisp_slot_idx;
+            self.effect_param_cursor = 0;
             self.lisp_libs.push(r.lib);
         }
     }
@@ -690,30 +724,23 @@ impl App {
     }
 
     fn handle_effects_column(&mut self, code: KeyCode) {
-        if self.lisp_tab_active {
-            self.handle_lisp_tab(code);
-            return;
-        }
+        let num_slots = self.num_effect_slots();
+
         match code {
             KeyCode::Left => {
-                let idx = EffectType::ALL.iter().position(|&e| e == self.effect_cursor).unwrap_or(0);
-                if idx > 0 {
-                    self.effect_cursor = EffectType::ALL[idx - 1];
+                if self.effect_slot_cursor > 0 {
+                    self.effect_slot_cursor -= 1;
                     self.effect_param_cursor = 0;
                 } else {
                     self.params_column = 0;
                 }
             }
             KeyCode::Right => {
-                let idx = EffectType::ALL.iter().position(|&e| e == self.effect_cursor).unwrap_or(0);
-                if idx + 1 < EffectType::ALL.len() {
-                    self.effect_cursor = EffectType::ALL[idx + 1];
+                if self.effect_slot_cursor + 1 < num_slots {
+                    self.effect_slot_cursor += 1;
                     self.effect_param_cursor = 0;
-                } else {
-                    // Move to Lisp tab
-                    self.lisp_tab_active = true;
-                    self.lisp_param_cursor = 0;
                 }
+                // Already at rightmost slot — do nothing
             }
             KeyCode::Up => {
                 if self.effect_param_cursor > 0 {
@@ -721,41 +748,45 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let max = self.effect_cursor.num_params().saturating_sub(1);
-                if self.effect_param_cursor < max {
-                    self.effect_param_cursor += 1;
+                if let Some(desc) = self.current_slot_descriptor() {
+                    let max = desc.params.len().saturating_sub(1);
+                    if self.effect_param_cursor < max {
+                        self.effect_param_cursor += 1;
+                    }
                 }
             }
             KeyCode::Enter => {
-                let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-                if crate::effects::effect_param_is_boolean(global_idx) {
-                    self.toggle_effect_boolean(global_idx);
-                } else if self.should_open_dropdown(global_idx) {
-                    self.dropdown_open = true;
-                    self.dropdown_cursor = 0;
-                    self.input_mode = InputMode::Dropdown;
-                    if global_idx == FilterParam::Mode.global_index() {
-                        let val = self.get_current_effect_value(global_idx);
-                        self.dropdown_cursor = val.round() as usize;
+                if let Some(desc) = self.current_slot_descriptor() {
+                    if self.effect_param_cursor < desc.params.len() {
+                        let param = &desc.params[self.effect_param_cursor];
+                        if param.is_boolean() {
+                            self.toggle_slot_boolean();
+                        } else if param.is_enum() {
+                            self.dropdown_open = true;
+                            self.dropdown_cursor = 0;
+                            self.input_mode = InputMode::Dropdown;
+                            let val = self.get_current_slot_value();
+                            self.dropdown_cursor = val.round() as usize;
+                        }
                     }
                 }
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
-                let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-                let inc = crate::effects::effect_param_increment(global_idx);
-                self.adjust_effect_param(global_idx, inc);
+                self.adjust_slot_param(1.0);
             }
             KeyCode::Char('-') => {
-                let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-                let inc = crate::effects::effect_param_increment(global_idx);
-                self.adjust_effect_param(global_idx, -inc);
+                self.adjust_slot_param(-1.0);
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
-                let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-                if !crate::effects::effect_param_is_boolean(global_idx) {
-                    self.value_buffer.clear();
-                    self.value_buffer.push(c);
-                    self.input_mode = InputMode::ValueEntry;
+                if let Some(desc) = self.current_slot_descriptor() {
+                    if self.effect_param_cursor < desc.params.len() {
+                        let param = &desc.params[self.effect_param_cursor];
+                        if !param.is_boolean() {
+                            self.value_buffer.clear();
+                            self.value_buffer.push(c);
+                            self.input_mode = InputMode::ValueEntry;
+                        }
+                    }
                 }
             }
             KeyCode::Char('[') => {
@@ -772,104 +803,99 @@ impl App {
         }
     }
 
-    fn handle_lisp_tab(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Left => {
-                self.lisp_tab_active = false;
-                self.effect_cursor = *EffectType::ALL.last().unwrap();
-                self.effect_param_cursor = 0;
-            }
-            KeyCode::Right => {} // already rightmost tab
-            KeyCode::Up => {
-                if self.lisp_param_cursor > 0 {
-                    self.lisp_param_cursor -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let max = self.lisp_params[self.cursor_track]
-                    .as_ref()
-                    .map(|p| p.len().saturating_sub(1))
-                    .unwrap_or(0);
-                if self.lisp_param_cursor < max {
-                    self.lisp_param_cursor += 1;
-                }
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.adjust_lisp_param(1.0);
-            }
-            KeyCode::Char('-') => {
-                self.adjust_lisp_param(-1.0);
-            }
-            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
-                if self.lisp_params[self.cursor_track]
-                    .as_ref()
-                    .map(|p| !p.is_empty())
-                    .unwrap_or(false)
-                {
-                    self.value_buffer.clear();
-                    self.value_buffer.push(c);
-                    self.input_mode = InputMode::ValueEntry;
-                }
-            }
-            KeyCode::Char('[') => {
-                let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step == 0 { ns - 1 } else { self.cursor_step - 1 };
-                self.selection_anchor = Some(self.cursor_step);
-            }
-            KeyCode::Char(']') => {
-                let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step + 1 >= ns { 0 } else { self.cursor_step + 1 };
-                self.selection_anchor = Some(self.cursor_step);
-            }
-            _ => {}
-        }
-    }
-
-    fn adjust_lisp_param(&mut self, direction: f32) {
+    fn adjust_slot_param(&self, direction: f32) {
         let track = self.cursor_track;
-        let idx = self.lisp_param_cursor;
-        if let Some(params) = &self.lisp_params[track] {
-            if idx < params.len() {
-                let param = &params[idx];
-                let inc = (param.max - param.min) * 0.01;
-                if self.has_selection() {
-                    let (lo, hi) = self.selected_range();
-                    for step in lo..=hi {
-                        let current = self.state.lisp_plocks[track]
-                            .get(step, idx)
-                            .unwrap_or_else(|| self.state.lisp_defaults[track].get(idx));
-                        let new_val = (current + direction * inc).clamp(param.min, param.max);
-                        self.state.lisp_plocks[track].set(step, idx, new_val);
-                    }
-                } else {
-                    let old = self.state.lisp_defaults[track].get(idx);
-                    let new_val = (old + direction * inc).clamp(param.min, param.max);
-                    self.state.lisp_defaults[track].set(idx, new_val);
-                    self.send_lisp_param(track, param.cell_id, new_val);
-                }
+        let slot_idx = self.effect_slot_cursor;
+        let param_idx = self.effect_param_cursor;
+
+        let desc = match self.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+            Some(d) => d,
+            None => return,
+        };
+        if param_idx >= desc.params.len() {
+            return;
+        }
+        let param_desc = &desc.params[param_idx];
+
+        let chain = &self.state.effect_chains[track];
+        if slot_idx >= chain.len() {
+            return;
+        }
+        let slot = &chain[slot_idx];
+
+        if self.has_selection() {
+            let (lo, hi) = self.selected_range();
+            for step in lo..=hi {
+                let current = slot.plocks.get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let inc = param_desc.increment(current);
+                let new_val = param_desc.clamp(current + direction * inc);
+                slot.plocks.set(step, param_idx, new_val);
             }
+        } else {
+            let old = slot.defaults.get(param_idx);
+            let inc = param_desc.increment(old);
+            let new_val = param_desc.clamp(old + direction * inc);
+            slot.defaults.set(param_idx, new_val);
+            // Send immediate param update to audio graph
+            self.send_slot_param(track, slot_idx, param_idx, new_val);
         }
     }
 
-    fn send_lisp_param(&self, track: usize, cell_id: usize, value: f32) {
-        if let Some(node_id) = self.lisp_effects[track] {
-            let idx = (lisp_effect::HEADER_SLOTS + cell_id) as u64;
-            unsafe {
-                crate::audiograph::params_push_wrapper(
-                    self.lg.0,
-                    crate::audiograph::ParamMsg {
-                        idx,
-                        logical_id: node_id as u64,
-                        fvalue: value,
-                    },
-                );
+    fn send_slot_param(&self, track: usize, slot_idx: usize, param_idx: usize, value: f32) {
+        let chain = &self.state.effect_chains[track];
+        if slot_idx >= chain.len() {
+            return;
+        }
+        let slot = &chain[slot_idx];
+        let node_id = slot.node_id.load(Ordering::Relaxed);
+        if node_id == 0 {
+            return;
+        }
+        let idx = slot.resolve_node_idx(param_idx);
+        unsafe {
+            crate::audiograph::params_push_wrapper(
+                self.lg.0,
+                crate::audiograph::ParamMsg {
+                    idx,
+                    logical_id: node_id as u64,
+                    fvalue: value,
+                },
+            );
+        }
+    }
+
+    fn toggle_slot_boolean(&self) {
+        let param_idx = self.effect_param_cursor;
+
+        let slot = match self.current_slot() {
+            Some(s) => s,
+            None => return,
+        };
+
+        if self.has_selection() {
+            let (lo, hi) = self.selected_range();
+            for step in lo..=hi {
+                let current = slot.plocks.get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+                slot.plocks.set(step, param_idx, new_val);
             }
+        } else {
+            let current = slot.defaults.get(param_idx);
+            let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+            slot.defaults.set(param_idx, new_val);
+        }
+    }
+
+    fn get_current_slot_value(&self) -> f32 {
+        match self.current_slot() {
+            Some(slot) => slot.defaults.get(self.effect_param_cursor),
+            None => 0.0,
         }
     }
 
     fn handle_dropdown(&mut self, code: KeyCode) {
-        let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-
         match code {
             KeyCode::Up => {
                 if self.dropdown_cursor > 0 {
@@ -877,13 +903,13 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let max = self.dropdown_max_items(global_idx);
-                if self.dropdown_cursor < max - 1 {
+                let max = self.dropdown_max_items();
+                if self.dropdown_cursor < max.saturating_sub(1) {
                     self.dropdown_cursor += 1;
                 }
             }
             KeyCode::Enter => {
-                self.apply_dropdown_selection(global_idx);
+                self.apply_dropdown_selection();
                 self.dropdown_open = false;
                 self.input_mode = InputMode::Normal;
             }
@@ -895,70 +921,45 @@ impl App {
         }
     }
 
-    fn should_open_dropdown(&self, global_idx: usize) -> bool {
-        global_idx == FilterParam::Mode.global_index()
-    }
-
-    fn dropdown_max_items(&self, global_idx: usize) -> usize {
-        if global_idx == FilterParam::Mode.global_index() {
-            3 // LP, HP, BP
-        } else {
-            0
+    fn dropdown_max_items(&self) -> usize {
+        if let Some(desc) = self.current_slot_descriptor() {
+            if self.effect_param_cursor < desc.params.len() {
+                if let crate::effects::ParamKind::Enum { ref labels } = desc.params[self.effect_param_cursor].kind {
+                    return labels.len();
+                }
+            }
         }
+        0
     }
 
-    fn apply_dropdown_selection(&self, global_idx: usize) {
+    fn dropdown_labels(&self) -> &[String] {
+        if let Some(desc) = self.current_slot_descriptor() {
+            if self.effect_param_cursor < desc.params.len() {
+                if let crate::effects::ParamKind::Enum { ref labels } = desc.params[self.effect_param_cursor].kind {
+                    return labels;
+                }
+            }
+        }
+        &[]
+    }
+
+    fn apply_dropdown_selection(&self) {
         let val = self.dropdown_cursor as f32;
+        let param_idx = self.effect_param_cursor;
+
+        let slot = match self.current_slot() {
+            Some(s) => s,
+            None => return,
+        };
+
         if self.has_selection() {
             let (lo, hi) = self.selected_range();
-            let plocks = &self.state.effect_plocks[self.cursor_track];
             for step in lo..=hi {
-                plocks.set(step, global_idx, val);
+                slot.plocks.set(step, param_idx, val);
             }
         } else {
-            self.state.effect_defaults[self.cursor_track].set(global_idx, val);
+            slot.defaults.set(param_idx, val);
         }
-    }
-
-    fn toggle_effect_boolean(&self, global_idx: usize) {
-        if self.has_selection() {
-            let (lo, hi) = self.selected_range();
-            let plocks = &self.state.effect_plocks[self.cursor_track];
-            let defaults = &self.state.effect_defaults[self.cursor_track];
-            for step in lo..=hi {
-                let current = plocks.get(step, global_idx).unwrap_or_else(|| defaults.get(global_idx));
-                let new_val = if current > 0.5 { 0.0 } else { 1.0 };
-                plocks.set(step, global_idx, new_val);
-            }
-        } else {
-            let defaults = &self.state.effect_defaults[self.cursor_track];
-            let current = defaults.get(global_idx);
-            let new_val = if current > 0.5 { 0.0 } else { 1.0 };
-            defaults.set(global_idx, new_val);
-        }
-    }
-
-    fn adjust_effect_param(&self, global_idx: usize, delta: f32) {
-        if self.has_selection() {
-            let (lo, hi) = self.selected_range();
-            let plocks = &self.state.effect_plocks[self.cursor_track];
-            let defaults = &self.state.effect_defaults[self.cursor_track];
-            for step in lo..=hi {
-                let current = plocks.get(step, global_idx).unwrap_or_else(|| defaults.get(global_idx));
-                let min = crate::effects::effect_param_min(global_idx);
-                let max = crate::effects::effect_param_max(global_idx);
-                let new_val = (current + delta).clamp(min, max);
-                plocks.set(step, global_idx, new_val);
-            }
-        } else {
-            let defaults = &self.state.effect_defaults[self.cursor_track];
-            let current = defaults.get(global_idx);
-            defaults.set(global_idx, current + delta);
-        }
-    }
-
-    fn get_current_effect_value(&self, global_idx: usize) -> f32 {
-        self.state.effect_defaults[self.cursor_track].get(global_idx)
     }
 
     fn handle_value_entry(&mut self, code: KeyCode) {
@@ -1025,39 +1026,36 @@ impl App {
                         }
                         _ => {}
                     }
-                } else if self.lisp_tab_active {
-                    // Lisp effect params — p-lock aware
-                    let track = self.cursor_track;
-                    let idx = self.lisp_param_cursor;
-                    if let Some(params) = &self.lisp_params[track] {
-                        if idx < params.len() {
-                            let clamped = val.clamp(params[idx].min, params[idx].max);
-                            if self.has_selection() {
-                                let (lo, hi) = self.selected_range();
-                                for step in lo..=hi {
-                                    self.state.lisp_plocks[track].set(step, idx, clamped);
-                                }
-                            } else {
-                                self.state.lisp_defaults[track].set(idx, clamped);
-                                self.send_lisp_param(track, params[idx].cell_id, clamped);
-                            }
-                        }
-                    }
                 } else {
-                    let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
-                    let store_val = if crate::effects::effect_param_is_percent(global_idx) {
-                        val / 100.0
-                    } else {
-                        val
+                    // Unified effect slot value entry
+                    let track = self.cursor_track;
+                    let slot_idx = self.effect_slot_cursor;
+                    let param_idx = self.effect_param_cursor;
+
+                    let desc = match self.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+                        Some(d) => d,
+                        None => return,
                     };
+                    if param_idx >= desc.params.len() {
+                        return;
+                    }
+                    let param_desc = &desc.params[param_idx];
+                    let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
+
+                    let chain = &self.state.effect_chains[track];
+                    if slot_idx >= chain.len() {
+                        return;
+                    }
+                    let slot = &chain[slot_idx];
+
                     if self.has_selection() {
                         let (lo, hi) = self.selected_range();
-                        let plocks = &self.state.effect_plocks[self.cursor_track];
                         for step in lo..=hi {
-                            plocks.set(step, global_idx, store_val);
+                            slot.plocks.set(step, param_idx, store_val);
                         }
                     } else {
-                        self.state.effect_defaults[self.cursor_track].set(global_idx, store_val);
+                        slot.defaults.set(param_idx, store_val);
+                        self.send_slot_param(track, slot_idx, param_idx, store_val);
                     }
                 }
             }
@@ -1355,13 +1353,9 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Branch to effect/lisp bars when effects column is focused in params region
+    // Branch to effect slot bars when effects column is focused
     if app.focused_region == Region::Params && app.params_column == 1 {
-        if app.lisp_tab_active {
-            draw_lisp_bars(frame, app, area);
-        } else {
-            draw_effect_bars(frame, app, area);
-        }
+        draw_slot_bars(frame, app, area);
         return;
     }
 
@@ -1468,86 +1462,32 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_lisp_bars(frame: &mut Frame, app: &App, area: Rect) {
+/// Unified bar drawing for any effect slot.
+fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
     let track = app.cursor_track;
-    let idx = app.lisp_param_cursor;
-    let params = match &app.lisp_params[track] {
-        Some(p) if idx < p.len() => p,
-        _ => return,
+    let slot_idx = app.effect_slot_cursor;
+    let param_idx = app.effect_param_cursor;
+
+    let desc = match app.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+        Some(d) => d,
+        None => return,
     };
-    let param = &params[idx];
-
-    let ns = app.num_steps();
-    let global_playhead = app.state.current_step();
-    let playhead = global_playhead % ns;
-    let is_playing = app.state.is_playing();
-    let (page_start, page_end) = app.page_range();
-    let x_offset = 2u16;
-    let range = param.max - param.min;
-
-    for step in page_start..page_end {
-        let col_x = area.x + x_offset + (step - page_start) as u16 * COL_WIDTH;
-        if col_x + COL_WIDTH > area.x + area.width {
-            break;
-        }
-
-        let plock_val = app.state.lisp_plocks[track].get(step, idx);
-        let value = plock_val.unwrap_or_else(|| app.state.lisp_defaults[track].get(idx));
-        let normalized = if range > 0.0 {
-            ((value - param.min) / range).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        let active = app.state.patterns[track].is_active(step);
-        let playhead_on_page = playhead >= page_start && playhead < page_end;
-        let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
-
-        let fill_levels = (normalized * (BAR_HEIGHT as f32 * 2.0)).round() as usize;
-
-        for row in 0..BAR_HEIGHT {
-            let cell_y = area.y + row as u16;
-            let rows_from_bottom = BAR_HEIGHT - 1 - row;
-            let threshold = rows_from_bottom * 2;
-            let level = if fill_levels >= threshold + 2 { 2 }
-                else if fill_levels >= threshold + 1 { 1 }
-                else { 0 };
-
-            let ch = match level {
-                2 => "\u{2588}",
-                1 => "\u{2584}",
-                _ => " ",
-            };
-
-            let cell_text = if ch == " " {
-                "   ".to_string()
-            } else {
-                format!(" {} ", ch)
-            };
-
-            let fg = if !active {
-                Color::Rgb(60, 60, 60)
-            } else if plock_val.is_some() {
-                Color::Cyan
-            } else {
-                Color::Green
-            };
-            let style = Style::default().fg(fg).bg(bg);
-            let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
-            frame.render_widget(Paragraph::new(cell_text).style(style), cell_area);
-        }
+    if param_idx >= desc.params.len() {
+        return;
     }
-}
+    let param_desc = &desc.params[param_idx];
 
-fn draw_effect_bars(frame: &mut Frame, app: &App, area: Rect) {
-    let track = app.cursor_track;
-    let global_idx = app.effect_cursor.param_offset() + app.effect_param_cursor;
-
-    // Skip boolean params (e.g., filter enabled, delay synced)
-    if crate::effects::effect_param_is_boolean(global_idx) {
+    // Skip boolean params
+    if param_desc.is_boolean() {
         return;
     }
 
+    let chain = &app.state.effect_chains[track];
+    if slot_idx >= chain.len() {
+        return;
+    }
+    let slot = &chain[slot_idx];
+
     let ns = app.num_steps();
     let global_playhead = app.state.current_step();
     let playhead = global_playhead % ns;
@@ -1555,9 +1495,9 @@ fn draw_effect_bars(frame: &mut Frame, app: &App, area: Rect) {
     let (page_start, page_end) = app.page_range();
     let x_offset = 2u16;
 
-    let param_min = crate::effects::effect_param_min(global_idx);
-    let param_max = crate::effects::effect_param_max(global_idx);
-    let range = param_max - param_min;
+    // Determine slot color: builtin=Magenta, custom=Green
+    let is_lisp_slot = slot_idx >= BUILTIN_SLOT_COUNT;
+    let default_color = if is_lisp_slot { Color::Green } else { Color::Magenta };
 
     for step in page_start..page_end {
         let col_x = area.x + x_offset + (step - page_start) as u16 * COL_WIDTH;
@@ -1565,13 +1505,9 @@ fn draw_effect_bars(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
 
-        let plock_val = app.state.effect_plocks[track].get(step, global_idx);
-        let value = plock_val.unwrap_or_else(|| app.state.effect_defaults[track].get(global_idx));
-        let normalized = if range > 0.0 {
-            ((value - param_min) / range).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let plock_val = slot.plocks.get(step, param_idx);
+        let value = plock_val.unwrap_or_else(|| slot.defaults.get(param_idx));
+        let normalized = param_desc.normalize(value);
 
         let active = app.state.patterns[track].is_active(step);
         let playhead_on_page = playhead >= page_start && playhead < page_end;
@@ -1604,7 +1540,7 @@ fn draw_effect_bars(frame: &mut Frame, app: &App, area: Rect) {
             } else if plock_val.is_some() {
                 Color::Cyan
             } else {
-                Color::Magenta
+                default_color
             };
             let style = Style::default().fg(fg).bg(bg);
             let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
@@ -1632,10 +1568,13 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         let active = app.state.patterns[app.cursor_track].is_active(step);
-        let has_effect_plock = app.state.effect_plocks[app.cursor_track].step_has_any_plock(step);
-        let lisp_param_count = app.state.lisp_param_count[app.cursor_track].load(Ordering::Relaxed) as usize;
-        let has_lisp_plock = app.state.lisp_plocks[app.cursor_track].step_has_any_plock(step, lisp_param_count);
-        let has_plock = has_effect_plock || has_lisp_plock;
+        // Check all slots for p-locks
+        let has_plock = app.state.effect_chains[app.cursor_track]
+            .iter()
+            .any(|slot| {
+                let np = slot.num_params.load(Ordering::Relaxed) as usize;
+                slot.plocks.step_has_any_plock(step, np)
+            });
         let ch = if active && has_plock {
             " * "
         } else if active {
@@ -1876,45 +1815,33 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         Style::default().fg(Color::Rgb(60, 60, 60))
     };
 
-    // Build title with effect type tabs (Filter, Delay, Lisp)
+    // Build title with slot tabs from effect_descriptors
     let mut title_spans = vec![];
-    for et in EffectType::ALL {
-        let is_selected = et == app.effect_cursor && !app.lisp_tab_active;
-        let style = if is_selected && col_focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan).bold()
-        } else if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let label = if is_selected {
-            format!("[< {} >]", et.label())
-        } else {
-            format!("[  {}  ]", et.label())
-        };
-        title_spans.push(Span::styled(label, style));
-        title_spans.push(Span::raw("  "));
-    }
-    // Lisp tab
-    {
-        let is_selected = app.lisp_tab_active;
-        let has_effect = !app.tracks.is_empty() && app.lisp_effects[app.cursor_track].is_some();
-        let lisp_label = if has_effect { "Lisp" } else { "Lisp" };
-        let style = if is_selected && col_focused {
-            Style::default().fg(Color::Black).bg(Color::Green).bold()
-        } else if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
-        } else if has_effect {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let label = if is_selected {
-            format!("[< {} >]", lisp_label)
-        } else {
-            format!("[  {}  ]", lisp_label)
-        };
-        title_spans.push(Span::styled(label, style));
+    if let Some(descs) = app.effect_descriptors.get(app.cursor_track) {
+        for (i, desc) in descs.iter().enumerate() {
+            let is_selected = i == app.effect_slot_cursor;
+            let is_lisp = i >= 2;
+            let style = if is_selected && col_focused {
+                if is_lisp {
+                    Style::default().fg(Color::Black).bg(Color::Green).bold()
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+                }
+            } else if is_selected {
+                Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
+            } else if is_lisp {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let label = if is_selected {
+                format!("[< {} >]", desc.name)
+            } else {
+                format!("[  {}  ]", desc.name)
+            };
+            title_spans.push(Span::styled(label, style));
+            title_spans.push(Span::raw("  "));
+        }
     }
 
     let block = Block::default()
@@ -1931,28 +1858,48 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         return;
     }
 
-    if app.lisp_tab_active {
-        draw_lisp_params(frame, app, inner, col_focused);
+    let track = app.cursor_track;
+    let slot_idx = app.effect_slot_cursor;
+
+    // Check if this is an empty lisp slot with no effect loaded
+    let is_lisp_slot = slot_idx >= BUILTIN_SLOT_COUNT;
+    let chain = &app.state.effect_chains[track];
+    let has_node = if slot_idx < chain.len() {
+        chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
+    } else {
+        false
+    };
+
+    if is_lisp_slot && !has_node {
+        // No effect loaded
+        let hint = Line::from(vec![
+            Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
+            Span::styled(" to create effect", Style::default().fg(Color::DarkGray)),
+        ]);
+        let row_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        frame.render_widget(Paragraph::new(hint), row_area);
         return;
     }
 
-    // Effect params
-    let defaults = &app.state.effect_defaults[app.cursor_track];
-    let offset = app.effect_cursor.param_offset();
-    let num_params = app.effect_cursor.num_params();
-    let is_entering_value = col_focused
-        && app.input_mode == InputMode::ValueEntry;
+    // Render params for current slot
+    let desc = match app.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+        Some(d) => d,
+        None => return,
+    };
 
-    for i in 0..num_params {
+    if slot_idx >= chain.len() {
+        return;
+    }
+    let slot = &chain[slot_idx];
+    let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+
+    for (i, param_desc) in desc.params.iter().enumerate() {
         let row_y = inner.y + i as u16;
         if row_y >= inner.y + inner.height {
             break;
         }
-        let global_idx = offset + i;
-        let value = defaults.get(global_idx);
-        let label = crate::effects::effect_param_label(global_idx);
-        let formatted = crate::effects::effect_param_format(global_idx, value);
 
+        let default_val = slot.defaults.get(i);
         let is_cursor_row = col_focused && app.effect_param_cursor == i;
         let cursor = if is_cursor_row { "> " } else { "  " };
         let cursor_style = if is_cursor_row {
@@ -1964,6 +1911,7 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         let label_width = 12;
         let value_width = 14;
 
+        // Value entry mode
         if is_cursor_row && is_entering_value {
             let target_label = if app.has_selection() {
                 let (lo, hi) = app.selected_range();
@@ -1973,7 +1921,7 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             };
             let spans = vec![
                 Span::styled(cursor, cursor_style),
-                Span::styled(format!("{:<width$}", label, width = label_width), Style::default().fg(Color::Gray)),
+                Span::styled(format!("{:<width$}", param_desc.name, width = label_width), Style::default().fg(Color::Gray)),
                 Span::styled(
                     format!("{}\u{2588}", app.value_buffer),
                     Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
@@ -1989,31 +1937,53 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             continue;
         }
 
+        // Determine display value and p-lock status
+        let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
+            let plock_val = slot.plocks.get(app.cursor_step, i);
+            match plock_val {
+                Some(v) => (v, Some(" (p-lock)")),
+                None => (default_val, None),
+            }
+        } else {
+            (default_val, None)
+        };
+
+        let formatted = param_desc.format_value(display_val);
+
         let mut spans = vec![
             Span::styled(cursor, cursor_style),
-            Span::styled(format!("{:<width$}", label, width = label_width), Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:<width$}", formatted, width = value_width), cursor_style),
+            Span::styled(
+                format!("{:<width$}", param_desc.name, width = label_width),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("{:<width$}", formatted, width = value_width),
+                cursor_style,
+            ),
         ];
 
-        // Add slider for numeric params
-        if !crate::effects::effect_param_is_boolean(global_idx) {
-            let min = crate::effects::effect_param_min(global_idx);
-            let max = crate::effects::effect_param_max(global_idx);
-            let range = max - min;
+        if let Some(lbl) = plock_label {
+            spans.push(Span::styled(lbl, Style::default().fg(Color::Cyan)));
+        }
+
+        // Slider for numeric params
+        if !param_desc.is_boolean() {
+            let range = param_desc.max - param_desc.min;
             if range > 0.0 {
-                let ns = app.num_steps();
-                let step = app.state.current_step() % ns;
-                let bar_value = app.state.effect_plocks[app.cursor_track]
-                    .get(step, global_idx)
-                    .unwrap_or(value);
-                let norm = ((bar_value - min) / range).clamp(0.0, 1.0);
+                let slider_val = if app.has_selection() {
+                    slot.plocks.get(app.cursor_step, i).unwrap_or(default_val)
+                } else {
+                    default_val
+                };
+                let norm = param_desc.normalize(slider_val);
                 let slider_width = (inner.width as usize).saturating_sub(label_width + value_width + 6);
                 if slider_width > 2 {
                     let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
                     let bar: String = "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
+                    let slider_color = if is_lisp_slot { Color::Green } else { Color::Magenta };
                     spans.push(Span::styled(
                         format!("[{}]", bar),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(slider_color),
                     ));
                 }
             }
@@ -2030,171 +2000,11 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     }
 }
 
-fn draw_lisp_params(frame: &mut Frame, app: &App, inner: Rect, col_focused: bool) {
-    let track = app.cursor_track;
-    let has_effect = app.lisp_effects[track].is_some();
-
-    if !has_effect {
-        // No effect loaded
-        let hint = Line::from(vec![
-            Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
-            Span::styled(" to create effect", Style::default().fg(Color::DarkGray)),
-        ]);
-        let row_area = Rect::new(inner.x, inner.y, inner.width, 1);
-        frame.render_widget(Paragraph::new(hint), row_area);
-        return;
-    }
-
-    // Effect is loaded
-    match &app.lisp_params[track] {
-        Some(params) if !params.is_empty() => {
-            let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
-
-            for (i, param) in params.iter().enumerate() {
-                let row_y = inner.y + i as u16;
-                if row_y >= inner.y + inner.height {
-                    break;
-                }
-
-                let is_cursor_row = col_focused && app.lisp_param_cursor == i;
-                let cursor = if is_cursor_row { "> " } else { "  " };
-                let cursor_style = if is_cursor_row {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
-                let label_width = 12;
-                let value_width = 14;
-
-                let default_val = app.state.lisp_defaults[track].get(i);
-                let unit_str = param
-                    .unit
-                    .as_deref()
-                    .map(|u| format!(" {}", u))
-                    .unwrap_or_default();
-
-                // Value entry mode
-                if is_cursor_row && is_entering_value {
-                    let target_label = if app.has_selection() {
-                        let (lo, hi) = app.selected_range();
-                        format!("p-lock steps {}-{}", lo + 1, hi + 1)
-                    } else {
-                        "default".to_string()
-                    };
-                    let spans = vec![
-                        Span::styled(cursor, cursor_style),
-                        Span::styled(format!("{:<width$}", param.name, width = label_width), Style::default().fg(Color::Gray)),
-                        Span::styled(
-                            format!("{}\u{2588}", app.value_buffer),
-                            Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
-                        ),
-                        Span::styled(
-                            format!("  ({})  Enter: set  Esc: cancel", target_label),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ];
-                    let line = Line::from(spans);
-                    let row_area = Rect::new(inner.x, row_y, inner.width, 1);
-                    frame.render_widget(Paragraph::new(line), row_area);
-                    continue;
-                }
-
-                // Determine display value and p-lock status
-                let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
-                    let plock_val = app.state.lisp_plocks[track].get(app.cursor_step, i);
-                    match plock_val {
-                        Some(v) => (v, Some(" (p-lock)")),
-                        None => (default_val, None),
-                    }
-                } else {
-                    (default_val, None)
-                };
-
-                let formatted = format!("{:.2}{}", display_val, unit_str);
-
-                let mut spans = vec![
-                    Span::styled(cursor, cursor_style),
-                    Span::styled(
-                        format!("{:<width$}", param.name, width = label_width),
-                        Style::default().fg(Color::Gray),
-                    ),
-                    Span::styled(
-                        format!("{:<width$}", formatted, width = value_width),
-                        cursor_style,
-                    ),
-                ];
-
-                if let Some(lbl) = plock_label {
-                    spans.push(Span::styled(lbl, Style::default().fg(Color::Cyan)));
-                }
-
-                // Slider
-                let range = param.max - param.min;
-                if range > 0.0 {
-                    let slider_val = if app.has_selection() {
-                        app.state.lisp_plocks[track]
-                            .get(app.cursor_step, i)
-                            .unwrap_or(default_val)
-                    } else {
-                        default_val
-                    };
-                    let norm = ((slider_val - param.min) / range).clamp(0.0, 1.0);
-                    let slider_width =
-                        (inner.width as usize).saturating_sub(label_width + value_width + 6);
-                    if slider_width > 2 {
-                        let filled =
-                            ((norm * slider_width as f32).round() as usize).min(slider_width);
-                        let bar: String =
-                            "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
-                        spans.push(Span::styled(
-                            format!("[{}]", bar),
-                            Style::default().fg(Color::Green),
-                        ));
-                    }
-                }
-
-                let line = Line::from(spans);
-                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
-                frame.render_widget(Paragraph::new(line), row_area);
-            }
-        }
-        _ => {
-            // Effect loaded but no params
-            let lines = vec![
-                Line::from(Span::styled(
-                    "  effect active",
-                    Style::default().fg(Color::Green),
-                )),
-                Line::from(Span::styled(
-                    "  (no parameters)",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(vec![
-                    Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
-                    Span::styled(" to edit", Style::default().fg(Color::DarkGray)),
-                ]),
-            ];
-            for (i, line) in lines.iter().enumerate() {
-                let row_y = inner.y + i as u16;
-                if row_y >= inner.y + inner.height {
-                    break;
-                }
-                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
-                frame.render_widget(Paragraph::new(line.clone()), row_area);
-            }
-        }
-    }
-}
-
 fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let global_idx = app.effect_cursor.param_offset() + app.effect_param_cursor;
-
-    let items: Vec<&str> = if global_idx == FilterParam::Mode.global_index() {
-        vec!["lowpass", "highpass", "bandpass"]
-    } else {
+    let items = app.dropdown_labels();
+    if items.is_empty() {
         return;
-    };
+    }
 
     let dropdown_y = area.y + app.effect_param_cursor as u16;
     let dropdown_x = area.x + 14; // after label
