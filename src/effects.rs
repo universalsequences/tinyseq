@@ -257,6 +257,14 @@ impl EffectDescriptor {
         vec![Self::builtin_filter(), Self::builtin_delay()]
     }
 
+    /// Empty custom slot placeholder (name is empty, no params).
+    pub fn empty_custom_slot() -> Self {
+        Self {
+            name: String::new(),
+            params: Vec::new(),
+        }
+    }
+
     /// Construct from a lisp effect manifest.
     pub fn from_lisp_manifest(name: &str, params: &[crate::lisp_effect::DGenParam]) -> Self {
         let descriptors = params

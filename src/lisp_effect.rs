@@ -29,21 +29,23 @@ type DGenProcessFn = unsafe extern "C" fn(
 );
 
 // ── Global process function registry ──
-// Each track can have one custom DGenLisp effect.
-// The process fn pointer is stored here, indexed by track.
+// Each track can have up to MAX_CUSTOM_FX custom effects.
+// The process fn pointer is stored here, indexed by slot_id = track * MAX_CUSTOM_FX + offset.
 
 const MAX_TRACKS: usize = 16;
-static DGEN_PROCESS_FNS: [AtomicUsize; MAX_TRACKS] = {
+pub const MAX_CUSTOM_FX: usize = 4;
+const REGISTRY_SIZE: usize = MAX_TRACKS * MAX_CUSTOM_FX;
+static DGEN_PROCESS_FNS: [AtomicUsize; REGISTRY_SIZE] = {
     const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; MAX_TRACKS]
+    [INIT; REGISTRY_SIZE]
 };
 
-fn set_dgen_process_fn(track_idx: usize, f: DGenProcessFn) {
-    DGEN_PROCESS_FNS[track_idx].store(f as usize, Ordering::Release);
+fn set_dgen_process_fn(slot_id: usize, f: DGenProcessFn) {
+    DGEN_PROCESS_FNS[slot_id % REGISTRY_SIZE].store(f as usize, Ordering::Release);
 }
 
 // ── Node state layout ──
-// state[0] = track_idx (f32)
+// state[0] = slot_id (f32), where slot_id = track_idx * MAX_CUSTOM_FX + offset
 // state[1] = total_memory_slots (f32)
 // state[2..2+N] = DGenLisp memory buffer
 
@@ -57,8 +59,8 @@ unsafe extern "C" fn dgenlisp_wrapper_process(
     _buffers: *mut c_void,
 ) {
     let s = state as *mut f32;
-    let track_idx = (*s) as usize;
-    let fn_ptr = DGEN_PROCESS_FNS[track_idx % MAX_TRACKS].load(Ordering::Acquire);
+    let slot_id = (*s) as usize;
+    let fn_ptr = DGEN_PROCESS_FNS[slot_id % REGISTRY_SIZE].load(Ordering::Acquire);
     if fn_ptr != 0 {
         let process_fn: DGenProcessFn = std::mem::transmute(fn_ptr);
         let memory = s.add(HEADER_SLOTS) as *mut c_void;
@@ -132,6 +134,42 @@ pub struct LoadedDGenLib {
 
 unsafe impl Send for LoadedDGenLib {}
 unsafe impl Sync for LoadedDGenLib {}
+
+// ── Effect library storage ──
+
+pub fn save_effect(name: &str, source: &str) -> io::Result<()> {
+    let dir = Path::new("effects");
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{}.lisp", name));
+    std::fs::write(&path, source)
+}
+
+pub fn list_saved_effects() -> Vec<String> {
+    let dir = Path::new("effects");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().map(|ext| ext == "lisp").unwrap_or(false) {
+                        path.file_stem().map(|s| s.to_string_lossy().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+pub fn load_effect_source(name: &str) -> io::Result<String> {
+    let path = Path::new("effects").join(format!("{}.lisp", name));
+    std::fs::read_to_string(&path)
+}
 
 // ── Editor flow ──
 
@@ -225,16 +263,8 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
         })
         .unwrap_or_default();
 
-    let n_inputs = v["inputs"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0)
-        .max(1);
-    let n_outputs = v["outputs"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0)
-        .max(1);
+    let n_inputs = v["inputs"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
+    let n_outputs = v["outputs"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
 
     let tensor_init_data = v["tensorInitData"]
         .as_array()
@@ -290,15 +320,12 @@ pub fn load_dylib(path: &Path) -> Result<LoadedDGenLib, String> {
 
 // ── Build initial state ──
 
-fn build_initial_state(
-    track_idx: usize,
-    manifest: &DGenManifest,
-) -> Vec<f32> {
+fn build_initial_state(slot_id: usize, manifest: &DGenManifest) -> Vec<f32> {
     let total_slots = HEADER_SLOTS + manifest.total_memory_slots;
     let mut state = vec![0.0f32; total_slots];
 
     // Header
-    state[0] = track_idx as f32;
+    state[0] = slot_id as f32;
     state[1] = manifest.total_memory_slots as f32;
 
     // Default param values
@@ -324,42 +351,43 @@ fn build_initial_state(
 
 // ── Add effect to track's audio chain ──
 
-/// Remove an existing custom effect from the track chain and reconnect sampler → filter.
-pub unsafe fn remove_custom_effect(
+/// Remove an effect from the chain and reconnect predecessor → successor.
+pub unsafe fn remove_effect_from_chain(
     lg: *mut LiveGraph,
     effect_node_id: i32,
-    sampler_id: i32,
-    filter_id: i32,
+    predecessor_id: i32,
+    successor_id: i32,
 ) {
-    audiograph::graph_disconnect(lg, sampler_id, 0, effect_node_id, 0);
-    audiograph::graph_disconnect(lg, effect_node_id, 0, filter_id, 0);
+    audiograph::graph_disconnect(lg, predecessor_id, 0, effect_node_id, 0);
+    audiograph::graph_disconnect(lg, effect_node_id, 0, successor_id, 0);
     audiograph::delete_node(lg, effect_node_id);
-    audiograph::graph_connect(lg, sampler_id, 0, filter_id, 0);
+    audiograph::graph_connect(lg, predecessor_id, 0, successor_id, 0);
 }
 
-/// Add a DGenLisp effect between sampler and filter.
-pub unsafe fn add_effect_to_chain(
+/// Add a DGenLisp effect between predecessor and successor nodes.
+/// slot_id = track_idx * MAX_CUSTOM_FX + offset.
+pub unsafe fn add_effect_to_chain_at(
     lg: *mut LiveGraph,
-    track_idx: usize,
+    slot_id: usize,
     manifest: &DGenManifest,
     lib: &LoadedDGenLib,
-    sampler_id: i32,
-    filter_id: i32,
+    predecessor_id: i32,
+    successor_id: i32,
     existing_effect: Option<i32>,
 ) -> Result<i32, String> {
     // Remove old effect if present
     if let Some(old_id) = existing_effect {
-        remove_custom_effect(lg, old_id, sampler_id, filter_id);
+        remove_effect_from_chain(lg, old_id, predecessor_id, successor_id);
     }
 
     // Register process function
-    set_dgen_process_fn(track_idx, lib.process_fn);
+    set_dgen_process_fn(slot_id, lib.process_fn);
 
     // Build initial state
-    let initial_state = build_initial_state(track_idx, manifest);
-    let state_size = initial_state.len() * std::mem::size_of::<f32>();
+    let initial_state = build_initial_state(slot_id, manifest);
+    let state_size = manifest.total_memory_slots * std::mem::size_of::<f32>();
 
-    let name = CString::new(format!("dgenlisp_fx_{}", track_idx)).unwrap();
+    let name = CString::new(format!("dgenlisp_fx_{}", slot_id)).unwrap();
 
     let node_id = audiograph::add_node(
         lg,
@@ -376,10 +404,10 @@ pub unsafe fn add_effect_to_chain(
         return Err("Failed to add DGenLisp node to graph".to_string());
     }
 
-    // Rewire: sampler → effect → filter (disconnect existing sampler → filter first)
-    audiograph::graph_disconnect(lg, sampler_id, 0, filter_id, 0);
-    audiograph::graph_connect(lg, sampler_id, 0, node_id, 0);
-    audiograph::graph_connect(lg, node_id, 0, filter_id, 0);
+    // Rewire: predecessor → effect → successor
+    audiograph::graph_disconnect(lg, predecessor_id, 0, successor_id, 0);
+    audiograph::graph_connect(lg, predecessor_id, 0, node_id, 0);
+    audiograph::graph_connect(lg, node_id, 0, successor_id, 0);
 
     Ok(node_id)
 }
@@ -398,18 +426,20 @@ pub struct LispEditResult {
     pub lib: LoadedDGenLib,
     pub source: String,
     pub params: Vec<DGenParam>,
+    pub name: String,
 }
 
-/// Run the full edit → compile → load → wire flow.
+/// Run the full edit → compile → load → wire → name → save flow.
 /// Called while terminal is in normal (non-raw) mode.
 pub fn run_editor_flow(
     lg: *mut LiveGraph,
-    track_idx: usize,
+    slot_id: usize,
     track_name: &str,
-    sampler_id: i32,
-    filter_id: i32,
+    predecessor_id: i32,
+    successor_id: i32,
     existing_effect: Option<i32>,
     last_source: &str,
+    existing_name: Option<&str>,
     sample_rate: u32,
 ) -> Option<LispEditResult> {
     let initial = if last_source.is_empty() {
@@ -444,21 +474,18 @@ pub fn run_editor_flow(
                             Ok(lib) => {
                                 // Add to graph
                                 match unsafe {
-                                    add_effect_to_chain(
+                                    add_effect_to_chain_at(
                                         lg,
-                                        track_idx,
+                                        slot_id,
                                         &manifest,
                                         &lib,
-                                        sampler_id,
-                                        filter_id,
+                                        predecessor_id,
+                                        successor_id,
                                         existing_effect,
                                     )
                                 } {
                                     Ok(node_id) => {
-                                        println!(
-                                            " OK! Effect added to track '{}'",
-                                            track_name
-                                        );
+                                        println!(" OK!");
                                         let n = manifest.params.len();
                                         if n > 0 {
                                             println!("  Parameters:");
@@ -476,7 +503,39 @@ pub fn run_editor_flow(
                                                 );
                                             }
                                         }
-                                        println!("\nPress Enter to return to sequencer...");
+
+                                        // Name prompt
+                                        let default_name = existing_name.unwrap_or("");
+                                        if default_name.is_empty() {
+                                            print!("\nEffect name: ");
+                                        } else {
+                                            print!("\nEffect name [{}]: ", default_name);
+                                        }
+                                        io::stdout().flush().ok();
+                                        let mut name_buf = String::new();
+                                        std::io::stdin().read_line(&mut name_buf).ok();
+                                        let name_input = name_buf.trim();
+                                        let name = if name_input.is_empty() {
+                                            if default_name.is_empty() {
+                                                "untitled".to_string()
+                                            } else {
+                                                default_name.to_string()
+                                            }
+                                        } else {
+                                            sanitize_effect_name(name_input)
+                                        };
+
+                                        // Save to effects/ library
+                                        match save_effect(&name, &source) {
+                                            Ok(()) => println!("Saved to effects/{}.lisp", name),
+                                            Err(e) => eprintln!("Warning: failed to save: {e}"),
+                                        }
+
+                                        println!(
+                                            "\nEffect '{}' added to track '{}'",
+                                            name, track_name
+                                        );
+                                        println!("Press Enter to return to sequencer...");
                                         let mut buf = String::new();
                                         std::io::stdin().read_line(&mut buf).ok();
                                         let params = manifest.params.clone();
@@ -485,6 +544,7 @@ pub fn run_editor_flow(
                                             lib,
                                             source,
                                             params,
+                                            name,
                                         });
                                     }
                                     Err(e) => {
@@ -517,4 +577,16 @@ pub fn run_editor_flow(
             return None;
         }
     }
+}
+
+fn sanitize_effect_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }

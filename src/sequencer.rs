@@ -445,6 +445,8 @@ pub struct SequencerState {
     pub peak_l: AtomicU32,
     /// Peak level for R channel (f32 bits, 0.0..1.0+), updated by audio thread.
     pub peak_r: AtomicU32,
+    /// Per-track trigger flash intensity (0-255). Audio writes 255, UI decays each frame.
+    pub trigger_flash: Vec<AtomicU32>,
     /// Inactive patterns stored here (only accessed by UI thread during switches).
     pub pattern_bank: Mutex<Vec<PatternSnapshot>>,
     /// Index of the currently active pattern.
@@ -462,7 +464,14 @@ impl SequencerState {
         // Build slot descriptors for default pattern snapshot
         let slot_descriptors: Vec<Vec<EffectDescriptor>> = initial_chains
             .iter()
-            .map(|_| EffectDescriptor::default_chain())
+            .map(|chain| {
+                let mut descs = EffectDescriptor::default_chain();
+                // Add empty descriptors for custom slots to match chain length
+                for _ in descs.len()..chain.len() {
+                    descs.push(EffectDescriptor::empty_custom_slot());
+                }
+                descs
+            })
             .collect();
 
         Self {
@@ -475,6 +484,7 @@ impl SequencerState {
             bpm: AtomicU32::new(DEFAULT_BPM),
             peak_l: AtomicU32::new(0.0_f32.to_bits()),
             peak_r: AtomicU32::new(0.0_f32.to_bits()),
+            trigger_flash: (0..num_tracks).map(|_| AtomicU32::new(0)).collect(),
             pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(num_tracks, &slot_descriptors)]),
             current_pattern: AtomicU32::new(0),
             num_patterns: AtomicU32::new(1),

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::audio::TrackNodes;
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::{EffectDescriptor, EffectSlotState, BUILTIN_SLOT_COUNT};
-use crate::lisp_effect::{self, LoadedDGenLib};
+use crate::lisp_effect::{self, LoadedDGenLib, MAX_CUSTOM_FX};
 use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, STEPS_PER_PAGE};
 
 const BAR_HEIGHT: usize = 8;
@@ -20,6 +20,7 @@ pub enum InputMode {
     ValueEntry,
     Dropdown,
     PatternSelect,
+    EffectPicker,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -95,8 +96,17 @@ pub struct App {
     pub track_node_ids: Vec<TrackNodeIds>,
     pub sample_rate: u32,
     pub pending_lisp_edit: bool,
-    pub lisp_sources: Vec<String>,                          // per-track last edited source
-    lisp_libs: Vec<LoadedDGenLib>,                          // keep loaded dylibs alive
+    pub pending_lisp_slot: usize,             // chain index being edited/added
+    pub pending_lisp_name: Option<String>,     // effect name if editing existing
+    lisp_libs: Vec<LoadedDGenLib>,             // keep loaded dylibs alive
+
+    // Effect picker
+    pub picker_cursor: usize,
+    pub picker_filter: String,
+    pub picker_items: Vec<String>,             // cached list from effects/ folder
+
+    // Status message (shown briefly in help bar)
+    pub status_message: Option<(String, Instant)>,
 }
 
 impl App {
@@ -116,9 +126,15 @@ impl App {
             })
             .collect();
 
-        // Initialize per-track effect descriptors: [Filter, Delay] for each track
+        // Initialize per-track effect descriptors: [Filter, Delay, empty*4] for each track
         let effect_descriptors: Vec<Vec<EffectDescriptor>> = (0..num_tracks)
-            .map(|_| EffectDescriptor::default_chain())
+            .map(|_| {
+                let mut chain = EffectDescriptor::default_chain();
+                for _ in 0..MAX_CUSTOM_FX {
+                    chain.push(EffectDescriptor::empty_custom_slot());
+                }
+                chain
+            })
             .collect();
 
         Self {
@@ -146,8 +162,13 @@ impl App {
             track_node_ids,
             sample_rate,
             pending_lisp_edit: false,
-            lisp_sources: vec![String::new(); num_tracks],
+            pending_lisp_slot: BUILTIN_SLOT_COUNT,
+            pending_lisp_name: None,
             lisp_libs: Vec::new(),
+            picker_cursor: 0,
+            picker_filter: String::new(),
+            picker_items: Vec::new(),
+            status_message: None,
         }
     }
 
@@ -212,15 +233,73 @@ impl App {
             .and_then(|chain| chain.get(self.effect_slot_cursor))
     }
 
-    /// Number of slots for the current track.
-    fn num_effect_slots(&self) -> usize {
+    /// Indices of visible (non-empty) effect slots for the current track.
+    fn visible_effect_indices(&self) -> Vec<usize> {
         if self.tracks.is_empty() {
-            return 0;
+            return Vec::new();
         }
-        self.effect_descriptors
-            .get(self.cursor_track)
-            .map(|d| d.len())
-            .unwrap_or(0)
+        let track = self.cursor_track;
+        let chain = &self.state.effect_chains[track];
+        let descs = &self.effect_descriptors[track];
+        let mut visible = Vec::new();
+        for i in 0..descs.len() {
+            if i < BUILTIN_SLOT_COUNT {
+                visible.push(i); // Always show built-in
+            } else if i < chain.len() && chain[i].node_id.load(Ordering::Relaxed) != 0 {
+                visible.push(i); // Show loaded custom
+            }
+        }
+        visible
+    }
+
+    /// Find the first free custom slot index for the current track, or None.
+    fn next_free_custom_slot(&self) -> Option<usize> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        let chain = &self.state.effect_chains[self.cursor_track];
+        for offset in 0..MAX_CUSTOM_FX {
+            let idx = BUILTIN_SLOT_COUNT + offset;
+            if idx < chain.len() && chain[idx].node_id.load(Ordering::Relaxed) == 0 {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Find the audio graph predecessor for a custom slot at `offset` (0..MAX_CUSTOM_FX).
+    fn find_custom_slot_predecessor(&self, track: usize, offset: usize) -> i32 {
+        let chain = &self.state.effect_chains[track];
+        for i in (0..offset).rev() {
+            let idx = BUILTIN_SLOT_COUNT + i;
+            if idx < chain.len() {
+                let nid = chain[idx].node_id.load(Ordering::Relaxed);
+                if nid != 0 {
+                    return nid as i32;
+                }
+            }
+        }
+        self.track_node_ids[track].sampler_id
+    }
+
+    /// Find the audio graph successor for a custom slot at `offset` (0..MAX_CUSTOM_FX).
+    fn find_custom_slot_successor(&self, track: usize, offset: usize) -> i32 {
+        let chain = &self.state.effect_chains[track];
+        for i in (offset + 1)..MAX_CUSTOM_FX {
+            let idx = BUILTIN_SLOT_COUNT + i;
+            if idx < chain.len() {
+                let nid = chain[idx].node_id.load(Ordering::Relaxed);
+                if nid != 0 {
+                    return nid as i32;
+                }
+            }
+        }
+        self.track_node_ids[track].filter_id
+    }
+
+    /// Whether there are fewer than MAX_CUSTOM_FX loaded custom effects (can add more).
+    fn can_add_custom_effect(&self) -> bool {
+        self.next_free_custom_slot().is_some()
     }
 
     pub fn handle_input(&mut self) -> std::io::Result<()> {
@@ -235,6 +314,7 @@ impl App {
                         InputMode::ValueEntry => self.handle_value_entry(key.code),
                         InputMode::Dropdown => self.handle_dropdown(key.code),
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
+                        InputMode::EffectPicker => self.handle_effect_picker(key.code),
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -250,6 +330,10 @@ impl App {
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.input_mode != InputMode::Normal {
+            // Close picker on click outside
+            if self.input_mode == InputMode::EffectPicker {
+                self.input_mode = InputMode::Normal;
+            }
             return;
         }
 
@@ -365,18 +449,23 @@ impl App {
 
     /// Returns the slot index for a click on the effect tab bar, or None.
     fn effect_tab_from_click_x(&self, col: u16) -> Option<usize> {
-        let num_slots = self.num_effect_slots();
-        if num_slots == 0 {
+        let visible = self.visible_effect_indices();
+        if visible.is_empty() {
             return None;
         }
+        let descs = self.effect_descriptors.get(self.cursor_track)?;
         let mut x = self.layout.effects_block.x + 1;
-        for (i, desc) in self.effect_descriptors.get(self.cursor_track)?.iter().enumerate() {
+        for &i in &visible {
+            if i >= descs.len() {
+                continue;
+            }
+            let desc = &descs[i];
             let label_len = desc.name.len() as u16;
             let tab_width = label_len + 6;
             if col >= x && col < x + tab_width {
                 return Some(i);
             }
-            x += tab_width + 2;
+            x += tab_width + 1; // matches the " " separator in rendering
         }
         None
     }
@@ -387,49 +476,51 @@ impl App {
             return;
         }
         let track = self.cursor_track;
-        let ids = &self.track_node_ids[track];
-        let sampler_id = ids.sampler_id;
-        let filter_id = ids.filter_id;
+        let slot_idx = self.pending_lisp_slot;
+        let offset = slot_idx - BUILTIN_SLOT_COUNT;
+        let slot_id = track * MAX_CUSTOM_FX + offset;
+        let predecessor_id = self.find_custom_slot_predecessor(track, offset);
+        let successor_id = self.find_custom_slot_successor(track, offset);
+
         let existing_node = self.state.effect_chains[track]
-            .get(BUILTIN_SLOT_COUNT)
+            .get(slot_idx)
             .map(|slot| slot.node_id.load(Ordering::Relaxed))
             .unwrap_or(0);
-        let existing = if existing_node != 0 { Some(existing_node as i32) } else { None };
-        let last_source = self.lisp_sources[track].clone();
+        let existing = if existing_node != 0 {
+            Some(existing_node as i32)
+        } else {
+            None
+        };
+
+        // Load source: from file (if editing existing) or empty for new
+        let last_source = match &self.pending_lisp_name {
+            Some(name) => lisp_effect::load_effect_source(name).unwrap_or_default(),
+            None => String::new(),
+        };
+        let existing_name = self.pending_lisp_name.clone();
         let track_name = self.tracks[track].clone();
 
         let result = lisp_effect::run_editor_flow(
             self.lg.0,
-            track,
+            slot_id,
             &track_name,
-            sampler_id,
-            filter_id,
+            predecessor_id,
+            successor_id,
             existing,
             &last_source,
+            existing_name.as_deref(),
             self.sample_rate,
         );
 
         if let Some(r) = result {
-            self.lisp_sources[track] = r.source;
-
-            // Build descriptor from manifest params
-            let desc = EffectDescriptor::from_lisp_manifest("Lisp", &r.params);
-
-            // Find if we already have a lisp slot, or append
-            let lisp_slot_idx = if self.effect_descriptors[track].len() > BUILTIN_SLOT_COUNT {
-                // Replace existing lisp slot
-                self.effect_descriptors[track][BUILTIN_SLOT_COUNT] = desc.clone();
-                BUILTIN_SLOT_COUNT
-            } else {
-                // Append new lisp slot
-                self.effect_descriptors[track].push(desc.clone());
-                self.effect_descriptors[track].len() - 1
-            };
+            // Build descriptor using the user-chosen name
+            let desc = EffectDescriptor::from_lisp_manifest(&r.name, &r.params);
+            self.effect_descriptors[track][slot_idx] = desc;
 
             // Update effect chain state
             let chain = &self.state.effect_chains[track];
-            if lisp_slot_idx < chain.len() {
-                let slot = &chain[lisp_slot_idx];
+            if slot_idx < chain.len() {
+                let slot = &chain[slot_idx];
                 slot.node_id.store(r.node_id as u32, Ordering::Relaxed);
                 slot.num_params.store(r.params.len() as u32, Ordering::Relaxed);
                 for (i, p) in r.params.iter().enumerate() {
@@ -441,9 +532,140 @@ impl App {
                 }
             }
 
-            self.effect_slot_cursor = lisp_slot_idx;
+            self.effect_slot_cursor = slot_idx;
             self.effect_param_cursor = 0;
+            self.focused_region = Region::Params;
+            self.params_column = 1;
             self.lisp_libs.push(r.lib);
+        }
+
+        // Clear pending state
+        self.pending_lisp_name = None;
+    }
+
+    /// Load a saved effect into a custom slot (no terminal suspension needed).
+    fn load_effect_into_slot(&mut self, name: &str, slot_idx: usize) -> Result<(), String> {
+        let source = lisp_effect::load_effect_source(name)
+            .map_err(|e| format!("Failed to load: {e}"))?;
+        let json = lisp_effect::compile_lisp(&source, self.sample_rate)?;
+        let manifest = lisp_effect::parse_manifest(&json)?;
+        let lib = lisp_effect::load_dylib(&manifest.dylib_path)?;
+
+        let track = self.cursor_track;
+        let offset = slot_idx - BUILTIN_SLOT_COUNT;
+        let slot_id = track * MAX_CUSTOM_FX + offset;
+        let pred = self.find_custom_slot_predecessor(track, offset);
+        let succ = self.find_custom_slot_successor(track, offset);
+
+        let existing = {
+            let nid = self.state.effect_chains[track][slot_idx]
+                .node_id
+                .load(Ordering::Relaxed);
+            if nid != 0 { Some(nid as i32) } else { None }
+        };
+
+        let node_id = unsafe {
+            lisp_effect::add_effect_to_chain_at(
+                self.lg.0, slot_id, &manifest, &lib, pred, succ, existing,
+            )?
+        };
+
+        // Update descriptor
+        let desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
+        self.effect_descriptors[track][slot_idx] = desc;
+
+        // Update chain state
+        let slot = &self.state.effect_chains[track][slot_idx];
+        slot.node_id.store(node_id as u32, Ordering::Relaxed);
+        slot.num_params
+            .store(manifest.params.len() as u32, Ordering::Relaxed);
+        for (i, p) in manifest.params.iter().enumerate() {
+            slot.defaults.set(i, p.default);
+            if i < slot.param_node_indices.len() {
+                let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
+                slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
+            }
+        }
+
+        self.lisp_libs.push(lib);
+        Ok(())
+    }
+
+    fn filtered_picker_items(&self) -> Vec<String> {
+        let mut items = vec!["+ New effect".to_string()];
+        for name in &self.picker_items {
+            if self.picker_filter.is_empty()
+                || name
+                    .to_lowercase()
+                    .contains(&self.picker_filter.to_lowercase())
+            {
+                items.push(name.clone());
+            }
+        }
+        items
+    }
+
+    fn handle_effect_picker(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => {
+                self.picker_filter.push(c);
+                self.picker_cursor = 0;
+            }
+            KeyCode::Backspace => {
+                self.picker_filter.pop();
+                self.picker_cursor = 0;
+            }
+            KeyCode::Up => {
+                if self.picker_cursor > 0 {
+                    self.picker_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let max = self.filtered_picker_items().len();
+                if self.picker_cursor + 1 < max {
+                    self.picker_cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let items = self.filtered_picker_items();
+                if self.picker_cursor < items.len() {
+                    let selected = &items[self.picker_cursor];
+                    if selected == "+ New effect" {
+                        // Open editor for new effect
+                        if let Some(slot_idx) = self.next_free_custom_slot() {
+                            self.pending_lisp_slot = slot_idx;
+                            self.pending_lisp_name = None;
+                            self.pending_lisp_edit = true;
+                        }
+                    } else {
+                        // Load saved effect from picker
+                        let name = selected.clone();
+                        if let Some(slot_idx) = self.next_free_custom_slot() {
+                            match self.load_effect_into_slot(&name, slot_idx) {
+                                Ok(()) => {
+                                    self.effect_slot_cursor = slot_idx;
+                                    self.effect_param_cursor = 0;
+                                    self.focused_region = Region::Params;
+                                    self.params_column = 1;
+                                    self.status_message = Some((
+                                        format!("Loaded '{}'", name),
+                                        Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.status_message =
+                                        Some((format!("Error: {}", e), Instant::now()));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
         }
     }
 
@@ -464,7 +686,30 @@ impl App {
             }
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.tracks.is_empty() {
-                    self.pending_lisp_edit = true;
+                    // If focused on a loaded custom slot, edit it directly
+                    let slot_idx = self.effect_slot_cursor;
+                    if slot_idx >= BUILTIN_SLOT_COUNT
+                        && self.focused_region == Region::Params
+                        && self.params_column == 1
+                    {
+                        let chain = &self.state.effect_chains[self.cursor_track];
+                        if slot_idx < chain.len()
+                            && chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
+                        {
+                            // Edit existing effect
+                            let name =
+                                self.effect_descriptors[self.cursor_track][slot_idx].name.clone();
+                            self.pending_lisp_slot = slot_idx;
+                            self.pending_lisp_name = Some(name);
+                            self.pending_lisp_edit = true;
+                            return;
+                        }
+                    }
+                    // Otherwise, open the effect picker
+                    self.picker_items = lisp_effect::list_saved_effects();
+                    self.picker_cursor = 0;
+                    self.picker_filter.clear();
+                    self.input_mode = InputMode::EffectPicker;
                 }
                 return;
             }
@@ -724,23 +969,28 @@ impl App {
     }
 
     fn handle_effects_column(&mut self, code: KeyCode) {
-        let num_slots = self.num_effect_slots();
+        let visible = self.visible_effect_indices();
 
         match code {
             KeyCode::Left => {
-                if self.effect_slot_cursor > 0 {
-                    self.effect_slot_cursor -= 1;
-                    self.effect_param_cursor = 0;
+                if let Some(pos) = visible.iter().position(|&i| i == self.effect_slot_cursor) {
+                    if pos > 0 {
+                        self.effect_slot_cursor = visible[pos - 1];
+                        self.effect_param_cursor = 0;
+                    } else {
+                        self.params_column = 0;
+                    }
                 } else {
                     self.params_column = 0;
                 }
             }
             KeyCode::Right => {
-                if self.effect_slot_cursor + 1 < num_slots {
-                    self.effect_slot_cursor += 1;
-                    self.effect_param_cursor = 0;
+                if let Some(pos) = visible.iter().position(|&i| i == self.effect_slot_cursor) {
+                    if pos + 1 < visible.len() {
+                        self.effect_slot_cursor = visible[pos + 1];
+                        self.effect_param_cursor = 0;
+                    }
                 }
-                // Already at rightmost slot — do nothing
             }
             KeyCode::Up => {
                 if self.effect_param_cursor > 0 {
@@ -1136,16 +1386,8 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
 
 // ── Drawing ──
 
-fn param_color(param: StepParam) -> Color {
-    match param {
-        StepParam::Duration  => Color::Cyan,
-        StepParam::Velocity  => Color::Red,
-        StepParam::Speed     => Color::Green,
-        StepParam::AuxA      => Color::Magenta,
-        StepParam::AuxB      => Color::Yellow,
-        StepParam::Transpose => Color::Blue,
-        StepParam::Chop      => Color::Rgb(255, 140, 0),
-    }
+fn param_color(_param: StepParam) -> Color {
+    Color::White
 }
 
 fn is_in_selection(app: &App, step: usize) -> bool {
@@ -1164,20 +1406,27 @@ fn region_border_style(app: &App, region: Region) -> Style {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    // 2 regions + help bar
+    // Global info bar + Cirklon + Params + Help
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(14),     // Cirklon region
+            Constraint::Length(1),   // Global info bar
+            Constraint::Min(13),     // Cirklon region
             Constraint::Length(8),   // Params region
             Constraint::Length(2),   // Help bar
         ])
         .split(area);
 
-    draw_cirklon_region(frame, app, chunks[0]);
-    draw_params_region(frame, app, chunks[1]);
-    draw_help_bar(frame, app, chunks[2]);
+    draw_global_info(frame, app, chunks[0]);
+    draw_cirklon_region(frame, app, chunks[1]);
+    draw_params_region(frame, app, chunks[2]);
+    draw_help_bar(frame, app, chunks[3]);
     draw_stereo_meter(frame, app, area);
+
+    // Draw picker overlay on top of everything
+    if app.input_mode == InputMode::EffectPicker {
+        draw_effect_picker(frame, app, area);
+    }
 }
 
 // ── Cirklon Region ──
@@ -1211,7 +1460,6 @@ fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let seq_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),                      // track info (2 lines)
             Constraint::Length(1),                      // param tabs
             Constraint::Length(BAR_HEIGHT as u16),      // bars
             Constraint::Length(2),                      // trigger + step numbers
@@ -1219,15 +1467,14 @@ fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(h_chunks[1]);
 
-    app.layout.param_tabs = seq_chunks[1];
-    app.layout.bars = seq_chunks[2];
-    app.layout.trigger_row = seq_chunks[3];
+    app.layout.param_tabs = seq_chunks[0];
+    app.layout.bars = seq_chunks[1];
+    app.layout.trigger_row = seq_chunks[2];
 
-    draw_track_info(frame, app, seq_chunks[0]);
-    draw_param_tabs(frame, app, seq_chunks[1]);
-    draw_bars(frame, app, seq_chunks[2]);
-    draw_trigger_row(frame, app, seq_chunks[3]);
-    draw_value_line(frame, app, seq_chunks[4]);
+    draw_param_tabs(frame, app, seq_chunks[0]);
+    draw_bars(frame, app, seq_chunks[1]);
+    draw_trigger_row(frame, app, seq_chunks[2]);
+    draw_value_line(frame, app, seq_chunks[3]);
 }
 
 fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -1242,66 +1489,54 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
         let style = if is_selected {
             Style::default().fg(Color::Black).bg(Color::Yellow).bold()
         } else {
-            Style::default().fg(Color::DarkGray)
+            // Flash decay: read value, decay by 30 per frame, interpolate gray(90)→white(255)
+            let flash = app.state.trigger_flash[i].load(Ordering::Relaxed);
+            let decayed = flash.saturating_sub(30);
+            app.state.trigger_flash[i].store(decayed, Ordering::Relaxed);
+            let base = 90u8;
+            let brightness = base + ((255 - base) as u32 * decayed / 255) as u8;
+            Style::default().fg(Color::Rgb(brightness, brightness, brightness))
         };
         let cell = Rect::new(area.x, y, area.width, 1);
         frame.render_widget(Paragraph::new(label).style(style), cell);
     }
 }
 
-fn draw_track_info(frame: &mut Frame, app: &App, area: Rect) {
-    if app.tracks.is_empty() {
-        let msg = Paragraph::new("  No .wav files found in samples/")
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(msg, area);
-        return;
-    }
-
-    let ns = app.num_steps();
-    let playing = if app.state.is_playing() { "PLAYING" } else { "STOPPED" };
+fn draw_global_info(frame: &mut Frame, app: &App, area: Rect) {
+    let play_symbol = if app.state.is_playing() { "\u{25b6}" } else { "\u{23f8}" };
     let bpm = app.state.bpm.load(Ordering::Relaxed);
-    let global_step = app.state.current_step();
-    let display_step = (global_step % ns) + 1;
-
-    // Line 1: pattern info
     let cur_pat = app.state.current_pattern.load(Ordering::Relaxed) as usize + 1;
     let num_pats = app.state.num_patterns.load(Ordering::Relaxed) as usize;
-    let line1 = format!(
-        " [pat {}/{}]  {} BPM  {}  step {}/{}",
-        cur_pat, num_pats, bpm, playing, display_step, ns
-    );
-    let span1 = Span::styled(
-        line1,
-        Style::default().fg(Color::White).bg(Color::DarkGray).bold(),
-    );
-    if area.height >= 1 {
-        frame.render_widget(
-            Paragraph::new(Line::from(span1)),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-    }
 
-    // Line 2: sample name + page info
-    if area.height >= 2 {
+    let info = format!(" {}  {} BPM  [pat {}/{}]", play_symbol, bpm, cur_pat, num_pats);
+    let dim_style = Style::default().fg(Color::White).bg(Color::DarkGray).bold();
+
+    let mut spans = vec![Span::styled(info.clone(), dim_style)];
+
+    if !app.tracks.is_empty() {
         let sample_name = &app.tracks[app.cursor_track];
-        let total_pages = (ns + STEPS_PER_PAGE - 1) / STEPS_PER_PAGE;
-        let current_page = app.current_page() + 1;
-
-        let line2 = if ns > STEPS_PER_PAGE {
-            format!(" {}  [page {}/{}]", sample_name, current_page, total_pages)
-        } else {
-            format!(" {}", sample_name)
-        };
-        let span2 = Span::styled(
-            line2,
-            Style::default().fg(Color::Gray).bg(Color::Rgb(30, 30, 30)),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(span2)),
-            Rect::new(area.x, area.y + 1, area.width, 1),
-        );
+        spans.push(Span::styled(
+            format!("  {}", sample_name),
+            Style::default().fg(Color::White),
+        ));
     }
+
+    // Show status message (auto-clears after 3 seconds)
+    if let Some((ref msg, ref when)) = app.status_message {
+        if when.elapsed() < Duration::from_secs(3) {
+            spans.push(Span::styled(
+                format!("  {}", msg),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
 }
+
 
 fn draw_param_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw("  ")];
@@ -1338,9 +1573,9 @@ fn step_bg(app: &App, step: usize, is_playing: bool, playhead: usize) -> Color {
     let is_ph = is_playing && step == playhead;
 
     if is_cursor {
-        Color::Rgb(120, 120, 30)
+        Color::Rgb(80, 80, 80)
     } else if is_sel {
-        Color::Rgb(40, 50, 80)
+        Color::Rgb(50, 50, 50)
     } else if is_ph {
         Color::Rgb(50, 50, 50)
     } else {
@@ -1495,9 +1730,7 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
     let (page_start, page_end) = app.page_range();
     let x_offset = 2u16;
 
-    // Determine slot color: builtin=Magenta, custom=Green
-    let is_lisp_slot = slot_idx >= BUILTIN_SLOT_COUNT;
-    let default_color = if is_lisp_slot { Color::Green } else { Color::Magenta };
+    let default_color = Color::White;
 
     for step in page_start..page_end {
         let col_x = area.x + x_offset + (step - page_start) as u16 * COL_WIDTH;
@@ -1538,7 +1771,7 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
             let fg = if !active {
                 Color::Rgb(60, 60, 60)
             } else if plock_val.is_some() {
-                Color::Cyan
+                Color::White
             } else {
                 default_color
             };
@@ -1583,7 +1816,7 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
             " . "
         };
         let fg = if active && has_plock {
-            Color::Yellow
+            Color::White
         } else if active {
             Color::White
         } else {
@@ -1604,9 +1837,9 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
         let num = format!("{:>2} ", step + 1);
         let is_sel = app.has_selection() && is_in_selection(app, step);
         let style = if step == app.cursor_step {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::White)
         } else if is_sel {
-            Style::default().fg(Color::Rgb(120, 150, 220))
+            Style::default().fg(Color::Rgb(160, 160, 160))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1635,7 +1868,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled("  Pattern: ", Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{}\u{2588}", app.value_buffer),
-                    Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                    Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
                 ),
                 Span::styled(
                     "  Enter: go  c: clone  x: delete  Esc: cancel",
@@ -1657,7 +1890,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!("{}\u{2588}", app.value_buffer),
-                Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
             ),
             Span::styled(
                 "  Enter: set  Esc: cancel  -: negate",
@@ -1673,7 +1906,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
                 lo + 1, hi + 1, count,
                 app.active_param.label(),
             ),
-            Style::default().fg(Color::Rgb(120, 150, 220)),
+            Style::default().fg(Color::Rgb(160, 160, 160)),
         ))
     } else {
         let sd = &app.state.step_data[app.cursor_track];
@@ -1815,22 +2048,23 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         Style::default().fg(Color::Rgb(60, 60, 60))
     };
 
-    // Build title with slot tabs from effect_descriptors
+    // Build title with slot tabs — only show non-empty slots + [+] button
+    let visible = app.visible_effect_indices();
     let mut title_spans = vec![];
     if let Some(descs) = app.effect_descriptors.get(app.cursor_track) {
-        for (i, desc) in descs.iter().enumerate() {
+        for &i in &visible {
+            if i >= descs.len() {
+                continue;
+            }
+            let desc = &descs[i];
             let is_selected = i == app.effect_slot_cursor;
-            let is_lisp = i >= 2;
+            let is_custom = i >= BUILTIN_SLOT_COUNT;
             let style = if is_selected && col_focused {
-                if is_lisp {
-                    Style::default().fg(Color::Black).bg(Color::Green).bold()
-                } else {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).bold()
-                }
+                Style::default().fg(Color::Black).bg(Color::White).bold()
             } else if is_selected {
                 Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
-            } else if is_lisp {
-                Style::default().fg(Color::Green)
+            } else if is_custom {
+                Style::default().fg(Color::Gray)
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -1840,7 +2074,16 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
                 format!("[  {}  ]", desc.name)
             };
             title_spans.push(Span::styled(label, style));
-            title_spans.push(Span::raw("  "));
+            title_spans.push(Span::raw(" "));
+        }
+        // Show [+] tab if there's room for more custom effects
+        if app.can_add_custom_effect() {
+            let plus_style = if col_focused {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Rgb(60, 60, 60))
+            };
+            title_spans.push(Span::styled("[+]", plus_style));
         }
     }
 
@@ -1871,10 +2114,10 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     };
 
     if is_lisp_slot && !has_node {
-        // No effect loaded
+        // No effect loaded — show hint
         let hint = Line::from(vec![
-            Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
-            Span::styled(" to create effect", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Ctrl+L", Style::default().fg(Color::White).bold()),
+            Span::styled(" to add effect", Style::default().fg(Color::DarkGray)),
         ]);
         let row_area = Rect::new(inner.x, inner.y, inner.width, 1);
         frame.render_widget(Paragraph::new(hint), row_area);
@@ -1963,7 +2206,7 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         ];
 
         if let Some(lbl) = plock_label {
-            spans.push(Span::styled(lbl, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(lbl, Style::default().fg(Color::White)));
         }
 
         // Slider for numeric params
@@ -1980,7 +2223,7 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
                 if slider_width > 2 {
                     let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
                     let bar: String = "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
-                    let slider_color = if is_lisp_slot { Color::Green } else { Color::Magenta };
+                    let slider_color = Color::White;
                     spans.push(Span::styled(
                         format!("[{}]", bar),
                         Style::default().fg(slider_color),
@@ -2104,8 +2347,76 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
 
 // ── Help Bar ──
 
+fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app.filtered_picker_items();
+    let max_visible = 10usize;
+    let list_height = items.len().min(max_visible) as u16;
+    let w = 36u16;
+    let h = list_height + 4; // 1 border top + 1 filter line + 1 blank + list + 1 border bottom
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let picker_area = Rect::new(x, y, w, h);
+
+    // Clear background
+    let bg = Style::default().bg(Color::Rgb(20, 20, 20));
+    for row in 0..h {
+        let row_area = Rect::new(x, y + row, w, 1);
+        frame.render_widget(Paragraph::new(" ".repeat(w as usize)).style(bg), row_area);
+    }
+
+    let block = Block::default()
+        .title(" Effects ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+
+    // Filter input line
+    let filter_text = format!(" > {}\u{2588}", app.picker_filter);
+    let filter_line = Line::from(Span::styled(
+        filter_text,
+        Style::default().fg(Color::White),
+    ));
+    let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(Paragraph::new(filter_line), filter_area);
+
+    // Item list
+    let list_start_y = inner.y + 1;
+    for (i, item) in items.iter().enumerate() {
+        if i >= max_visible {
+            break;
+        }
+        let row_y = list_start_y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let is_cursor = i == app.picker_cursor;
+        let style = if is_cursor {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else if item == "+ New effect" {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let prefix = if is_cursor { " > " } else { "   " };
+        let truncated: String = item.chars().take((inner.width as usize).saturating_sub(4)).collect();
+        let text = format!("{}{:<width$}", prefix, truncated, width = (inner.width as usize).saturating_sub(3));
+        let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+        frame.render_widget(Paragraph::new(text).style(style), row_area);
+    }
+}
+
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if app.input_mode == InputMode::PatternSelect {
+    let lines = if app.input_mode == InputMode::EffectPicker {
+        vec![Line::from(Span::styled(
+            "  Type to filter  \u{2191}\u{2193}: navigate  Enter: select  Esc: cancel",
+            Style::default().fg(Color::Yellow),
+        ))]
+    } else if app.input_mode == InputMode::PatternSelect {
         vec![Line::from(Span::styled(
             "  0-9: pattern number  c: clone  x: delete  Enter: confirm  Esc: cancel",
             Style::default().fg(Color::Yellow),

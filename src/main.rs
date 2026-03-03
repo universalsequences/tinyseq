@@ -20,6 +20,9 @@ use crate::audio::TrackNodes;
 use crate::effects::{EffectDescriptor, EffectSlotState};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure effects/ directory exists
+    std::fs::create_dir_all("effects").ok();
+
     // Scan samples/ directory for .wav files
     let mut wav_paths: Vec<std::path::PathBuf> = std::fs::read_dir("samples")
         .unwrap_or_else(|_| {
@@ -150,9 +153,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let delay_desc = EffectDescriptor::builtin_delay();
             let filter_slot = EffectSlotState::new(&filter_desc, tn.filter_lid as u32);
             let delay_slot = EffectSlotState::new(&delay_desc, tn.delay_lid as u32);
-            // Pre-allocate an empty lisp slot
-            let lisp_slot = EffectSlotState::empty();
-            vec![filter_slot, delay_slot, lisp_slot]
+            // Pre-allocate 4 empty custom effect slots
+            let mut chain = vec![filter_slot, delay_slot];
+            for _ in 0..4 {
+                chain.push(EffectSlotState::empty());
+            }
+            chain
         })
         .collect();
 
