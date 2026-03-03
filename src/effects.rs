@@ -444,6 +444,83 @@ impl EffectPLockData {
     }
 }
 
+// ── Lisp effect p-lock types ──
+
+pub const MAX_LISP_PARAMS: usize = 16;
+
+/// Per-track per-step lisp effect parameter overrides.
+/// NaN = no override (use track default).
+/// Unlike EffectPLockData, does NOT clamp internally (min/max are dynamic per-effect; UI clamps).
+pub struct LispPLockData {
+    data: Vec<AtomicU32>,
+}
+
+impl LispPLockData {
+    pub fn new() -> Self {
+        let size = MAX_STEPS * MAX_LISP_PARAMS;
+        let data: Vec<AtomicU32> = (0..size)
+            .map(|_| AtomicU32::new(NAN_BITS))
+            .collect();
+        Self { data }
+    }
+
+    fn index(step: usize, param_idx: usize) -> usize {
+        step * MAX_LISP_PARAMS + param_idx
+    }
+
+    pub fn get(&self, step: usize, param_idx: usize) -> Option<f32> {
+        let bits = self.data[Self::index(step, param_idx)].load(Ordering::Relaxed);
+        let val = f32::from_bits(bits);
+        if val.is_nan() { None } else { Some(val) }
+    }
+
+    pub fn set(&self, step: usize, param_idx: usize, val: f32) {
+        self.data[Self::index(step, param_idx)].store(val.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn clear_step(&self, step: usize) {
+        for p in 0..MAX_LISP_PARAMS {
+            self.data[Self::index(step, p)].store(NAN_BITS, Ordering::Relaxed);
+        }
+    }
+
+    pub fn clear_param(&self, step: usize, param_idx: usize) {
+        self.data[Self::index(step, param_idx)].store(NAN_BITS, Ordering::Relaxed);
+    }
+
+    pub fn step_has_any_plock(&self, step: usize, num_params: usize) -> bool {
+        for p in 0..num_params.min(MAX_LISP_PARAMS) {
+            let bits = self.data[Self::index(step, p)].load(Ordering::Relaxed);
+            if !f32::from_bits(bits).is_nan() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Per-track lisp effect default parameter values.
+pub struct LispParamDefaults {
+    data: [AtomicU32; MAX_LISP_PARAMS],
+}
+
+impl LispParamDefaults {
+    pub fn new() -> Self {
+        let data: [AtomicU32; MAX_LISP_PARAMS] = std::array::from_fn(|_| {
+            AtomicU32::new(0.0_f32.to_bits())
+        });
+        Self { data }
+    }
+
+    pub fn get(&self, idx: usize) -> f32 {
+        f32::from_bits(self.data[idx].load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, idx: usize, val: f32) {
+        self.data[idx].store(val.to_bits(), Ordering::Relaxed);
+    }
+}
+
 // ── Track-level effect defaults ──
 
 pub struct TrackEffectDefaults {

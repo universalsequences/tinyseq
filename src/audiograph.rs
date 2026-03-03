@@ -108,6 +108,18 @@ extern "C" {
     // Wrapper for the static-inline params_push
     pub fn params_push_wrapper(lg: *mut LiveGraph, m: ParamMsg) -> bool;
 
+    // Disconnect
+    pub fn graph_disconnect(
+        lg: *mut LiveGraph,
+        src_node: c_int,
+        src_port: c_int,
+        dst_node: c_int,
+        dst_port: c_int,
+    ) -> bool;
+
+    // Delete
+    pub fn delete_node(lg: *mut LiveGraph, node_id: c_int) -> bool;
+
     // Debug
     pub fn debug_dump_graph(lg: *mut LiveGraph);
 }

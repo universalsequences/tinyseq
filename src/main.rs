@@ -6,6 +6,8 @@ mod delay;
 mod effects;
 #[allow(dead_code)]
 mod filter;
+#[allow(dead_code)]
+mod lisp_effect;
 mod sampler;
 #[allow(dead_code)]
 mod sequencer;
@@ -164,14 +166,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     // Create UI app
-    let mut app = ui::App::new(Arc::clone(&state), &track_nodes);
+    let lg_ptr = audiograph::LiveGraphPtr(lg);
+    let mut app = ui::App::new(Arc::clone(&state), &track_nodes, lg_ptr, sample_rate);
 
     // Main loop
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
         app.handle_input()?;
         if app.should_quit {
             break;
+        }
+        if app.pending_lisp_edit {
+            app.pending_lisp_edit = false;
+
+            // Suspend terminal for editor
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+
+            app.run_lisp_editor_flow();
+
+            // Resume terminal
+            crossterm::terminal::enable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture
+            )?;
+            terminal.clear()?;
         }
     }
 

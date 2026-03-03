@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::TrackNodes;
+use crate::audiograph::LiveGraphPtr;
 use crate::effects::{EffectType, FilterParam};
+use crate::lisp_effect::{self, LoadedDGenLib};
 use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, STEPS_PER_PAGE};
 
 const BAR_HEIGHT: usize = 8;
@@ -53,6 +55,15 @@ pub struct LayoutRects {
     pub effects_block: Rect,
 }
 
+/// Per-track node IDs needed for graph rewiring.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct TrackNodeIds {
+    pub sampler_id: i32,
+    pub filter_id: i32,
+    pub delay_id: i32,
+}
+
 pub struct App {
     pub state: Arc<SequencerState>,
     pub tracks: Vec<String>,
@@ -75,10 +86,38 @@ pub struct App {
     pub layout: LayoutRects,
     last_step_click: Option<(usize, Instant)>, // (step, time) for double-click detection
     pub pattern_clone_pending: bool,
+
+    // DGenLisp integration
+    pub lg: LiveGraphPtr,
+    pub track_node_ids: Vec<TrackNodeIds>,
+    pub sample_rate: u32,
+    pub pending_lisp_edit: bool,
+    pub lisp_sources: Vec<String>,                          // per-track last edited source
+    pub lisp_effects: Vec<Option<i32>>,                     // per-track custom effect node ID
+    pub lisp_params: Vec<Option<Vec<lisp_effect::DGenParam>>>, // per-track manifest params
+    pub lisp_tab_active: bool,                              // true = Lisp tab selected
+    pub lisp_param_cursor: usize,                           // cursor within lisp params
+    pub lisp_param_values: Vec<Vec<f32>>,                   // per-track current param values
+    lisp_libs: Vec<LoadedDGenLib>,                          // keep loaded dylibs alive
 }
 
 impl App {
-    pub fn new(state: Arc<SequencerState>, tracks: &[TrackNodes]) -> Self {
+    pub fn new(
+        state: Arc<SequencerState>,
+        tracks: &[TrackNodes],
+        lg: LiveGraphPtr,
+        sample_rate: u32,
+    ) -> Self {
+        let num_tracks = tracks.len();
+        let track_node_ids: Vec<TrackNodeIds> = tracks
+            .iter()
+            .map(|t| TrackNodeIds {
+                sampler_id: t.sampler_lid as i32,
+                filter_id: t.filter_lid as i32,
+                delay_id: t.delay_lid as i32,
+            })
+            .collect();
+
         Self {
             state,
             tracks: tracks.iter().map(|t| t.name.clone()).collect(),
@@ -99,6 +138,17 @@ impl App {
             layout: LayoutRects::default(),
             last_step_click: None,
             pattern_clone_pending: false,
+            lg,
+            track_node_ids,
+            sample_rate,
+            pending_lisp_edit: false,
+            lisp_sources: vec![String::new(); num_tracks],
+            lisp_effects: vec![None; num_tracks],
+            lisp_params: vec![None; num_tracks],
+            lisp_tab_active: false,
+            lisp_param_cursor: 0,
+            lisp_param_values: vec![Vec::new(); num_tracks],
+            lisp_libs: Vec::new(),
         }
     }
 
@@ -226,9 +276,16 @@ impl App {
 
         // Effects block title row: click on effect tab
         if row == l.effects_block.y && col >= l.effects_block.x && col < l.effects_block.x + l.effects_block.width {
-            if let Some(et) = self.effect_tab_from_click_x(col) {
+            let (et, is_lisp) = self.effect_tab_from_click_x(col);
+            if let Some(et) = et {
                 self.effect_cursor = et;
                 self.effect_param_cursor = 0;
+                self.lisp_tab_active = false;
+                self.focused_region = Region::Params;
+                self.params_column = 1;
+            } else if is_lisp {
+                self.lisp_tab_active = true;
+                self.lisp_param_cursor = 0;
                 self.focused_region = Region::Params;
                 self.params_column = 1;
             }
@@ -238,7 +295,17 @@ impl App {
         // Effects inner: click selects effect param row
         if rect_contains(l.effects_inner, col, row) {
             let row_idx = (row - l.effects_inner.y) as usize;
-            if row_idx < self.effect_cursor.num_params() {
+            if self.lisp_tab_active {
+                let max = self.lisp_params[self.cursor_track]
+                    .as_ref()
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+                if row_idx < max {
+                    self.focused_region = Region::Params;
+                    self.params_column = 1;
+                    self.lisp_param_cursor = row_idx;
+                }
+            } else if row_idx < self.effect_cursor.num_params() {
                 self.focused_region = Region::Params;
                 self.params_column = 1;
                 self.effect_param_cursor = row_idx;
@@ -281,18 +348,69 @@ impl App {
         }
     }
 
-    fn effect_tab_from_click_x(&self, col: u16) -> Option<EffectType> {
+    /// Returns (Some(effect_type), false) for Filter/Delay tabs,
+    /// (None, true) for Lisp tab, (None, false) for no match.
+    fn effect_tab_from_click_x(&self, col: u16) -> (Option<EffectType>, bool) {
         // Title starts at effects_block.x + 1 (after border)
         let mut x = self.layout.effects_block.x + 1;
         for et in EffectType::ALL {
             let label_len = et.label().len() as u16;
             let tab_width = label_len + 6; // "[< " + label + " >]"
             if col >= x && col < x + tab_width {
-                return Some(et);
+                return (Some(et), false);
             }
             x += tab_width + 2; // 2-char separator
         }
-        None
+        // Check Lisp tab
+        let lisp_width = 4u16 + 6; // "Lisp" + brackets
+        if col >= x && col < x + lisp_width {
+            return (None, true);
+        }
+        (None, false)
+    }
+
+    /// Called from main loop after terminal is suspended.
+    pub fn run_lisp_editor_flow(&mut self) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        let track = self.cursor_track;
+        let ids = &self.track_node_ids[track];
+        let sampler_id = ids.sampler_id;
+        let filter_id = ids.filter_id;
+        let existing = self.lisp_effects[track];
+        let last_source = self.lisp_sources[track].clone();
+        let track_name = self.tracks[track].clone();
+
+        let result = lisp_effect::run_editor_flow(
+            self.lg.0,
+            track,
+            &track_name,
+            sampler_id,
+            filter_id,
+            existing,
+            &last_source,
+            self.sample_rate,
+        );
+
+        if let Some(r) = result {
+            self.lisp_effects[track] = Some(r.node_id);
+            self.lisp_sources[track] = r.source;
+            self.lisp_param_values[track] = r.params.iter().map(|p| p.default).collect();
+
+            // Write metadata to shared SequencerState for audio thread
+            self.state.lisp_node_ids[track].store(r.node_id as u32, Ordering::Relaxed);
+            self.state.lisp_param_count[track].store(r.params.len() as u32, Ordering::Relaxed);
+            for (i, p) in r.params.iter().enumerate() {
+                self.state.set_lisp_cell_id(track, i, p.cell_id as u32);
+                self.state.lisp_defaults[track].set(i, p.default);
+            }
+
+            self.lisp_params[track] = Some(r.params);
+            self.lisp_tab_active = true;
+            self.lisp_param_cursor = 0;
+            self.lisp_libs.push(r.lib);
+        }
     }
 
     fn handle_normal(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -307,6 +425,12 @@ impl App {
                 self.state.toggle_play();
                 if was_playing {
                     self.state.playhead.store(0, Ordering::Relaxed);
+                }
+                return;
+            }
+            KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.tracks.is_empty() {
+                    self.pending_lisp_edit = true;
                 }
                 return;
             }
@@ -566,6 +690,10 @@ impl App {
     }
 
     fn handle_effects_column(&mut self, code: KeyCode) {
+        if self.lisp_tab_active {
+            self.handle_lisp_tab(code);
+            return;
+        }
         match code {
             KeyCode::Left => {
                 let idx = EffectType::ALL.iter().position(|&e| e == self.effect_cursor).unwrap_or(0);
@@ -581,6 +709,10 @@ impl App {
                 if idx + 1 < EffectType::ALL.len() {
                     self.effect_cursor = EffectType::ALL[idx + 1];
                     self.effect_param_cursor = 0;
+                } else {
+                    // Move to Lisp tab
+                    self.lisp_tab_active = true;
+                    self.lisp_param_cursor = 0;
                 }
             }
             KeyCode::Up => {
@@ -626,7 +758,112 @@ impl App {
                     self.input_mode = InputMode::ValueEntry;
                 }
             }
+            KeyCode::Char('[') => {
+                let ns = self.num_steps();
+                self.cursor_step = if self.cursor_step == 0 { ns - 1 } else { self.cursor_step - 1 };
+                self.selection_anchor = Some(self.cursor_step);
+            }
+            KeyCode::Char(']') => {
+                let ns = self.num_steps();
+                self.cursor_step = if self.cursor_step + 1 >= ns { 0 } else { self.cursor_step + 1 };
+                self.selection_anchor = Some(self.cursor_step);
+            }
             _ => {}
+        }
+    }
+
+    fn handle_lisp_tab(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left => {
+                self.lisp_tab_active = false;
+                self.effect_cursor = *EffectType::ALL.last().unwrap();
+                self.effect_param_cursor = 0;
+            }
+            KeyCode::Right => {} // already rightmost tab
+            KeyCode::Up => {
+                if self.lisp_param_cursor > 0 {
+                    self.lisp_param_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let max = self.lisp_params[self.cursor_track]
+                    .as_ref()
+                    .map(|p| p.len().saturating_sub(1))
+                    .unwrap_or(0);
+                if self.lisp_param_cursor < max {
+                    self.lisp_param_cursor += 1;
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.adjust_lisp_param(1.0);
+            }
+            KeyCode::Char('-') => {
+                self.adjust_lisp_param(-1.0);
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                if self.lisp_params[self.cursor_track]
+                    .as_ref()
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
+                {
+                    self.value_buffer.clear();
+                    self.value_buffer.push(c);
+                    self.input_mode = InputMode::ValueEntry;
+                }
+            }
+            KeyCode::Char('[') => {
+                let ns = self.num_steps();
+                self.cursor_step = if self.cursor_step == 0 { ns - 1 } else { self.cursor_step - 1 };
+                self.selection_anchor = Some(self.cursor_step);
+            }
+            KeyCode::Char(']') => {
+                let ns = self.num_steps();
+                self.cursor_step = if self.cursor_step + 1 >= ns { 0 } else { self.cursor_step + 1 };
+                self.selection_anchor = Some(self.cursor_step);
+            }
+            _ => {}
+        }
+    }
+
+    fn adjust_lisp_param(&mut self, direction: f32) {
+        let track = self.cursor_track;
+        let idx = self.lisp_param_cursor;
+        if let Some(params) = &self.lisp_params[track] {
+            if idx < params.len() {
+                let param = &params[idx];
+                let inc = (param.max - param.min) * 0.01;
+                if self.has_selection() {
+                    let (lo, hi) = self.selected_range();
+                    for step in lo..=hi {
+                        let current = self.state.lisp_plocks[track]
+                            .get(step, idx)
+                            .unwrap_or_else(|| self.state.lisp_defaults[track].get(idx));
+                        let new_val = (current + direction * inc).clamp(param.min, param.max);
+                        self.state.lisp_plocks[track].set(step, idx, new_val);
+                    }
+                } else {
+                    let old = self.state.lisp_defaults[track].get(idx);
+                    let new_val = (old + direction * inc).clamp(param.min, param.max);
+                    self.state.lisp_defaults[track].set(idx, new_val);
+                    self.send_lisp_param(track, param.cell_id, new_val);
+                }
+            }
+        }
+    }
+
+    fn send_lisp_param(&self, track: usize, cell_id: usize, value: f32) {
+        if let Some(node_id) = self.lisp_effects[track] {
+            let idx = (lisp_effect::HEADER_SLOTS + cell_id) as u64;
+            unsafe {
+                crate::audiograph::params_push_wrapper(
+                    self.lg.0,
+                    crate::audiograph::ParamMsg {
+                        idx,
+                        logical_id: node_id as u64,
+                        fvalue: value,
+                    },
+                );
+            }
         }
     }
 
@@ -787,6 +1024,24 @@ impl App {
                             self.clamp_cursor_to_steps();
                         }
                         _ => {}
+                    }
+                } else if self.lisp_tab_active {
+                    // Lisp effect params — p-lock aware
+                    let track = self.cursor_track;
+                    let idx = self.lisp_param_cursor;
+                    if let Some(params) = &self.lisp_params[track] {
+                        if idx < params.len() {
+                            let clamped = val.clamp(params[idx].min, params[idx].max);
+                            if self.has_selection() {
+                                let (lo, hi) = self.selected_range();
+                                for step in lo..=hi {
+                                    self.state.lisp_plocks[track].set(step, idx, clamped);
+                                }
+                            } else {
+                                self.state.lisp_defaults[track].set(idx, clamped);
+                                self.send_lisp_param(track, params[idx].cell_id, clamped);
+                            }
+                        }
                     }
                 } else {
                     let global_idx = self.effect_cursor.param_offset() + self.effect_param_cursor;
@@ -1100,6 +1355,16 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Branch to effect/lisp bars when effects column is focused in params region
+    if app.focused_region == Region::Params && app.params_column == 1 {
+        if app.lisp_tab_active {
+            draw_lisp_bars(frame, app, area);
+        } else {
+            draw_effect_bars(frame, app, area);
+        }
+        return;
+    }
+
     let ns = app.num_steps();
     let global_playhead = app.state.current_step();
     let playhead = global_playhead % ns;
@@ -1203,6 +1468,151 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_lisp_bars(frame: &mut Frame, app: &App, area: Rect) {
+    let track = app.cursor_track;
+    let idx = app.lisp_param_cursor;
+    let params = match &app.lisp_params[track] {
+        Some(p) if idx < p.len() => p,
+        _ => return,
+    };
+    let param = &params[idx];
+
+    let ns = app.num_steps();
+    let global_playhead = app.state.current_step();
+    let playhead = global_playhead % ns;
+    let is_playing = app.state.is_playing();
+    let (page_start, page_end) = app.page_range();
+    let x_offset = 2u16;
+    let range = param.max - param.min;
+
+    for step in page_start..page_end {
+        let col_x = area.x + x_offset + (step - page_start) as u16 * COL_WIDTH;
+        if col_x + COL_WIDTH > area.x + area.width {
+            break;
+        }
+
+        let plock_val = app.state.lisp_plocks[track].get(step, idx);
+        let value = plock_val.unwrap_or_else(|| app.state.lisp_defaults[track].get(idx));
+        let normalized = if range > 0.0 {
+            ((value - param.min) / range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let active = app.state.patterns[track].is_active(step);
+        let playhead_on_page = playhead >= page_start && playhead < page_end;
+        let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
+
+        let fill_levels = (normalized * (BAR_HEIGHT as f32 * 2.0)).round() as usize;
+
+        for row in 0..BAR_HEIGHT {
+            let cell_y = area.y + row as u16;
+            let rows_from_bottom = BAR_HEIGHT - 1 - row;
+            let threshold = rows_from_bottom * 2;
+            let level = if fill_levels >= threshold + 2 { 2 }
+                else if fill_levels >= threshold + 1 { 1 }
+                else { 0 };
+
+            let ch = match level {
+                2 => "\u{2588}",
+                1 => "\u{2584}",
+                _ => " ",
+            };
+
+            let cell_text = if ch == " " {
+                "   ".to_string()
+            } else {
+                format!(" {} ", ch)
+            };
+
+            let fg = if !active {
+                Color::Rgb(60, 60, 60)
+            } else if plock_val.is_some() {
+                Color::Cyan
+            } else {
+                Color::Green
+            };
+            let style = Style::default().fg(fg).bg(bg);
+            let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
+            frame.render_widget(Paragraph::new(cell_text).style(style), cell_area);
+        }
+    }
+}
+
+fn draw_effect_bars(frame: &mut Frame, app: &App, area: Rect) {
+    let track = app.cursor_track;
+    let global_idx = app.effect_cursor.param_offset() + app.effect_param_cursor;
+
+    // Skip boolean params (e.g., filter enabled, delay synced)
+    if crate::effects::effect_param_is_boolean(global_idx) {
+        return;
+    }
+
+    let ns = app.num_steps();
+    let global_playhead = app.state.current_step();
+    let playhead = global_playhead % ns;
+    let is_playing = app.state.is_playing();
+    let (page_start, page_end) = app.page_range();
+    let x_offset = 2u16;
+
+    let param_min = crate::effects::effect_param_min(global_idx);
+    let param_max = crate::effects::effect_param_max(global_idx);
+    let range = param_max - param_min;
+
+    for step in page_start..page_end {
+        let col_x = area.x + x_offset + (step - page_start) as u16 * COL_WIDTH;
+        if col_x + COL_WIDTH > area.x + area.width {
+            break;
+        }
+
+        let plock_val = app.state.effect_plocks[track].get(step, global_idx);
+        let value = plock_val.unwrap_or_else(|| app.state.effect_defaults[track].get(global_idx));
+        let normalized = if range > 0.0 {
+            ((value - param_min) / range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let active = app.state.patterns[track].is_active(step);
+        let playhead_on_page = playhead >= page_start && playhead < page_end;
+        let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
+
+        let fill_levels = (normalized * (BAR_HEIGHT as f32 * 2.0)).round() as usize;
+
+        for row in 0..BAR_HEIGHT {
+            let cell_y = area.y + row as u16;
+            let rows_from_bottom = BAR_HEIGHT - 1 - row;
+            let threshold = rows_from_bottom * 2;
+            let level = if fill_levels >= threshold + 2 { 2 }
+                else if fill_levels >= threshold + 1 { 1 }
+                else { 0 };
+
+            let ch = match level {
+                2 => "\u{2588}",
+                1 => "\u{2584}",
+                _ => " ",
+            };
+
+            let cell_text = if ch == " " {
+                "   ".to_string()
+            } else {
+                format!(" {} ", ch)
+            };
+
+            let fg = if !active {
+                Color::Rgb(60, 60, 60)
+            } else if plock_val.is_some() {
+                Color::Cyan
+            } else {
+                Color::Magenta
+            };
+            let style = Style::default().fg(fg).bg(bg);
+            let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
+            frame.render_widget(Paragraph::new(cell_text).style(style), cell_area);
+        }
+    }
+}
+
 fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
     if app.tracks.is_empty() || area.height < 2 {
         return;
@@ -1222,7 +1632,10 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         let active = app.state.patterns[app.cursor_track].is_active(step);
-        let has_plock = app.state.effect_plocks[app.cursor_track].step_has_any_plock(step);
+        let has_effect_plock = app.state.effect_plocks[app.cursor_track].step_has_any_plock(step);
+        let lisp_param_count = app.state.lisp_param_count[app.cursor_track].load(Ordering::Relaxed) as usize;
+        let has_lisp_plock = app.state.lisp_plocks[app.cursor_track].step_has_any_plock(step, lisp_param_count);
+        let has_plock = has_effect_plock || has_lisp_plock;
         let ch = if active && has_plock {
             " * "
         } else if active {
@@ -1463,10 +1876,10 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         Style::default().fg(Color::Rgb(60, 60, 60))
     };
 
-    // Build title with effect type tabs
+    // Build title with effect type tabs (Filter, Delay, Lisp)
     let mut title_spans = vec![];
     for et in EffectType::ALL {
-        let is_selected = et == app.effect_cursor;
+        let is_selected = et == app.effect_cursor && !app.lisp_tab_active;
         let style = if is_selected && col_focused {
             Style::default().fg(Color::Black).bg(Color::Cyan).bold()
         } else if is_selected {
@@ -1482,6 +1895,27 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
         title_spans.push(Span::styled(label, style));
         title_spans.push(Span::raw("  "));
     }
+    // Lisp tab
+    {
+        let is_selected = app.lisp_tab_active;
+        let has_effect = !app.tracks.is_empty() && app.lisp_effects[app.cursor_track].is_some();
+        let lisp_label = if has_effect { "Lisp" } else { "Lisp" };
+        let style = if is_selected && col_focused {
+            Style::default().fg(Color::Black).bg(Color::Green).bold()
+        } else if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
+        } else if has_effect {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let label = if is_selected {
+            format!("[< {} >]", lisp_label)
+        } else {
+            format!("[  {}  ]", lisp_label)
+        };
+        title_spans.push(Span::styled(label, style));
+    }
 
     let block = Block::default()
         .title(Line::from(title_spans))
@@ -1494,6 +1928,11 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     app.layout.effects_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
+        return;
+    }
+
+    if app.lisp_tab_active {
+        draw_lisp_params(frame, app, inner, col_focused);
         return;
     }
 
@@ -1588,6 +2027,163 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     // Dropdown overlay
     if app.dropdown_open && col_focused {
         draw_dropdown(frame, app, inner);
+    }
+}
+
+fn draw_lisp_params(frame: &mut Frame, app: &App, inner: Rect, col_focused: bool) {
+    let track = app.cursor_track;
+    let has_effect = app.lisp_effects[track].is_some();
+
+    if !has_effect {
+        // No effect loaded
+        let hint = Line::from(vec![
+            Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
+            Span::styled(" to create effect", Style::default().fg(Color::DarkGray)),
+        ]);
+        let row_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        frame.render_widget(Paragraph::new(hint), row_area);
+        return;
+    }
+
+    // Effect is loaded
+    match &app.lisp_params[track] {
+        Some(params) if !params.is_empty() => {
+            let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+
+            for (i, param) in params.iter().enumerate() {
+                let row_y = inner.y + i as u16;
+                if row_y >= inner.y + inner.height {
+                    break;
+                }
+
+                let is_cursor_row = col_focused && app.lisp_param_cursor == i;
+                let cursor = if is_cursor_row { "> " } else { "  " };
+                let cursor_style = if is_cursor_row {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let label_width = 12;
+                let value_width = 14;
+
+                let default_val = app.state.lisp_defaults[track].get(i);
+                let unit_str = param
+                    .unit
+                    .as_deref()
+                    .map(|u| format!(" {}", u))
+                    .unwrap_or_default();
+
+                // Value entry mode
+                if is_cursor_row && is_entering_value {
+                    let target_label = if app.has_selection() {
+                        let (lo, hi) = app.selected_range();
+                        format!("p-lock steps {}-{}", lo + 1, hi + 1)
+                    } else {
+                        "default".to_string()
+                    };
+                    let spans = vec![
+                        Span::styled(cursor, cursor_style),
+                        Span::styled(format!("{:<width$}", param.name, width = label_width), Style::default().fg(Color::Gray)),
+                        Span::styled(
+                            format!("{}\u{2588}", app.value_buffer),
+                            Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                        ),
+                        Span::styled(
+                            format!("  ({})  Enter: set  Esc: cancel", target_label),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ];
+                    let line = Line::from(spans);
+                    let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+                    frame.render_widget(Paragraph::new(line), row_area);
+                    continue;
+                }
+
+                // Determine display value and p-lock status
+                let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
+                    let plock_val = app.state.lisp_plocks[track].get(app.cursor_step, i);
+                    match plock_val {
+                        Some(v) => (v, Some(" (p-lock)")),
+                        None => (default_val, None),
+                    }
+                } else {
+                    (default_val, None)
+                };
+
+                let formatted = format!("{:.2}{}", display_val, unit_str);
+
+                let mut spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(
+                        format!("{:<width$}", param.name, width = label_width),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("{:<width$}", formatted, width = value_width),
+                        cursor_style,
+                    ),
+                ];
+
+                if let Some(lbl) = plock_label {
+                    spans.push(Span::styled(lbl, Style::default().fg(Color::Cyan)));
+                }
+
+                // Slider
+                let range = param.max - param.min;
+                if range > 0.0 {
+                    let slider_val = if app.has_selection() {
+                        app.state.lisp_plocks[track]
+                            .get(app.cursor_step, i)
+                            .unwrap_or(default_val)
+                    } else {
+                        default_val
+                    };
+                    let norm = ((slider_val - param.min) / range).clamp(0.0, 1.0);
+                    let slider_width =
+                        (inner.width as usize).saturating_sub(label_width + value_width + 6);
+                    if slider_width > 2 {
+                        let filled =
+                            ((norm * slider_width as f32).round() as usize).min(slider_width);
+                        let bar: String =
+                            "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
+                        spans.push(Span::styled(
+                            format!("[{}]", bar),
+                            Style::default().fg(Color::Green),
+                        ));
+                    }
+                }
+
+                let line = Line::from(spans);
+                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+                frame.render_widget(Paragraph::new(line), row_area);
+            }
+        }
+        _ => {
+            // Effect loaded but no params
+            let lines = vec![
+                Line::from(Span::styled(
+                    "  effect active",
+                    Style::default().fg(Color::Green),
+                )),
+                Line::from(Span::styled(
+                    "  (no parameters)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(vec![
+                    Span::styled("  Ctrl+L", Style::default().fg(Color::Green).bold()),
+                    Span::styled(" to edit", Style::default().fg(Color::DarkGray)),
+                ]),
+            ];
+            for (i, line) in lines.iter().enumerate() {
+                let row_y = inner.y + i as u16;
+                if row_y >= inner.y + inner.height {
+                    break;
+                }
+                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+                frame.render_widget(Paragraph::new(line.clone()), row_area);
+            }
+        }
     }
 }
 
@@ -1729,6 +2325,11 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                 vec![Line::from(Span::styled(
                     "  \u{2191}\u{2193}: select  Enter: confirm  Esc: cancel",
                     Style::default().fg(Color::Yellow),
+                ))]
+            } else if app.params_column == 1 {
+                vec![Line::from(Span::styled(
+                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  +/-: adjust  [/]: step  Enter: toggle  Tab: region",
+                    Style::default().fg(Color::DarkGray),
                 ))]
             } else {
                 vec![Line::from(Span::styled(

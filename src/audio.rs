@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::audiograph::*;
 use crate::delay;
 use crate::effects::TOTAL_EFFECT_PARAMS;
+use crate::lisp_effect::HEADER_SLOTS;
 use crate::sampler::{
     PARAM_ATTACK_SAMPLES, PARAM_GATE_MODE, PARAM_GATE_SAMPLES, PARAM_PLAYHEAD,
     PARAM_RELEASE_SAMPLES, PARAM_SPEED, PARAM_TRANSPOSE, PARAM_TRIGGER, PARAM_VELOCITY,
@@ -75,39 +76,75 @@ unsafe fn send_trigger(
 ) {
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_VELOCITY, logical_id: lid, fvalue: sd.get(step, StepParam::Velocity) },
+        ParamMsg {
+            idx: PARAM_VELOCITY,
+            logical_id: lid,
+            fvalue: sd.get(step, StepParam::Velocity),
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_SPEED, logical_id: lid, fvalue: sd.get(step, StepParam::Speed) },
+        ParamMsg {
+            idx: PARAM_SPEED,
+            logical_id: lid,
+            fvalue: sd.get(step, StepParam::Speed),
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_GATE_SAMPLES, logical_id: lid, fvalue: gate_samples },
+        ParamMsg {
+            idx: PARAM_GATE_SAMPLES,
+            logical_id: lid,
+            fvalue: gate_samples,
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_TRANSPOSE, logical_id: lid, fvalue: sd.get(step, StepParam::Transpose) },
+        ParamMsg {
+            idx: PARAM_TRANSPOSE,
+            logical_id: lid,
+            fvalue: sd.get(step, StepParam::Transpose),
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_ATTACK_SAMPLES, logical_id: lid, fvalue: attack_samples },
+        ParamMsg {
+            idx: PARAM_ATTACK_SAMPLES,
+            logical_id: lid,
+            fvalue: attack_samples,
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_RELEASE_SAMPLES, logical_id: lid, fvalue: release_samples },
+        ParamMsg {
+            idx: PARAM_RELEASE_SAMPLES,
+            logical_id: lid,
+            fvalue: release_samples,
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_GATE_MODE, logical_id: lid, fvalue: gate_mode },
+        ParamMsg {
+            idx: PARAM_GATE_MODE,
+            logical_id: lid,
+            fvalue: gate_mode,
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_PLAYHEAD, logical_id: lid, fvalue: 0.0 },
+        ParamMsg {
+            idx: PARAM_PLAYHEAD,
+            logical_id: lid,
+            fvalue: 0.0,
+        },
     );
     params_push_wrapper(
         lg,
-        ParamMsg { idx: PARAM_TRIGGER, logical_id: lid, fvalue: 1.0 },
+        ParamMsg {
+            idx: PARAM_TRIGGER,
+            logical_id: lid,
+            fvalue: 1.0,
+        },
     );
 }
 
@@ -152,6 +189,37 @@ unsafe fn dispatch_effect_plocks_for_track(
                 );
             }
         }
+    }
+}
+
+/// Dispatch lisp effect p-locks for a given step on a single track.
+unsafe fn dispatch_lisp_plocks_for_track(
+    lg: *mut LiveGraph,
+    state: &SequencerState,
+    track_idx: usize,
+    step: usize,
+) {
+    let node_id = state.lisp_node_ids[track_idx].load(Ordering::Relaxed);
+    if node_id == 0 {
+        return;
+    }
+    let param_count = state.lisp_param_count[track_idx].load(Ordering::Relaxed) as usize;
+    let logical_id = node_id as u64;
+
+    for i in 0..param_count {
+        let value = state.lisp_plocks[track_idx]
+            .get(step, i)
+            .unwrap_or_else(|| state.lisp_defaults[track_idx].get(i));
+        let cell_id = state.lisp_cell_id(track_idx, i);
+        let idx = (HEADER_SLOTS + cell_id as usize) as u64;
+        params_push_wrapper(
+            lg,
+            ParamMsg {
+                idx,
+                logical_id,
+                fvalue: value,
+            },
+        );
     }
 }
 
@@ -239,6 +307,7 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                         track_idx,
                         local_step,
                     );
+                    dispatch_lisp_plocks_for_track(data.lg.0, &data.state, track_idx, local_step);
                 }
 
                 let tp = &data.state.track_params[track_idx];
@@ -313,10 +382,14 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     let nch = data.num_channels;
     for i in 0..nframes {
         let l = output[i * nch].abs();
-        if l > peak_l { peak_l = l; }
+        if l > peak_l {
+            peak_l = l;
+        }
         if nch > 1 {
             let r = output[i * nch + 1].abs();
-            if r > peak_r { peak_r = r; }
+            if r > peak_r {
+                peak_r = r;
+            }
         }
     }
     data.state.peak_l.store(peak_l.to_bits(), Ordering::Relaxed);
@@ -332,10 +405,7 @@ pub fn build_output_stream(
     num_channels: usize,
     block_size: usize,
 ) -> Result<Stream, String> {
-    let clock = SequencerClock::new(
-        sample_rate,
-        state.bpm.load(Ordering::Relaxed),
-    );
+    let clock = SequencerClock::new(sample_rate, state.bpm.load(Ordering::Relaxed));
 
     let num_tracks = track_nodes.len();
 
@@ -399,7 +469,9 @@ pub fn build_output_stream(
         )
         .map_err(|e| format!("Failed to build output stream: {e}"))?;
 
-    stream.play().map_err(|e| format!("Failed to play stream: {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("Failed to play stream: {e}"))?;
 
     Ok(stream)
 }
