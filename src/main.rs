@@ -8,10 +8,14 @@ mod effects;
 mod filter;
 #[allow(dead_code)]
 mod lisp_effect;
+#[allow(dead_code)]
+mod reverb;
 mod sampler;
 #[allow(dead_code)]
 mod sequencer;
 mod ui;
+#[allow(dead_code)]
+mod voice;
 
 use std::ffi::CString;
 use std::sync::Arc;
@@ -54,6 +58,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Create global reverb bus and reverb node
+    let reverb_bus_name = CString::new("reverb_bus").unwrap();
+    let reverb_bus_id = unsafe { audiograph::live_add_gain(lg, 1.0, reverb_bus_name.as_ptr()) };
+
+    let reverb_node_name = CString::new("reverb").unwrap();
+    let reverb_node_id = unsafe {
+        audiograph::add_node(
+            lg,
+            reverb::reverb_vtable(),
+            reverb::REVERB_STATE_SIZE * std::mem::size_of::<f32>(),
+            reverb_node_name.as_ptr(),
+            1,
+            2, // 1 mono input, 2 stereo outputs
+            std::ptr::null(),
+            0,
+        )
+    };
+
+    // Wire: reverb_bus → reverb_node → bus_L / bus_R
+    unsafe {
+        audiograph::graph_connect(lg, reverb_bus_id, 0, reverb_node_id, 0);
+        audiograph::graph_connect(lg, reverb_node_id, 0, bus_l_id, 0);
+        audiograph::graph_connect(lg, reverb_node_id, 1, bus_r_id, 0);
+    }
+
     // Start engine with 0 workers (audio callback is single-threaded)
     unsafe {
         audiograph::engine_start_workers(0);
@@ -62,6 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared sequencer state (start with 0 tracks)
     let state = Arc::new(sequencer::SequencerState::new(0, vec![]));
 
+    // Create psc channel for keyboard triggers
+    let (keyboard_tx, keyboard_rx) = std::sync::mpsc::channel();
+
     // Build cpal audio stream
     let _stream = audio::build_output_stream(
         lg,
@@ -69,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_rate,
         channels as usize,
         block_size,
+        keyboard_rx,
     )?;
 
     // Setup terminal
@@ -77,14 +110,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     // Create UI app
     let lg_ptr = audiograph::LiveGraphPtr(lg);
-    let mut app = ui::App::new(Arc::clone(&state), lg_ptr, sample_rate, bus_l_id, bus_r_id);
+    let mut app = ui::App::new(
+        Arc::clone(&state),
+        lg_ptr,
+        sample_rate,
+        bus_l_id,
+        bus_r_id,
+        reverb_bus_id,
+        reverb_node_id,
+        keyboard_tx,
+    );
 
     // Main loop
     loop {
@@ -100,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             crossterm::terminal::disable_raw_mode()?;
             crossterm::execute!(
                 terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
                 crossterm::terminal::LeaveAlternateScreen,
                 crossterm::event::DisableMouseCapture
             )?;
@@ -112,7 +158,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             crossterm::execute!(
                 terminal.backend_mut(),
                 crossterm::terminal::EnterAlternateScreen,
-                crossterm::event::EnableMouseCapture
+                crossterm::event::EnableMouseCapture,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
             )?;
             terminal.clear()?;
         }
@@ -122,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     )?;

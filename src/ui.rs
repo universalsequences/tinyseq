@@ -1,4 +1,6 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::ffi::CString;
@@ -8,12 +10,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audiograph::LiveGraphPtr;
-use crate::effects::{EffectDescriptor, EffectSlotState, BUILTIN_SLOT_COUNT};
+use crate::effects::{
+    EffectDescriptor, EffectSlotState, ParamKind, SyncDivision, BUILTIN_SLOT_COUNT,
+};
 use crate::lisp_effect::{self, LoadedDGenLib, MAX_CUSTOM_FX};
-use crate::sequencer::{SequencerState, StepParam, NUM_PARAMS, MAX_STEPS, MAX_TRACKS, STEPS_PER_PAGE};
+use crate::reverb;
+use crate::sequencer::{
+    KeyboardTrigger, SequencerState, StepParam, MAX_STEPS, MAX_TRACKS, NUM_PARAMS, STEPS_PER_PAGE,
+};
+use crate::voice::MAX_VOICES;
 
 const BAR_HEIGHT: usize = 8;
 const COL_WIDTH: u16 = 3;
+
+/// Sentinel value for `effect_slot_cursor` indicating the Reverb tab is selected.
+const REVERB_TAB: usize = usize::MAX;
+
+// Track param cursor indices
+const TP_GATE: usize = 0;
+const TP_ATTACK: usize = 1;
+const TP_RELEASE: usize = 2;
+const TP_SWING: usize = 3;
+const TP_STEPS: usize = 4;
+const TP_SEND: usize = 5;
+const TP_POLY: usize = 6;
+const TP_LAST: usize = TP_POLY;
+
+struct PendingCompile {
+    receiver: std::sync::mpsc::Receiver<Result<lisp_effect::CompileResult, String>>,
+    name: String,
+    slot_idx: usize,
+    cursor_track: usize,
+    tick: usize,
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum InputMode {
@@ -23,6 +52,7 @@ pub enum InputMode {
     PatternSelect,
     EffectPicker,
     SampleBrowser,
+    Audition,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -56,15 +86,19 @@ pub struct LayoutRects {
     pub track_params_inner: Rect,
     pub effects_inner: Rect,
     pub effects_block: Rect,
+    pub info_bar: Rect,
+    pub rec_button: Rect,
 }
 
 /// Per-track node IDs needed for graph rewiring.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct TrackNodeIds {
-    pub sampler_id: i32,
+    pub sampler_ids: Vec<i32>, // up to MAX_VOICES
+    pub voice_sum_id: i32,     // dedicated sum node
     pub filter_id: i32,
     pub delay_id: i32,
+    pub send_id: i32,
 }
 
 // ── Sample Browser tree ──
@@ -120,7 +154,8 @@ impl BrowserNode {
                         expanded: false,
                     });
                 }
-            } else if path.extension()
+            } else if path
+                .extension()
                 .map(|ext| ext.to_ascii_lowercase() == "wav")
                 .unwrap_or(false)
             {
@@ -141,8 +176,11 @@ impl BrowserNode {
         let mut result = Vec::new();
         for node in nodes {
             result.push(BrowserEntry {
-                depth, is_dir: node.is_dir, name: node.name.clone(),
-                path: node.path.clone(), expanded: node.expanded,
+                depth,
+                is_dir: node.is_dir,
+                name: node.name.clone(),
+                path: node.path.clone(),
+                expanded: node.expanded,
             });
             if node.is_dir && node.expanded {
                 result.extend(Self::flatten_visible(&node.children, depth + 1));
@@ -152,23 +190,59 @@ impl BrowserNode {
     }
 
     /// Flatten with search filter — show matching .wav files with their ancestor context (auto-expanded).
-    pub fn flatten_filtered(nodes: &[BrowserNode], filter_lower: &str, depth: usize) -> Vec<BrowserEntry> {
+    /// Matches against both file names and folder names. When a folder name matches,
+    /// all its descendants are included.
+    pub fn flatten_filtered(
+        nodes: &[BrowserNode],
+        filter_lower: &str,
+        depth: usize,
+    ) -> Vec<BrowserEntry> {
         let mut result = Vec::new();
         for node in nodes {
             if node.is_dir {
-                let child_results = Self::flatten_filtered(&node.children, filter_lower, depth + 1);
+                let dir_matches = node.name.to_lowercase().contains(filter_lower);
+                let child_results = if dir_matches {
+                    // Folder name matches — include all children
+                    Self::flatten_all(&node.children, depth + 1)
+                } else {
+                    Self::flatten_filtered(&node.children, filter_lower, depth + 1)
+                };
                 if !child_results.is_empty() {
                     result.push(BrowserEntry {
-                        depth, is_dir: true, name: node.name.clone(),
-                        path: node.path.clone(), expanded: true,
+                        depth,
+                        is_dir: true,
+                        name: node.name.clone(),
+                        path: node.path.clone(),
+                        expanded: true,
                     });
                     result.extend(child_results);
                 }
             } else if node.name.to_lowercase().contains(filter_lower) {
                 result.push(BrowserEntry {
-                    depth, is_dir: false, name: node.name.clone(),
-                    path: node.path.clone(), expanded: false,
+                    depth,
+                    is_dir: false,
+                    name: node.name.clone(),
+                    path: node.path.clone(),
+                    expanded: false,
                 });
+            }
+        }
+        result
+    }
+
+    /// Flatten all descendants (used when a parent folder matches the filter).
+    fn flatten_all(nodes: &[BrowserNode], depth: usize) -> Vec<BrowserEntry> {
+        let mut result = Vec::new();
+        for node in nodes {
+            result.push(BrowserEntry {
+                depth,
+                is_dir: node.is_dir,
+                name: node.name.clone(),
+                path: node.path.clone(),
+                expanded: node.is_dir,
+            });
+            if node.is_dir {
+                result.extend(Self::flatten_all(&node.children, depth + 1));
             }
         }
         result
@@ -216,7 +290,7 @@ pub struct App {
     pub focused_region: Region,
     pub params_column: usize, // 0 = track params (left), 1 = effects (right)
     pub track_param_cursor: usize, // 0=gate, 1=attack, 2=release, 3=swing, 4=steps
-    pub effect_slot_cursor: usize,  // index into effect_descriptors[track]
+    pub effect_slot_cursor: usize, // index into effect_descriptors[track]
     pub effect_param_cursor: usize, // param index within focused slot
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
@@ -232,14 +306,14 @@ pub struct App {
     pub track_node_ids: Vec<TrackNodeIds>,
     pub sample_rate: u32,
     pub pending_lisp_edit: bool,
-    pub pending_lisp_slot: usize,             // chain index being edited/added
-    pub pending_lisp_name: Option<String>,     // effect name if editing existing
-    lisp_libs: Vec<LoadedDGenLib>,             // keep loaded dylibs alive
+    pub pending_lisp_slot: usize, // chain index being edited/added
+    pub pending_lisp_name: Option<String>, // effect name if editing existing
+    lisp_libs: Vec<LoadedDGenLib>, // keep loaded dylibs alive
 
     // Effect picker
     pub picker_cursor: usize,
     pub picker_filter: String,
-    pub picker_items: Vec<String>,             // cached list from effects/ folder
+    pub picker_items: Vec<String>, // cached list from effects/ folder
 
     // Status message (shown briefly in help bar)
     pub status_message: Option<(String, Instant)>,
@@ -250,12 +324,40 @@ pub struct App {
     // Bus node IDs for wiring new tracks
     pub bus_l_id: i32,
     pub bus_r_id: i32,
+    pub reverb_bus_id: i32,
+    pub reverb_node_id: i32,
+
+    // Reverb tab state
+    pub reverb_param_cursor: usize,
+    pub reverb_size: f32,
+    pub reverb_brightness: f32,
+    pub reverb_replace: f32,
+
+    // Async effect compilation
+    pending_compile: Option<PendingCompile>,
 
     // Sample browser
     pub browser_tree: Vec<BrowserNode>,
     pub browser_cursor: usize,
     pub browser_filter: String,
     pub browser_scroll_offset: usize,
+
+    // Per-track buffer IDs and audition state
+    pub track_buffer_ids: Vec<i32>,
+    pub audition_original_buffer_id: i32,
+    pub audition_original_name: String,
+
+    // Keyboard playing & recording
+    pub record_armed: Vec<bool>,
+    pub recording: bool, // true = record into pattern on key-up
+    pub keyboard_octave: i32,
+    pub keyboard_tx: std::sync::mpsc::Sender<KeyboardTrigger>,
+
+    // Held notes for key-up duration tracking: (key_char, transpose, step_at_press, press_instant)
+    pub held_notes: Vec<(char, f32, usize, Instant)>,
+
+    // Per-track voice logical IDs (UI-side tracking)
+    pub track_voice_lids: Vec<Vec<u64>>,
 }
 
 impl App {
@@ -265,6 +367,9 @@ impl App {
         sample_rate: u32,
         bus_l_id: i32,
         bus_r_id: i32,
+        reverb_bus_id: i32,
+        reverb_node_id: i32,
+        keyboard_tx: std::sync::mpsc::Sender<KeyboardTrigger>,
     ) -> Self {
         // Auto-open sample browser when starting with 0 tracks
         let input_mode = if state.active_track_count() == 0 {
@@ -310,10 +415,26 @@ impl App {
             bpm_entry: false,
             bus_l_id,
             bus_r_id,
+            reverb_bus_id,
+            reverb_node_id,
+            reverb_param_cursor: 0,
+            reverb_size: 0.2,
+            reverb_brightness: 0.8,
+            reverb_replace: 0.3,
             browser_tree,
             browser_cursor: 0,
             browser_filter: String::new(),
             browser_scroll_offset: 0,
+            pending_compile: None,
+            track_buffer_ids: Vec::new(),
+            audition_original_buffer_id: -1,
+            audition_original_name: String::new(),
+            record_armed: Vec::new(),
+            recording: false,
+            keyboard_octave: 0,
+            keyboard_tx,
+            held_notes: Vec::new(),
+            track_voice_lids: Vec::new(),
         }
     }
 
@@ -324,9 +445,23 @@ impl App {
             return Err("Maximum number of tracks reached".to_string());
         }
 
-        // Load WAV and create sampler node
-        let sampler_track = crate::sampler::create_sampler_track(self.lg.0, wav_path)?;
-        let track_name = sampler_track.name.clone();
+        // Load WAV buffer once
+        let (buffer_id, track_name) = crate::sampler::load_wav_buffer(self.lg.0, wav_path)?;
+
+        // Create MAX_VOICES sampler nodes sharing the same buffer
+        let mut sampler_ids = Vec::with_capacity(MAX_VOICES);
+        let mut voice_lids = Vec::with_capacity(MAX_VOICES);
+        for v in 0..MAX_VOICES {
+            let node_name = format!("{}_{}", track_name, v);
+            let st = crate::sampler::create_sampler_node(self.lg.0, buffer_id, &node_name)?;
+            sampler_ids.push(st.node_id);
+            voice_lids.push(st.logical_id);
+        }
+
+        // Create voice_sum gain node (gain=1.0)
+        let sum_name = CString::new(format!("{}_sum", track_name)).unwrap();
+        let voice_sum_id =
+            unsafe { crate::audiograph::live_add_gain(self.lg.0, 1.0, sum_name.as_ptr()) };
 
         // Create filter node (1 in, 1 out)
         let filter_name = CString::new(format!("{}_filter", track_name)).unwrap();
@@ -336,7 +471,8 @@ impl App {
                 crate::filter::filter_vtable(),
                 crate::filter::FILTER_STATE_SIZE * std::mem::size_of::<f32>(),
                 filter_name.as_ptr(),
-                1, 1,
+                1,
+                1,
                 std::ptr::null(),
                 0,
             )
@@ -350,23 +486,42 @@ impl App {
                 crate::delay::delay_vtable(),
                 crate::delay::DELAY_STATE_SIZE * std::mem::size_of::<f32>(),
                 delay_name.as_ptr(),
-                1, 2,
+                1,
+                2,
                 std::ptr::null(),
                 0,
             )
         };
 
-        // Wire: sampler → filter → delay → bus_L/bus_R
+        // Create send gain node (default gain 0 = silent, controlled per-step)
+        let send_name = CString::new(format!("{}_send", track_name)).unwrap();
+        let send_id =
+            unsafe { crate::audiograph::live_add_gain(self.lg.0, 0.0, send_name.as_ptr()) };
+
+        // Wire: voice_0..5 → voice_sum → [custom_fx] → filter → delay → bus_L/bus_R
+        //        voice_sum → send → reverb_bus (send path)
         unsafe {
-            crate::audiograph::graph_connect(self.lg.0, sampler_track.node_id, 0, filter_id, 0);
+            for &sid in &sampler_ids {
+                crate::audiograph::graph_connect(self.lg.0, sid, 0, voice_sum_id, 0);
+            }
+            crate::audiograph::graph_connect(self.lg.0, voice_sum_id, 0, filter_id, 0);
             crate::audiograph::graph_connect(self.lg.0, filter_id, 0, delay_id, 0);
             crate::audiograph::graph_connect(self.lg.0, delay_id, 0, self.bus_l_id, 0);
             crate::audiograph::graph_connect(self.lg.0, delay_id, 1, self.bus_r_id, 0);
+            crate::audiograph::graph_connect(self.lg.0, voice_sum_id, 0, send_id, 0);
+            crate::audiograph::graph_connect(self.lg.0, send_id, 0, self.reverb_bus_id, 0);
         }
 
-        // Store node IDs in state for audio thread
-        self.state.sampler_lids[idx].store(sampler_track.logical_id, Ordering::Release);
+        // Store voice LIDs in state for audio thread
+        for (v, &lid) in voice_lids.iter().enumerate() {
+            self.state.voice_lids[idx][v].store(lid, Ordering::Release);
+        }
+        self.state.voice_counts[idx].store(MAX_VOICES as u32, Ordering::Release);
+
+        // Also store first voice as sampler_lid for backward compat
+        self.state.sampler_lids[idx].store(voice_lids[0], Ordering::Release);
         self.state.delay_lids[idx].store(delay_id as u64, Ordering::Release);
+        self.state.send_lids[idx].store(send_id as u64, Ordering::Release);
 
         // Initialize effect chain for this track slot
         let filter_desc = EffectDescriptor::builtin_filter();
@@ -377,12 +532,18 @@ impl App {
 
         // Push to App's UI-side tracking
         self.tracks.push(track_name);
+        self.track_buffer_ids.push(buffer_id);
         self.track_node_ids.push(TrackNodeIds {
-            sampler_id: sampler_track.node_id,
+            sampler_ids,
+            voice_sum_id,
             filter_id,
             delay_id,
+            send_id,
         });
-        self.effect_descriptors.push(EffectDescriptor::default_full_chain());
+        self.effect_descriptors
+            .push(EffectDescriptor::default_full_chain());
+        self.record_armed.push(false);
+        self.track_voice_lids.push(voice_lids);
 
         // Extend all pattern bank snapshots to cover the new track
         {
@@ -393,7 +554,9 @@ impl App {
         }
 
         // Make the new track visible to the audio thread (Release ordering)
-        self.state.num_tracks.store((idx + 1) as u32, Ordering::Release);
+        self.state
+            .num_tracks
+            .store((idx + 1) as u32, Ordering::Release);
 
         Ok(idx)
     }
@@ -454,7 +617,8 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
-        self.state.effect_chains
+        self.state
+            .effect_chains
             .get(self.cursor_track)
             .and_then(|chain| chain.get(self.effect_slot_cursor))
     }
@@ -505,7 +669,7 @@ impl App {
                 }
             }
         }
-        self.track_node_ids[track].sampler_id
+        self.track_node_ids[track].voice_sum_id
     }
 
     /// Find the audio graph successor for a custom slot at `offset` (0..MAX_CUSTOM_FX).
@@ -529,7 +693,11 @@ impl App {
     }
 
     /// Compute wiring info for a custom slot at `slot_idx`.
-    fn resolve_custom_slot_wiring(&self, track: usize, slot_idx: usize) -> (usize, i32, i32, Option<i32>) {
+    fn resolve_custom_slot_wiring(
+        &self,
+        track: usize,
+        slot_idx: usize,
+    ) -> (usize, i32, i32, Option<i32>) {
         let offset = slot_idx - BUILTIN_SLOT_COUNT;
         let slot_id = track * MAX_CUSTOM_FX + offset;
         let predecessor_id = self.find_custom_slot_predecessor(track, offset);
@@ -538,18 +706,30 @@ impl App {
             .get(slot_idx)
             .map(|slot| slot.node_id.load(Ordering::Relaxed))
             .unwrap_or(0);
-        let existing = if existing_node != 0 { Some(existing_node as i32) } else { None };
+        let existing = if existing_node != 0 {
+            Some(existing_node as i32)
+        } else {
+            None
+        };
         (slot_id, predecessor_id, successor_id, existing)
     }
 
     /// Apply a loaded effect's metadata to the slot state and descriptor.
-    fn apply_effect_to_slot(&mut self, track: usize, slot_idx: usize, node_id: i32, name: &str, params: &[lisp_effect::DGenParam]) {
+    fn apply_effect_to_slot(
+        &mut self,
+        track: usize,
+        slot_idx: usize,
+        node_id: i32,
+        name: &str,
+        params: &[lisp_effect::DGenParam],
+    ) {
         let desc = EffectDescriptor::from_lisp_manifest(name, params);
         self.effect_descriptors[track][slot_idx] = desc;
 
         let slot = &self.state.effect_chains[track][slot_idx];
         slot.node_id.store(node_id as u32, Ordering::Relaxed);
-        slot.num_params.store(params.len() as u32, Ordering::Relaxed);
+        slot.num_params
+            .store(params.len() as u32, Ordering::Relaxed);
         for (i, p) in params.iter().enumerate() {
             slot.defaults.set(i, p.default);
             if i < slot.param_node_indices.len() {
@@ -560,9 +740,52 @@ impl App {
     }
 
     pub fn handle_input(&mut self) -> std::io::Result<()> {
+        // Poll for async compilation result
+        if let Some(ref pending) = self.pending_compile {
+            match pending.receiver.try_recv() {
+                Ok(Ok(compile_result)) => {
+                    let name = pending.name.clone();
+                    let slot_idx = pending.slot_idx;
+                    let track = pending.cursor_track;
+                    self.pending_compile = None;
+                    self.apply_compiled_effect(compile_result, &name, slot_idx, track);
+                }
+                Ok(Err(e)) => {
+                    self.status_message = Some((format!("Compile error: {}", e), Instant::now()));
+                    self.pending_compile = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still compiling — increment tick for spinner animation
+                    self.pending_compile.as_mut().unwrap().tick += 1;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.status_message =
+                        Some(("Compile thread crashed".to_string(), Instant::now()));
+                    self.pending_compile = None;
+                }
+            }
+        }
+
+        // Block normal input while compiling — just consume events
+        if self.pending_compile.is_some() {
+            if event::poll(Duration::from_millis(33))? {
+                let _ = event::read()?;
+            }
+            return Ok(());
+        }
+
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
                 Event::Key(key) => {
+                    // Handle key release for note-off (armed keyboard playing)
+                    if key.kind == KeyEventKind::Release {
+                        if self.any_track_armed() {
+                            if let KeyCode::Char(c) = key.code {
+                                self.handle_note_release(c);
+                            }
+                        }
+                        return Ok(());
+                    }
                     if key.kind != KeyEventKind::Press {
                         return Ok(());
                     }
@@ -573,6 +796,7 @@ impl App {
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
                         InputMode::SampleBrowser => self.handle_sample_browser(key.code),
+                        InputMode::Audition => self.handle_audition(key.code),
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -589,7 +813,10 @@ impl App {
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.input_mode != InputMode::Normal {
             // Close overlays on click outside
-            if self.input_mode == InputMode::EffectPicker || self.input_mode == InputMode::SampleBrowser {
+            if self.input_mode == InputMode::EffectPicker
+                || self.input_mode == InputMode::SampleBrowser
+                || self.input_mode == InputMode::Audition
+            {
                 self.input_mode = InputMode::Normal;
             }
             return;
@@ -597,13 +824,37 @@ impl App {
 
         let l = &self.layout;
 
-        // Track list: click selects track
+        // Play button: click toggles playback
+        if rect_contains(l.info_bar, col, row) {
+            self.state.toggle_play();
+            if !self.state.is_playing() {
+                self.state.playhead.store(0, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        // REC button: click toggles recording
+        if rect_contains(l.rec_button, col, row) {
+            self.recording = !self.recording;
+            return;
+        }
+
+        // Track list: click selects track, click on arm dot toggles arm
         if rect_contains(l.track_list, col, row) {
             let idx = (row - l.track_list.y) as usize;
             if idx < self.tracks.len() {
-                self.cursor_track = idx;
-                self.clamp_cursor_to_steps();
-                self.focused_region = Region::Cirklon;
+                // Arm dot: label is "N XX " (5-6 chars), then "██ " (3 chars)
+                // Use last 4 cols as the click zone to be generous
+                let dot_start = l.track_list.x + l.track_list.width.saturating_sub(4);
+                if col >= dot_start {
+                    // Toggle arm on this track
+                    self.cursor_track = idx;
+                    self.record_armed[idx] = !self.record_armed[idx];
+                } else {
+                    self.cursor_track = idx;
+                    self.clamp_cursor_to_steps();
+                    self.focused_region = Region::Cirklon;
+                }
             }
             return;
         }
@@ -612,8 +863,8 @@ impl App {
         if rect_contains(l.param_tabs, col, row) {
             let x_off = col.saturating_sub(l.param_tabs.x + 2);
             let tab_idx = (x_off / 6) as usize;
-            if tab_idx < StepParam::ALL.len() {
-                self.active_param = StepParam::ALL[tab_idx];
+            if tab_idx < StepParam::VISIBLE.len() {
+                self.active_param = StepParam::VISIBLE[tab_idx];
                 self.focused_region = Region::Cirklon;
             }
             return;
@@ -638,7 +889,7 @@ impl App {
         // Track params inner: click selects param row
         if rect_contains(l.track_params_inner, col, row) {
             let row_idx = (row - l.track_params_inner.y) as usize;
-            if row_idx <= 4 {
+            if row_idx <= TP_LAST {
                 self.focused_region = Region::Params;
                 self.params_column = 0;
                 self.track_param_cursor = row_idx;
@@ -647,7 +898,10 @@ impl App {
         }
 
         // Effects block title row: click on effect slot tab
-        if row == l.effects_block.y && col >= l.effects_block.x && col < l.effects_block.x + l.effects_block.width {
+        if row == l.effects_block.y
+            && col >= l.effects_block.x
+            && col < l.effects_block.x + l.effects_block.width
+        {
             if let Some(slot_idx) = self.effect_tab_from_click_x(col) {
                 self.effect_slot_cursor = slot_idx;
                 self.effect_param_cursor = 0;
@@ -675,14 +929,17 @@ impl App {
         let now = Instant::now();
         let is_double = self
             .last_step_click
-            .map(|(prev_step, prev_time)| prev_step == step && now.duration_since(prev_time).as_millis() < 400)
+            .map(|(prev_step, prev_time)| {
+                prev_step == step && now.duration_since(prev_time).as_millis() < 400
+            })
             .unwrap_or(false);
 
         self.cursor_step = step;
         self.focused_region = Region::Cirklon;
 
         if is_double && !self.tracks.is_empty() {
-            self.state.toggle_step_and_clear_plocks(self.cursor_track, step);
+            self.state
+                .toggle_step_and_clear_plocks(self.cursor_track, step);
             self.last_step_click = None;
         } else {
             self.last_step_click = Some((step, now));
@@ -771,27 +1028,64 @@ impl App {
         self.pending_lisp_name = None;
     }
 
-    /// Load a saved effect into a custom slot (no terminal suspension needed).
-    fn load_effect_into_slot(&mut self, name: &str, slot_idx: usize) -> Result<(), String> {
-        let source = lisp_effect::load_effect_source(name)
-            .map_err(|e| format!("Failed to load: {e}"))?;
-        let json = lisp_effect::compile_lisp(&source, self.sample_rate)?;
-        let manifest = lisp_effect::parse_manifest(&json)?;
-        let lib = lisp_effect::load_dylib(&manifest.dylib_path)?;
-
-        let track = self.cursor_track;
-        let (slot_id, pred, succ, existing) =
-            self.resolve_custom_slot_wiring(track, slot_idx);
-
-        let node_id = unsafe {
-            lisp_effect::add_effect_to_chain_at(
-                self.lg.0, slot_id, &manifest, &lib, pred, succ, existing,
-            )?
+    /// Spawn a background thread to compile an effect, storing a PendingCompile.
+    fn start_effect_compile(&mut self, name: &str, slot_idx: usize) {
+        let source = match lisp_effect::load_effect_source(name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_message = Some((format!("Error: {e}"), Instant::now()));
+                return;
+            }
         };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sample_rate = self.sample_rate;
+        std::thread::spawn(move || {
+            let result = lisp_effect::compile_and_load(&source, sample_rate);
+            let _ = tx.send(result);
+        });
+        self.pending_compile = Some(PendingCompile {
+            receiver: rx,
+            name: name.to_string(),
+            slot_idx,
+            cursor_track: self.cursor_track,
+            tick: 0,
+        });
+    }
 
-        self.apply_effect_to_slot(track, slot_idx, node_id, name, &manifest.params);
-        self.lisp_libs.push(lib);
-        Ok(())
+    /// Apply a compiled effect result to the audio graph (must run on UI thread).
+    fn apply_compiled_effect(
+        &mut self,
+        result: lisp_effect::CompileResult,
+        name: &str,
+        slot_idx: usize,
+        track: usize,
+    ) {
+        let (slot_id, pred, succ, existing) = self.resolve_custom_slot_wiring(track, slot_idx);
+
+        match unsafe {
+            lisp_effect::add_effect_to_chain_at(
+                self.lg.0,
+                slot_id,
+                &result.manifest,
+                &result.lib,
+                pred,
+                succ,
+                existing,
+            )
+        } {
+            Ok(node_id) => {
+                self.apply_effect_to_slot(track, slot_idx, node_id, name, &result.manifest.params);
+                self.lisp_libs.push(result.lib);
+                self.effect_slot_cursor = slot_idx;
+                self.effect_param_cursor = 0;
+                self.focused_region = Region::Params;
+                self.params_column = 1;
+                self.status_message = Some((format!("Loaded '{}'", name), Instant::now()));
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Error: {}", e), Instant::now()));
+            }
+        }
     }
 
     fn filtered_picker_items(&self) -> Vec<String> {
@@ -838,25 +1132,10 @@ impl App {
                             self.pending_lisp_edit = true;
                         }
                     } else {
-                        // Load saved effect from picker
+                        // Load saved effect from picker (async)
                         let name = selected.clone();
                         if let Some(slot_idx) = self.next_free_custom_slot() {
-                            match self.load_effect_into_slot(&name, slot_idx) {
-                                Ok(()) => {
-                                    self.effect_slot_cursor = slot_idx;
-                                    self.effect_param_cursor = 0;
-                                    self.focused_region = Region::Params;
-                                    self.params_column = 1;
-                                    self.status_message = Some((
-                                        format!("Loaded '{}'", name),
-                                        Instant::now(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    self.status_message =
-                                        Some((format!("Error: {}", e), Instant::now()));
-                                }
-                            }
+                            self.start_effect_compile(&name, slot_idx);
                         }
                     }
                 }
@@ -943,22 +1222,120 @@ impl App {
                         match self.add_track(&path) {
                             Ok(idx) => {
                                 self.cursor_track = idx;
-                                self.status_message = Some((
-                                    format!("Added track {}", idx + 1),
-                                    Instant::now(),
-                                ));
+                                self.status_message =
+                                    Some((format!("Added track {}", idx + 1), Instant::now()));
                             }
                             Err(e) => {
-                                self.status_message = Some((
-                                    format!("Error: {}", e),
-                                    Instant::now(),
-                                ));
+                                self.status_message =
+                                    Some((format!("Error: {}", e), Instant::now()));
                             }
                         }
                     }
                 }
             }
             KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.browser_filter.clear();
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_audition(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => {
+                self.browser_filter.push(c);
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+            }
+            KeyCode::Backspace => {
+                self.browser_filter.pop();
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+            }
+            KeyCode::Up => {
+                if self.browser_cursor > 0 {
+                    self.browser_cursor -= 1;
+                    if self.browser_cursor < self.browser_scroll_offset {
+                        self.browser_scroll_offset = self.browser_cursor;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor + 1 < items.len() {
+                    self.browser_cursor += 1;
+                    let max_visible = 20usize;
+                    if self.browser_cursor >= self.browser_scroll_offset + max_visible {
+                        self.browser_scroll_offset = self.browser_cursor + 1 - max_visible;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    if item.is_dir && !item.expanded {
+                        let path = item.path.clone();
+                        BrowserNode::set_expanded(&mut self.browser_tree, &path, true);
+                    }
+                }
+            }
+            KeyCode::Left => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    if item.is_dir && item.expanded {
+                        let path = item.path.clone();
+                        BrowserNode::set_expanded(&mut self.browser_tree, &path, false);
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let items = self.browser_visible_items();
+                if self.browser_cursor < items.len() {
+                    let item = &items[self.browser_cursor];
+                    let path = item.path.clone();
+                    if item.is_dir {
+                        BrowserNode::toggle_expanded(&mut self.browser_tree, &path);
+                    } else {
+                        // Hot-swap sample on current track (all voices)
+                        match crate::sampler::load_wav_buffer(self.lg.0, &path) {
+                            Ok((new_buffer_id, new_name)) => {
+                                let track = self.cursor_track;
+                                self.send_buffer_to_all_voices(track, new_buffer_id);
+                                self.track_buffer_ids[track] = new_buffer_id;
+                                self.tracks[track] = new_name.clone();
+                                self.status_message =
+                                    Some((format!("Preview: {}", new_name), Instant::now()));
+                            }
+                            Err(e) => {
+                                self.status_message =
+                                    Some((format!("Error: {}", e), Instant::now()));
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                // Confirm — keep the current sample
+                let track = self.cursor_track;
+                let name = self.tracks[track].clone();
+                self.input_mode = InputMode::Normal;
+                self.browser_filter.clear();
+                self.browser_cursor = 0;
+                self.browser_scroll_offset = 0;
+                self.status_message =
+                    Some((format!("Sample changed to '{}'", name), Instant::now()));
+            }
+            KeyCode::Esc => {
+                // Revert to original sample (all voices)
+                let track = self.cursor_track;
+                self.send_buffer_to_all_voices(track, self.audition_original_buffer_id);
+                self.track_buffer_ids[track] = self.audition_original_buffer_id;
+                self.tracks[track] = self.audition_original_name.clone();
                 self.input_mode = InputMode::Normal;
                 self.browser_filter.clear();
                 self.browser_cursor = 0;
@@ -996,8 +1373,9 @@ impl App {
                             && chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
                         {
                             // Edit existing effect
-                            let name =
-                                self.effect_descriptors[self.cursor_track][slot_idx].name.clone();
+                            let name = self.effect_descriptors[self.cursor_track][slot_idx]
+                                .name
+                                .clone();
                             self.pending_lisp_slot = slot_idx;
                             self.pending_lisp_name = Some(name);
                             self.pending_lisp_edit = true;
@@ -1026,13 +1404,150 @@ impl App {
                 }
                 return;
             }
+            // Shift+R: toggle arm on current track
+            KeyCode::Char('R') if modifiers.contains(KeyModifiers::SHIFT) => {
+                if !self.tracks.is_empty() {
+                    let t = self.cursor_track;
+                    self.record_armed[t] = !self.record_armed[t];
+                    // Disarm turns off recording too if no tracks remain armed
+                    if !self.any_track_armed() {
+                        self.recording = false;
+                    }
+                }
+                return;
+            }
+            // Ctrl+R: toggle recording mode (only when armed)
+            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.any_track_armed() {
+                    self.recording = !self.recording;
+                }
+                return;
+            }
             _ => {}
+        }
+
+        // Keyboard playing interception when any track is armed
+        if self.any_track_armed() {
+            if let KeyCode::Char(c) = code {
+                match c {
+                    'z' => {
+                        self.keyboard_octave = (self.keyboard_octave - 12).max(-48);
+                        return;
+                    }
+                    'x' => {
+                        self.keyboard_octave = (self.keyboard_octave + 12).min(48);
+                        return;
+                    }
+                    _ => {
+                        if let Some(semitone) = Self::note_from_key(c) {
+                            // Ignore key repeat — only trigger on first press
+                            if self.held_notes.iter().any(|(k, _, _, _)| *k == c) {
+                                return;
+                            }
+                            let transpose = semitone as f32 + self.keyboard_octave as f32;
+                            // Send note-on to audio thread for all armed tracks
+                            for (track, armed) in self.record_armed.iter().enumerate() {
+                                if *armed {
+                                    let _ = self.keyboard_tx.send(KeyboardTrigger {
+                                        track,
+                                        transpose,
+                                        velocity: 1.0,
+                                        note_off: false,
+                                    });
+                                }
+                            }
+                            // Track held note for key-up duration calculation
+                            let step_now = self.state.playhead.load(Ordering::Relaxed) as usize;
+                            self.held_notes
+                                .push((c, transpose, step_now, Instant::now()));
+                            return;
+                        }
+                    }
+                }
+            }
         }
 
         // Region-specific dispatch
         match self.focused_region {
             Region::Cirklon => self.handle_cirklon_input(code, modifiers),
             Region::Params => self.handle_params_input(code, modifiers),
+        }
+    }
+
+    fn any_track_armed(&self) -> bool {
+        self.record_armed.iter().any(|a| *a)
+    }
+
+    /// Map QWERTY key to semitone offset (standard DAW layout).
+    fn note_from_key(c: char) -> Option<i32> {
+        match c {
+            'a' => Some(0),  // C
+            'w' => Some(1),  // C#
+            's' => Some(2),  // D
+            'e' => Some(3),  // D#
+            'd' => Some(4),  // E
+            'f' => Some(5),  // F
+            't' => Some(6),  // F#
+            'g' => Some(7),  // G
+            'y' => Some(8),  // G#
+            'h' => Some(9),  // A
+            'u' => Some(10), // A#
+            'j' => Some(11), // B
+            'k' => Some(12), // C+1
+            'o' => Some(13), // C#+1
+            'l' => Some(14), // D+1
+            _ => None,
+        }
+    }
+
+    /// Handle key release: send note-off to audio and optionally record into pattern.
+    fn handle_note_release(&mut self, c: char) {
+        // Find and remove the held note for this key
+        let held = self.held_notes.iter().position(|(k, _, _, _)| *k == c);
+        let held = match held {
+            Some(idx) => self.held_notes.remove(idx),
+            None => return,
+        };
+        let (_key, transpose, step_at_press, press_time) = held;
+
+        // Send note-off to audio thread for all armed tracks
+        for (track, armed) in self.record_armed.iter().enumerate() {
+            if *armed {
+                let _ = self.keyboard_tx.send(KeyboardTrigger {
+                    track,
+                    transpose,
+                    velocity: 0.0,
+                    note_off: true,
+                });
+            }
+        }
+
+        // Record into pattern if recording + playing
+        if !self.recording || !self.state.is_playing() {
+            return;
+        }
+
+        // Compute duration in 1/16th note units from hold time
+        let bpm = self.state.bpm.load(Ordering::Relaxed) as f64;
+        let secs_per_step = 60.0 / bpm / 4.0; // duration of one 1/16th note
+        let hold_secs = press_time.elapsed().as_secs_f64();
+        let duration_steps = (hold_secs / secs_per_step).max(0.15).min(64.0);
+
+        for (track, armed) in self.record_armed.iter().enumerate() {
+            if !*armed {
+                continue;
+            }
+            let num_steps = self.state.track_params[track].get_num_steps();
+            let local_step = step_at_press % num_steps;
+            // Enable step trigger
+            if !self.state.patterns[track].is_active(local_step) {
+                self.state.patterns[track].toggle_step(local_step);
+            }
+            // Add note to chord data (supports multiple notes per step)
+            self.state.chord_data[track].add_note(local_step, transpose);
+            // Set velocity and duration p-locks
+            self.state.step_data[track].set(local_step, StepParam::Velocity, 1.0);
+            self.state.step_data[track].set(local_step, StepParam::Duration, duration_steps as f32);
         }
     }
 
@@ -1105,8 +1620,22 @@ impl App {
                 if !self.tracks.is_empty() {
                     let (lo, hi) = self.selected_range();
                     for step in lo..=hi {
-                        self.state.toggle_step_and_clear_plocks(self.cursor_track, step);
+                        self.state
+                            .toggle_step_and_clear_plocks(self.cursor_track, step);
                     }
+                }
+            }
+
+            KeyCode::Backspace | KeyCode::Delete => {
+                if !self.tracks.is_empty() {
+                    let track = self.cursor_track;
+                    let (lo, hi) = self.selected_range();
+                    for step in lo..=hi {
+                        if self.state.patterns[track].is_active(step) {
+                            self.state.toggle_step_and_clear_plocks(track, step);
+                        }
+                    }
+                    self.selection_anchor = None;
                 }
             }
 
@@ -1136,6 +1665,40 @@ impl App {
                 self.value_buffer.clear();
                 self.pattern_clone_pending = false;
             }
+            KeyCode::Char('*') => {
+                if !self.tracks.is_empty() {
+                    let old_len = self.num_steps();
+                    let new_len = self.state.duplicate_track_pattern(self.cursor_track);
+                    if new_len == old_len {
+                        self.status_message = Some((
+                            format!("Already at max ({} steps)", new_len),
+                            Instant::now(),
+                        ));
+                    } else {
+                        self.status_message = Some((
+                            format!("Pattern doubled to {} steps", new_len),
+                            Instant::now(),
+                        ));
+                    }
+                    self.clamp_cursor_to_steps();
+                }
+            }
+            KeyCode::Char('/') => {
+                if !self.tracks.is_empty() {
+                    let old_len = self.num_steps();
+                    let new_len = self.state.halve_track_pattern(self.cursor_track);
+                    if new_len == old_len {
+                        self.status_message =
+                            Some(("Already at minimum (1 step)".to_string(), Instant::now()));
+                    } else {
+                        self.status_message = Some((
+                            format!("Pattern halved to {} steps", new_len),
+                            Instant::now(),
+                        ));
+                    }
+                    self.clamp_cursor_to_steps();
+                }
+            }
             KeyCode::Char('n') => {
                 self.browser_tree = BrowserNode::scan_root("samples");
                 self.browser_cursor = 0;
@@ -1143,12 +1706,61 @@ impl App {
                 self.browser_scroll_offset = 0;
                 self.input_mode = InputMode::SampleBrowser;
             }
+            KeyCode::Char('a') => {
+                if !self.tracks.is_empty() {
+                    self.audition_original_buffer_id = self.track_buffer_ids[self.cursor_track];
+                    self.audition_original_name = self.tracks[self.cursor_track].clone();
+                    self.browser_tree = BrowserNode::scan_root("samples");
+                    self.browser_cursor = 0;
+                    self.browser_filter.clear();
+                    self.browser_scroll_offset = 0;
+                    self.input_mode = InputMode::Audition;
+                }
+            }
             KeyCode::Char(c) => {
                 if let Some(param) = StepParam::from_hotkey(c) {
-                    self.active_param = param;
+                    if StepParam::VISIBLE.contains(&param) {
+                        self.active_param = param;
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Apply sample assignments from a restored pattern snapshot.
+    /// For each track with a valid buffer_id (>= 0), send a ParamMsg to swap the
+    /// buffer and update the UI's track name / buffer_id.
+    fn apply_sample_ids(&mut self, sample_ids: &[(i32, String)]) {
+        for (track, (buffer_id, name)) in sample_ids.iter().enumerate() {
+            if *buffer_id < 0 {
+                continue;
+            }
+            if track >= self.tracks.len() {
+                break;
+            }
+            // Send buffer swap to ALL voice LIDs for this track
+            self.send_buffer_to_all_voices(track, *buffer_id);
+            self.track_buffer_ids[track] = *buffer_id;
+            self.tracks[track] = name.clone();
+        }
+    }
+
+    /// Send PARAM_BUFFER_ID to all voice logical IDs for a track.
+    fn send_buffer_to_all_voices(&self, track: usize, buffer_id: i32) {
+        if track < self.track_voice_lids.len() {
+            for &lid in &self.track_voice_lids[track] {
+                unsafe {
+                    crate::audiograph::params_push_wrapper(
+                        self.lg.0,
+                        crate::audiograph::ParamMsg {
+                            idx: crate::sampler::PARAM_BUFFER_ID,
+                            logical_id: lid,
+                            fvalue: buffer_id as f32,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -1167,7 +1779,12 @@ impl App {
             }
             KeyCode::Char('x') => {
                 let num_tracks = self.tracks.len();
-                self.state.delete_pattern(num_tracks);
+                if let Some(sample_ids) =
+                    self.state
+                        .delete_pattern(num_tracks, &self.track_buffer_ids, &self.tracks)
+                {
+                    self.apply_sample_ids(&sample_ids);
+                }
                 self.clamp_cursor_to_steps();
                 self.value_buffer.clear();
                 self.pattern_clone_pending = false;
@@ -1176,14 +1793,22 @@ impl App {
             KeyCode::Enter => {
                 if self.pattern_clone_pending {
                     let num_tracks = self.tracks.len();
-                    self.state.clone_pattern(num_tracks);
+                    self.state
+                        .clone_pattern(num_tracks, &self.track_buffer_ids, &self.tracks);
                 } else if let Ok(n) = self.value_buffer.parse::<usize>() {
                     if n >= 1 {
                         let num_tracks = self.tracks.len();
                         let num_patterns = self.state.num_patterns.load(Ordering::Relaxed) as usize;
                         let idx = n - 1;
                         if idx < num_patterns {
-                            self.state.switch_pattern(idx, num_tracks);
+                            if let Some(sample_ids) = self.state.switch_pattern(
+                                idx,
+                                num_tracks,
+                                &self.track_buffer_ids,
+                                &self.tracks,
+                            ) {
+                                self.apply_sample_ids(&sample_ids);
+                            }
                             self.clamp_cursor_to_steps();
                         }
                     }
@@ -1231,7 +1856,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                if self.track_param_cursor < 4 {
+                if self.track_param_cursor < TP_LAST {
                     self.track_param_cursor += 1;
                 }
             }
@@ -1240,36 +1865,36 @@ impl App {
             }
             KeyCode::Left => {} // Already at leftmost column
             KeyCode::Enter => {
-                if self.track_param_cursor == 0 {
+                if self.track_param_cursor == TP_GATE {
                     tp.toggle_gate();
+                } else if self.track_param_cursor == TP_POLY {
+                    tp.toggle_polyphonic();
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                match self.track_param_cursor {
-                    1 => tp.set_attack_ms(tp.get_attack_ms() + 5.0),
-                    2 => tp.set_release_ms(tp.get_release_ms() + 10.0),
-                    3 => tp.set_swing(tp.get_swing() + 1.0),
-                    4 => {
-                        tp.set_num_steps(tp.get_num_steps() + 1);
-                        self.clamp_cursor_to_steps();
-                    }
-                    _ => {}
+            KeyCode::Char('+') | KeyCode::Char('=') => match self.track_param_cursor {
+                TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() + 5.0),
+                TP_RELEASE => tp.set_release_ms(tp.get_release_ms() + 10.0),
+                TP_SWING => tp.set_swing(tp.get_swing() + 1.0),
+                TP_STEPS => {
+                    tp.set_num_steps(tp.get_num_steps() + 1);
+                    self.clamp_cursor_to_steps();
                 }
-            }
-            KeyCode::Char('-') => {
-                match self.track_param_cursor {
-                    1 => tp.set_attack_ms(tp.get_attack_ms() - 5.0),
-                    2 => tp.set_release_ms(tp.get_release_ms() - 10.0),
-                    3 => tp.set_swing(tp.get_swing() - 1.0),
-                    4 => {
-                        tp.set_num_steps(tp.get_num_steps().saturating_sub(1).max(1));
-                        self.clamp_cursor_to_steps();
-                    }
-                    _ => {}
+                TP_SEND => self.adjust_track_send(0.05),
+                _ => {}
+            },
+            KeyCode::Char('-') => match self.track_param_cursor {
+                TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() - 5.0),
+                TP_RELEASE => tp.set_release_ms(tp.get_release_ms() - 10.0),
+                TP_SWING => tp.set_swing(tp.get_swing() - 1.0),
+                TP_STEPS => {
+                    tp.set_num_steps(tp.get_num_steps().saturating_sub(1).max(1));
+                    self.clamp_cursor_to_steps();
                 }
-            }
+                TP_SEND => self.adjust_track_send(-0.05),
+                _ => {}
+            },
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                if self.track_param_cursor > 0 {
+                if self.track_param_cursor > TP_GATE && self.track_param_cursor != TP_POLY {
                     self.value_buffer.clear();
                     self.value_buffer.push(c);
                     self.input_mode = InputMode::ValueEntry;
@@ -1279,7 +1904,87 @@ impl App {
         }
     }
 
+    fn push_send_gain(&self, track: usize) {
+        let send_lid = self.state.send_lids[track].load(Ordering::Acquire);
+        if send_lid != 0 {
+            let tp = &self.state.track_params[track];
+            unsafe {
+                crate::audiograph::params_push_wrapper(
+                    self.lg.0,
+                    crate::audiograph::ParamMsg {
+                        idx: 0,
+                        logical_id: send_lid,
+                        fvalue: tp.get_send(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn adjust_track_send(&mut self, delta: f32) {
+        let track = self.cursor_track;
+        let tp = &self.state.track_params[track];
+        tp.set_send(tp.get_send() + delta);
+        self.push_send_gain(track);
+    }
+
     fn handle_effects_column(&mut self, code: KeyCode) {
+        if self.effect_slot_cursor == REVERB_TAB {
+            match code {
+                KeyCode::Left => {
+                    let visible = self.visible_effect_indices();
+                    if let Some(&last) = visible.last() {
+                        self.effect_slot_cursor = last;
+                        self.effect_param_cursor = 0;
+                    } else {
+                        self.params_column = 0;
+                    }
+                }
+                KeyCode::Right => {} // Already at rightmost tab
+                KeyCode::Up => {
+                    if self.reverb_param_cursor > 0 {
+                        self.reverb_param_cursor -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if self.reverb_param_cursor < 2 {
+                        self.reverb_param_cursor += 1;
+                    }
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.adjust_reverb_param(0.05);
+                }
+                KeyCode::Char('-') => {
+                    self.adjust_reverb_param(-0.05);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                    self.value_buffer.clear();
+                    self.value_buffer.push(c);
+                    self.input_mode = InputMode::ValueEntry;
+                }
+                KeyCode::Char('[') => {
+                    let ns = self.num_steps();
+                    self.cursor_step = if self.cursor_step == 0 {
+                        ns - 1
+                    } else {
+                        self.cursor_step - 1
+                    };
+                    self.selection_anchor = Some(self.cursor_step);
+                }
+                KeyCode::Char(']') => {
+                    let ns = self.num_steps();
+                    self.cursor_step = if self.cursor_step + 1 >= ns {
+                        0
+                    } else {
+                        self.cursor_step + 1
+                    };
+                    self.selection_anchor = Some(self.cursor_step);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let visible = self.visible_effect_indices();
 
         match code {
@@ -1300,7 +2005,15 @@ impl App {
                     if pos + 1 < visible.len() {
                         self.effect_slot_cursor = visible[pos + 1];
                         self.effect_param_cursor = 0;
+                    } else {
+                        // Move to reverb tab
+                        self.effect_slot_cursor = REVERB_TAB;
+                        self.reverb_param_cursor = 0;
                     }
+                } else {
+                    // Move to reverb tab
+                    self.effect_slot_cursor = REVERB_TAB;
+                    self.reverb_param_cursor = 0;
                 }
             }
             KeyCode::Up => {
@@ -1322,6 +2035,7 @@ impl App {
                         let param = &desc.params[self.effect_param_cursor];
                         if param.is_boolean() {
                             self.toggle_slot_boolean();
+                            self.update_delay_time_param_kind();
                         } else if param.is_enum() {
                             self.dropdown_open = true;
                             self.dropdown_cursor = 0;
@@ -1352,16 +2066,63 @@ impl App {
             }
             KeyCode::Char('[') => {
                 let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step == 0 { ns - 1 } else { self.cursor_step - 1 };
+                self.cursor_step = if self.cursor_step == 0 {
+                    ns - 1
+                } else {
+                    self.cursor_step - 1
+                };
                 self.selection_anchor = Some(self.cursor_step);
             }
             KeyCode::Char(']') => {
                 let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step + 1 >= ns { 0 } else { self.cursor_step + 1 };
+                self.cursor_step = if self.cursor_step + 1 >= ns {
+                    0
+                } else {
+                    self.cursor_step + 1
+                };
                 self.selection_anchor = Some(self.cursor_step);
             }
             _ => {}
         }
+    }
+
+    fn set_reverb_param(&mut self, cursor: usize, value: f32) {
+        let clamped = value.clamp(0.0, 1.0);
+        let param_idx = match cursor {
+            0 => {
+                self.reverb_size = clamped;
+                reverb::REVERB_PARAM_SIZE
+            }
+            1 => {
+                self.reverb_brightness = clamped;
+                reverb::REVERB_PARAM_BRIGHT
+            }
+            2 => {
+                self.reverb_replace = clamped;
+                reverb::REVERB_PARAM_REPLACE
+            }
+            _ => return,
+        };
+        unsafe {
+            crate::audiograph::params_push_wrapper(
+                self.lg.0,
+                crate::audiograph::ParamMsg {
+                    idx: param_idx,
+                    logical_id: self.reverb_node_id as u64,
+                    fvalue: clamped,
+                },
+            );
+        }
+    }
+
+    fn adjust_reverb_param(&mut self, delta: f32) {
+        let current = match self.reverb_param_cursor {
+            0 => self.reverb_size,
+            1 => self.reverb_brightness,
+            2 => self.reverb_replace,
+            _ => return,
+        };
+        self.set_reverb_param(self.reverb_param_cursor, current + delta);
     }
 
     fn adjust_slot_param(&self, direction: f32) {
@@ -1369,7 +2130,11 @@ impl App {
         let slot_idx = self.effect_slot_cursor;
         let param_idx = self.effect_param_cursor;
 
-        let desc = match self.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+        let desc = match self
+            .effect_descriptors
+            .get(track)
+            .and_then(|d| d.get(slot_idx))
+        {
             Some(d) => d,
             None => return,
         };
@@ -1387,7 +2152,9 @@ impl App {
         if self.has_selection() {
             let (lo, hi) = self.selected_range();
             for step in lo..=hi {
-                let current = slot.plocks.get(step, param_idx)
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
                     .unwrap_or_else(|| slot.defaults.get(param_idx));
                 let inc = param_desc.increment(current);
                 let new_val = param_desc.clamp(current + direction * inc);
@@ -1437,7 +2204,9 @@ impl App {
         if self.has_selection() {
             let (lo, hi) = self.selected_range();
             for step in lo..=hi {
-                let current = slot.plocks.get(step, param_idx)
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
                     .unwrap_or_else(|| slot.defaults.get(param_idx));
                 let new_val = if current > 0.5 { 0.0 } else { 1.0 };
                 slot.plocks.set(step, param_idx, new_val);
@@ -1446,6 +2215,61 @@ impl App {
             let current = slot.defaults.get(param_idx);
             let new_val = if current > 0.5 { 0.0 } else { 1.0 };
             slot.defaults.set(param_idx, new_val);
+        }
+    }
+
+    /// When the delay's "synced" boolean is toggled, swap the "time" param
+    /// between Continuous (ms) and Enum (sync division labels) and reset the value.
+    fn update_delay_time_param_kind(&mut self) {
+        const DELAY_SLOT: usize = 1;
+        const SYNCED_PARAM: usize = 1;
+        const TIME_PARAM: usize = 2;
+
+        if self.effect_slot_cursor != DELAY_SLOT || self.effect_param_cursor != SYNCED_PARAM {
+            return;
+        }
+
+        let track = self.cursor_track;
+        let slot = match self
+            .state
+            .effect_chains
+            .get(track)
+            .and_then(|c| c.get(DELAY_SLOT))
+        {
+            Some(s) => s,
+            None => return,
+        };
+        let synced = slot.defaults.get(SYNCED_PARAM) > 0.5;
+
+        let desc = match self
+            .effect_descriptors
+            .get_mut(track)
+            .and_then(|d| d.get_mut(DELAY_SLOT))
+        {
+            Some(d) => d,
+            None => return,
+        };
+        if TIME_PARAM >= desc.params.len() {
+            return;
+        }
+
+        if synced {
+            let labels: Vec<String> = SyncDivision::ALL
+                .iter()
+                .map(|d| d.label().to_string())
+                .collect();
+            desc.params[TIME_PARAM].kind = ParamKind::Enum { labels };
+            desc.params[TIME_PARAM].min = 0.0;
+            desc.params[TIME_PARAM].max = (SyncDivision::ALL.len() - 1) as f32;
+            // Default to 1/4 note (index 6)
+            slot.defaults.set(TIME_PARAM, 6.0);
+        } else {
+            desc.params[TIME_PARAM].kind = ParamKind::Continuous {
+                unit: Some("ms".to_string()),
+            };
+            desc.params[TIME_PARAM].min = 1.0;
+            desc.params[TIME_PARAM].max = 2000.0;
+            slot.defaults.set(TIME_PARAM, 250.0);
         }
     }
 
@@ -1485,7 +2309,9 @@ impl App {
     fn dropdown_max_items(&self) -> usize {
         if let Some(desc) = self.current_slot_descriptor() {
             if self.effect_param_cursor < desc.params.len() {
-                if let crate::effects::ParamKind::Enum { ref labels } = desc.params[self.effect_param_cursor].kind {
+                if let crate::effects::ParamKind::Enum { ref labels } =
+                    desc.params[self.effect_param_cursor].kind
+                {
                     return labels.len();
                 }
             }
@@ -1496,7 +2322,9 @@ impl App {
     fn dropdown_labels(&self) -> &[String] {
         if let Some(desc) = self.current_slot_descriptor() {
             if self.effect_param_cursor < desc.params.len() {
-                if let crate::effects::ParamKind::Enum { ref labels } = desc.params[self.effect_param_cursor].kind {
+                if let crate::effects::ParamKind::Enum { ref labels } =
+                    desc.params[self.effect_param_cursor].kind
+                {
                     return labels;
                 }
             }
@@ -1588,22 +2416,32 @@ impl App {
                 if self.params_column == 0 {
                     let tp = &self.state.track_params[self.cursor_track];
                     match self.track_param_cursor {
-                        1 => tp.set_attack_ms(val),
-                        2 => tp.set_release_ms(val),
-                        3 => tp.set_swing(val),
-                        4 => {
+                        TP_ATTACK => tp.set_attack_ms(val),
+                        TP_RELEASE => tp.set_release_ms(val),
+                        TP_SWING => tp.set_swing(val),
+                        TP_STEPS => {
                             tp.set_num_steps(val as usize);
                             self.clamp_cursor_to_steps();
                         }
+                        TP_SEND => {
+                            tp.set_send(val.clamp(0.0, 1.0));
+                            self.push_send_gain(self.cursor_track);
+                        }
                         _ => {}
                     }
+                } else if self.effect_slot_cursor == REVERB_TAB {
+                    self.set_reverb_param(self.reverb_param_cursor, val);
                 } else {
                     // Unified effect slot value entry
                     let track = self.cursor_track;
                     let slot_idx = self.effect_slot_cursor;
                     let param_idx = self.effect_param_cursor;
 
-                    let desc = match self.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+                    let desc = match self
+                        .effect_descriptors
+                        .get(track)
+                        .and_then(|d| d.get(slot_idx))
+                    {
                         Some(d) => d,
                         None => return,
                     };
@@ -1731,13 +2569,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Global info bar
-            Constraint::Min(13),     // Cirklon region
-            Constraint::Length(8),   // Params region
-            Constraint::Length(2),   // Help bar
+            Constraint::Length(1),  // Global info bar
+            Constraint::Min(13),    // Cirklon region
+            Constraint::Length(10), // Params region
+            Constraint::Length(2),  // Help bar
         ])
         .split(area);
 
+    app.layout.info_bar = chunks[0];
     draw_global_info(frame, app, chunks[0]);
     draw_cirklon_region(frame, app, chunks[1]);
     draw_params_region(frame, app, chunks[2]);
@@ -1749,7 +2588,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_effect_picker(frame, app, area);
     }
     if app.input_mode == InputMode::SampleBrowser {
-        draw_sample_browser(frame, app, area);
+        draw_sample_browser(frame, app, area, " Samples ");
+    }
+    if app.input_mode == InputMode::Audition {
+        draw_sample_browser(frame, app, area, " Audition ");
+    }
+
+    // Draw compiling overlay
+    if let Some(ref pending) = app.pending_compile {
+        draw_compiling_overlay(frame, pending, area);
     }
 }
 
@@ -1771,8 +2618,8 @@ fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(6), // Track list column
-            Constraint::Min(0),   // Sequencer content
+            Constraint::Length(10), // Track list column
+            Constraint::Min(0),     // Sequencer content
         ])
         .split(inner);
 
@@ -1784,10 +2631,10 @@ fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let seq_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                      // param tabs
-            Constraint::Length(BAR_HEIGHT as u16),      // bars
-            Constraint::Length(2),                      // trigger + step numbers
-            Constraint::Length(1),                      // value line
+            Constraint::Length(1),                 // param tabs
+            Constraint::Length(BAR_HEIGHT as u16), // bars
+            Constraint::Length(2),                 // trigger + step numbers
+            Constraint::Length(1),                 // value line
         ])
         .split(h_chunks[1]);
 
@@ -1809,7 +2656,21 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
         let y = area.y + i as u16;
         let is_selected = i == app.cursor_track;
         let truncated: String = name.chars().take(2).collect();
-        let label = format!("{} {:<2}", i + 1, truncated);
+
+        // Arm indicator: 2-char block for visibility, clickable
+        let armed = i < app.record_armed.len() && app.record_armed[i];
+        let arm_sym = if armed {
+            "\u{2588}\u{2588}"
+        } else {
+            "\u{2591}\u{2591}"
+        }; // "██" vs "░░"
+        let arm_style = if armed {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let label = format!("{} {:<2} ", i + 1, truncated);
         let style = if is_selected {
             Style::default().fg(Color::Black).bg(Color::Yellow).bold()
         } else {
@@ -1821,21 +2682,63 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
             let brightness = base + ((255 - base) as u32 * decayed / 255) as u8;
             Style::default().fg(Color::Rgb(brightness, brightness, brightness))
         };
+
         let cell = Rect::new(area.x, y, area.width, 1);
-        frame.render_widget(Paragraph::new(label).style(style), cell);
+        let spans = vec![
+            Span::styled(label, style),
+            Span::styled(arm_sym, arm_style),
+            Span::raw(" "), // right padding
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), cell);
     }
 }
 
-fn draw_global_info(frame: &mut Frame, app: &App, area: Rect) {
-    let play_symbol = if app.state.is_playing() { "\u{25b6}" } else { "\u{23f8}" };
+fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
+    let bar_style = Style::default().fg(Color::White).bg(Color::DarkGray).bold();
+
+    // ── Play button (3 chars) ──
+    let play_label = if app.state.is_playing() {
+        " \u{25b6} "
+    } else {
+        " \u{23f8} "
+    };
+    let play_style = if app.state.is_playing() {
+        Style::default().fg(Color::Black).bg(Color::Green).bold()
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(60, 60, 60))
+            .bold()
+    };
+    let play_rect = Rect::new(area.x, area.y, 3, 1);
+    app.layout.info_bar = play_rect; // play button rect
+    frame.render_widget(
+        Paragraph::new(Span::styled(play_label, play_style)),
+        play_rect,
+    );
+
+    // ── REC button (5 chars) ──
+    let rec_style = if app.recording {
+        Style::default().fg(Color::White).bg(Color::Red).bold()
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(40, 40, 40))
+            .bold()
+    };
+    let rec_rect = Rect::new(area.x + 3, area.y, 5, 1);
+    app.layout.rec_button = rec_rect;
+    frame.render_widget(Paragraph::new(Span::styled(" REC ", rec_style)), rec_rect);
+
+    // ── Info text (rest of bar) ──
     let bpm = app.state.bpm.load(Ordering::Relaxed);
     let cur_pat = app.state.current_pattern.load(Ordering::Relaxed) as usize + 1;
     let num_pats = app.state.num_patterns.load(Ordering::Relaxed) as usize;
 
-    let info = format!(" {}  {} BPM  [pat {}/{}]", play_symbol, bpm, cur_pat, num_pats);
-    let dim_style = Style::default().fg(Color::White).bg(Color::DarkGray).bold();
-
-    let mut spans = vec![Span::styled(info.clone(), dim_style)];
+    let mut spans = vec![Span::styled(
+        format!("  {} BPM  [pat {}/{}]", bpm, cur_pat, num_pats),
+        bar_style,
+    )];
 
     if !app.tracks.is_empty() {
         let sample_name = &app.tracks[app.cursor_track];
@@ -1845,7 +2748,13 @@ fn draw_global_info(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Show status message (auto-clears after 3 seconds)
+    if app.any_track_armed() {
+        spans.push(Span::styled(
+            format!("  Oct:{}", app.keyboard_octave / 12),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
     if let Some((ref msg, ref when)) = app.status_message {
         if when.elapsed() < Duration::from_secs(3) {
             spans.push(Span::styled(
@@ -1855,16 +2764,17 @@ fn draw_global_info(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let info_x = area.x + 8;
+    let info_w = area.width.saturating_sub(8);
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
-        Rect::new(area.x, area.y, area.width, 1),
+        Rect::new(info_x, area.y, info_w, 1),
     );
 }
 
-
 fn draw_param_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw("  ")];
-    for param in StepParam::ALL {
+    for param in StepParam::VISIBLE {
         let (prefix, hotkey, suffix) = param.tab_parts();
         let is_active = param == app.active_param;
         let color = param_color(param);
@@ -1961,14 +2871,31 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                         let dist_from_center = center - row;
                         let threshold = (dist_from_center - 1) * 2;
                         if half_levels >= threshold + 2 {
-                            (" \u{2588} ".to_string(), if active { color } else { Color::Rgb(60, 60, 60) })
+                            (
+                                " \u{2588} ".to_string(),
+                                if active {
+                                    color
+                                } else {
+                                    Color::Rgb(60, 60, 60)
+                                },
+                            )
                         } else if half_levels >= threshold + 1 {
-                            (" \u{2584} ".to_string(), if active { color } else { Color::Rgb(60, 60, 60) })
+                            (
+                                " \u{2584} ".to_string(),
+                                if active {
+                                    color
+                                } else {
+                                    Color::Rgb(60, 60, 60)
+                                },
+                            )
                         } else {
                             ("   ".to_string(), Color::Rgb(60, 60, 60))
                         }
                     } else if row == center {
-                        ("\u{2500}\u{2500}\u{2500}".to_string(), Color::Rgb(80, 80, 80))
+                        (
+                            "\u{2500}\u{2500}\u{2500}".to_string(),
+                            Color::Rgb(80, 80, 80),
+                        )
                     } else {
                         ("   ".to_string(), Color::Rgb(60, 60, 60))
                     }
@@ -1977,14 +2904,31 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                         let dist_from_center = row - center;
                         let threshold = (dist_from_center - 1) * 2;
                         if half_levels >= threshold + 2 {
-                            (" \u{2588} ".to_string(), if active { color } else { Color::Rgb(60, 60, 60) })
+                            (
+                                " \u{2588} ".to_string(),
+                                if active {
+                                    color
+                                } else {
+                                    Color::Rgb(60, 60, 60)
+                                },
+                            )
                         } else if half_levels >= threshold + 1 {
-                            (" \u{2580} ".to_string(), if active { color } else { Color::Rgb(60, 60, 60) })
+                            (
+                                " \u{2580} ".to_string(),
+                                if active {
+                                    color
+                                } else {
+                                    Color::Rgb(60, 60, 60)
+                                },
+                            )
                         } else {
                             ("   ".to_string(), Color::Rgb(60, 60, 60))
                         }
                     } else if row == center {
-                        ("\u{2500}\u{2500}\u{2500}".to_string(), Color::Rgb(80, 80, 80))
+                        (
+                            "\u{2500}\u{2500}\u{2500}".to_string(),
+                            Color::Rgb(80, 80, 80),
+                        )
                     } else {
                         ("   ".to_string(), Color::Rgb(60, 60, 60))
                     }
@@ -1996,9 +2940,13 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 let rows_from_bottom = BAR_HEIGHT - 1 - row;
                 let threshold = rows_from_bottom * 2;
-                let level = if fill_levels >= threshold + 2 { 2 }
-                    else if fill_levels >= threshold + 1 { 1 }
-                    else { 0 };
+                let level = if fill_levels >= threshold + 2 {
+                    2
+                } else if fill_levels >= threshold + 1 {
+                    1
+                } else {
+                    0
+                };
 
                 let ch = match level {
                     2 => "\u{2588}",
@@ -2012,7 +2960,11 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                     format!(" {} ", ch)
                 };
 
-                let fg = if active { color } else { Color::Rgb(60, 60, 60) };
+                let fg = if active {
+                    color
+                } else {
+                    Color::Rgb(60, 60, 60)
+                };
                 let style = Style::default().fg(fg).bg(bg);
                 let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
                 frame.render_widget(Paragraph::new(cell_text).style(style), cell_area);
@@ -2027,7 +2979,11 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
     let slot_idx = app.effect_slot_cursor;
     let param_idx = app.effect_param_cursor;
 
-    let desc = match app.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+    let desc = match app
+        .effect_descriptors
+        .get(track)
+        .and_then(|d| d.get(slot_idx))
+    {
         Some(d) => d,
         None => return,
     };
@@ -2076,9 +3032,13 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
             let cell_y = area.y + row as u16;
             let rows_from_bottom = BAR_HEIGHT - 1 - row;
             let threshold = rows_from_bottom * 2;
-            let level = if fill_levels >= threshold + 2 { 2 }
-                else if fill_levels >= threshold + 1 { 1 }
-                else { 0 };
+            let level = if fill_levels >= threshold + 2 {
+                2
+            } else if fill_levels >= threshold + 1 {
+                1
+            } else {
+                0
+            };
 
             let ch = match level {
                 2 => "\u{2588}",
@@ -2188,7 +3148,10 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("  BPM: ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("{}\u{2588}", app.value_buffer),
-                Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 60, 60))
+                    .bold(),
             ),
             Span::styled(
                 "  Enter: set  Esc: cancel",
@@ -2198,15 +3161,24 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
     } else if is_pattern_select {
         if app.pattern_clone_pending {
             Line::from(vec![
-                Span::styled("  Clone pattern \u{2192} new  ", Style::default().fg(Color::Cyan)),
-                Span::styled("Enter: confirm  Esc: cancel", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "  Clone pattern \u{2192} new  ",
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    "Enter: confirm  Esc: cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ])
         } else {
             Line::from(vec![
                 Span::styled("  Pattern: ", Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{}\u{2588}", app.value_buffer),
-                    Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Rgb(60, 60, 60))
+                        .bold(),
                 ),
                 Span::styled(
                     "  Enter: go  c: clone  x: delete  Esc: cancel",
@@ -2228,7 +3200,10 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!("{}\u{2588}", app.value_buffer),
-                Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60)).bold(),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 60, 60))
+                    .bold(),
             ),
             Span::styled(
                 "  Enter: set  Esc: cancel  -: negate",
@@ -2241,7 +3216,9 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(
             format!(
                 "  Steps {}-{} selected ({} steps)  {} = \u{2191}\u{2193}",
-                lo + 1, hi + 1, count,
+                lo + 1,
+                hi + 1,
+                count,
                 app.active_param.label(),
             ),
             Style::default().fg(Color::Rgb(160, 160, 160)),
@@ -2308,16 +3285,47 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     let swing = tp.get_swing();
     let steps = tp.get_num_steps();
 
+    let send = tp.get_send();
+
     let params: Vec<(&str, String, Option<f32>)> = vec![
-        ("gate", if tp.is_gate_on() { "ON".to_string() } else { "OFF".to_string() }, None),
+        (
+            "gate",
+            if tp.is_gate_on() {
+                "ON".to_string()
+            } else {
+                "OFF".to_string()
+            },
+            None,
+        ),
         ("attack", format!("{:.0} ms", attack), Some(attack / 500.0)),
-        ("release", format!("{:.0} ms", release), Some(release / 2000.0)),
-        ("swing", format!("{:.0}%", swing), Some((swing - 50.0) / 25.0)),
-        ("steps", format!("{}", steps), Some(steps as f32 / MAX_STEPS as f32)),
+        (
+            "release",
+            format!("{:.0} ms", release),
+            Some(release / 2000.0),
+        ),
+        (
+            "swing",
+            format!("{:.0}%", swing),
+            Some((swing - 50.0) / 25.0),
+        ),
+        (
+            "steps",
+            format!("{}", steps),
+            Some(steps as f32 / MAX_STEPS as f32),
+        ),
+        ("send", format!("{:.2}", send), Some(send)),
+        (
+            "poly",
+            if tp.is_polyphonic() {
+                "ON".to_string()
+            } else {
+                "OFF".to_string()
+            },
+            None,
+        ),
     ];
 
-    let is_entering_value = col_focused
-        && app.input_mode == InputMode::ValueEntry;
+    let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
 
     for (i, (name, value, slider)) in params.iter().enumerate() {
         if i as u16 >= inner.height {
@@ -2338,10 +3346,16 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
         if is_cursor_row && is_entering_value {
             let spans = vec![
                 Span::styled(cursor, cursor_style),
-                Span::styled(format!("{:<width$}", name, width = label_width), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:<width$}", name, width = label_width),
+                    Style::default().fg(Color::Gray),
+                ),
                 Span::styled(
                     format!("{}\u{2588}", app.value_buffer),
-                    Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(Color::Rgb(60, 60, 20))
+                        .bold(),
                 ),
                 Span::styled(
                     "  Enter: set  Esc: cancel",
@@ -2356,8 +3370,14 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
 
         let mut spans = vec![
             Span::styled(cursor, cursor_style),
-            Span::styled(format!("{:<width$}", name, width = label_width), Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:<width$}", value, width = value_width), cursor_style),
+            Span::styled(
+                format!("{:<width$}", name, width = label_width),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("{:<width$}", value, width = value_width),
+                cursor_style,
+            ),
         ];
 
         if let Some(norm) = slider {
@@ -2399,7 +3419,9 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             let style = if is_selected && col_focused {
                 Style::default().fg(Color::Black).bg(Color::White).bold()
             } else if is_selected {
-                Style::default().fg(Color::Black).bg(Color::Rgb(100, 100, 100))
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(100, 100, 100))
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -2420,6 +3442,28 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             };
             title_spans.push(Span::styled("[+]", plus_style));
         }
+
+        // Reverb tab (always visible)
+        let reverb_selected = app.effect_slot_cursor == REVERB_TAB;
+        let reverb_style = if reverb_selected && col_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(180, 140, 220))
+                .bold()
+        } else if reverb_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(120, 90, 160))
+        } else {
+            Style::default().fg(Color::Rgb(120, 90, 160))
+        };
+        title_spans.push(Span::raw(" "));
+        let reverb_label = if reverb_selected {
+            "[< Reverb >]"
+        } else {
+            "[  Reverb  ]"
+        };
+        title_spans.push(Span::styled(reverb_label, reverb_style));
     }
 
     let block = Block::default()
@@ -2433,6 +3477,87 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     app.layout.effects_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
+        return;
+    }
+
+    // Reverb tab rendering
+    if app.effect_slot_cursor == REVERB_TAB {
+        let reverb_params: [(&str, f32); 3] = [
+            ("size", app.reverb_size),
+            ("brightness", app.reverb_brightness),
+            ("replace", app.reverb_replace),
+        ];
+        let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+
+        for (i, (name, val)) in reverb_params.iter().enumerate() {
+            if i as u16 >= inner.height {
+                break;
+            }
+            let row_y = inner.y + i as u16;
+            let is_cursor_row = col_focused && app.reverb_param_cursor == i;
+            let cursor = if is_cursor_row { "> " } else { "  " };
+            let cursor_style = if is_cursor_row {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Rgb(180, 140, 220))
+            };
+
+            let label_width = 12;
+            let value_width = 14;
+
+            if is_cursor_row && is_entering_value {
+                let spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(
+                        format!("{:<width$}", name, width = label_width),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("{}\u{2588}", app.value_buffer),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 60, 20))
+                            .bold(),
+                    ),
+                    Span::styled(
+                        "  Enter: set  Esc: cancel",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                let line = Line::from(spans);
+                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+                frame.render_widget(Paragraph::new(line), row_area);
+                continue;
+            }
+
+            let formatted = format!("{:.2}", val);
+            let norm = val.clamp(0.0, 1.0);
+            let mut spans = vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(
+                    format!("{:<width$}", name, width = label_width),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("{:<width$}", formatted, width = value_width),
+                    cursor_style,
+                ),
+            ];
+
+            let slider_width = (inner.width as usize).saturating_sub(label_width + value_width + 6);
+            if slider_width > 2 {
+                let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
+                let bar: String = "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
+                spans.push(Span::styled(
+                    format!("[{}]", bar),
+                    Style::default().fg(Color::Rgb(160, 130, 200)),
+                ));
+            }
+
+            let line = Line::from(spans);
+            let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+            frame.render_widget(Paragraph::new(line), row_area);
+        }
         return;
     }
 
@@ -2460,7 +3585,11 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
     }
 
     // Render params for current slot
-    let desc = match app.effect_descriptors.get(track).and_then(|d| d.get(slot_idx)) {
+    let desc = match app
+        .effect_descriptors
+        .get(track)
+        .and_then(|d| d.get(slot_idx))
+    {
         Some(d) => d,
         None => return,
     };
@@ -2499,10 +3628,16 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
             };
             let spans = vec![
                 Span::styled(cursor, cursor_style),
-                Span::styled(format!("{:<width$}", param_desc.name, width = label_width), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:<width$}", param_desc.name, width = label_width),
+                    Style::default().fg(Color::Gray),
+                ),
                 Span::styled(
                     format!("{}\u{2588}", app.value_buffer),
-                    Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 60, 20)).bold(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .bg(Color::Rgb(60, 60, 20))
+                        .bold(),
                 ),
                 Span::styled(
                     format!("  ({})  Enter: set  Esc: cancel", target_label),
@@ -2554,10 +3689,12 @@ fn draw_effects_column(frame: &mut Frame, app: &mut App, area: Rect, region_focu
                     default_val
                 };
                 let norm = param_desc.normalize(slider_val);
-                let slider_width = (inner.width as usize).saturating_sub(label_width + value_width + 6);
+                let slider_width =
+                    (inner.width as usize).saturating_sub(label_width + value_width + 6);
                 if slider_width > 2 {
                     let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
-                    let bar: String = "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
+                    let bar: String =
+                        "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
                     let slider_color = Color::White;
                     spans.push(Span::styled(
                         format!("[{}]", bar),
@@ -2584,22 +3721,44 @@ fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let dropdown_y = area.y + app.effect_param_cursor as u16;
     let dropdown_x = area.x + 14; // after label
     let dropdown_width = 16u16;
 
-    for (i, item) in items.iter().enumerate() {
-        let y = dropdown_y + i as u16;
-        if y >= area.y + area.height {
+    // How many rows can we show?
+    let max_rows = (area.y + area.height).saturating_sub(area.y) as usize;
+    let visible_count = items.len().min(max_rows);
+    if visible_count == 0 {
+        return;
+    }
+
+    // Scroll so the cursor is always visible
+    let scroll = if app.dropdown_cursor >= visible_count {
+        app.dropdown_cursor + 1 - visible_count
+    } else {
+        0
+    };
+
+    // Position: try to start at the param row, but shift up if it would overflow
+    let ideal_y = area.y + app.effect_param_cursor as u16;
+    let dropdown_y = ideal_y.min((area.y + area.height).saturating_sub(visible_count as u16));
+
+    for vi in 0..visible_count {
+        let i = scroll + vi;
+        if i >= items.len() {
             break;
         }
+        let y = dropdown_y + vi as u16;
         let is_cursor = i == app.dropdown_cursor;
         let style = if is_cursor {
             Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
             Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60))
         };
-        let text = format!(" {:<width$}", item, width = (dropdown_width - 2) as usize);
+        let text = format!(
+            " {:<width$}",
+            items[i],
+            width = (dropdown_width - 2) as usize
+        );
         let cell = Rect::new(dropdown_x, y, dropdown_width, 1);
         frame.render_widget(Paragraph::new(text).style(style), cell);
     }
@@ -2653,10 +3812,7 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Color::Green
             };
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(color),
-            ));
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
         }
         spans
     };
@@ -2665,19 +3821,60 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     let mut l_spans = vec![Span::styled("L ", Style::default().fg(Color::DarkGray))];
     l_spans.extend(render_bar(peak_l));
     let l_line = Line::from(l_spans);
-    frame.render_widget(
-        Paragraph::new(l_line),
-        Rect::new(x, y, meter_width, 1),
-    );
+    frame.render_widget(Paragraph::new(l_line), Rect::new(x, y, meter_width, 1));
 
     // R channel
     let mut r_spans = vec![Span::styled("R ", Style::default().fg(Color::DarkGray))];
     r_spans.extend(render_bar(peak_r));
     let r_line = Line::from(r_spans);
-    frame.render_widget(
-        Paragraph::new(r_line),
-        Rect::new(x, y + 1, meter_width, 1),
-    );
+    frame.render_widget(Paragraph::new(r_line), Rect::new(x, y + 1, meter_width, 1));
+}
+
+// ── Compiling Overlay ──
+
+fn draw_compiling_overlay(frame: &mut Frame, pending: &PendingCompile, area: Rect) {
+    const SPINNER: &[char] = &[
+        '\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{287F}', '\u{28BF}', '\u{28FB}', '\u{28FD}',
+        '\u{28FE}',
+    ];
+    let spin = SPINNER[pending.tick / 2 % SPINNER.len()];
+    let name_display = if pending.name.len() > 14 {
+        format!("{}...", &pending.name[..11])
+    } else {
+        pending.name.clone()
+    };
+
+    let w = 20u16;
+    let h = 4u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let overlay = Rect::new(x, y, w, h);
+
+    // Clear background
+    let bg = Style::default().bg(Color::Rgb(20, 20, 20));
+    for row in 0..h {
+        let row_area = Rect::new(x, y + row, w, 1);
+        frame.render_widget(Paragraph::new(" ".repeat(w as usize)).style(bg), row_area);
+    }
+
+    let block = Block::default()
+        .title(" Compiling ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    if inner.height >= 2 && inner.width >= 4 {
+        let line1 = Line::from(Span::styled(
+            format!("  {} {}  ", spin, name_display),
+            Style::default().fg(Color::Yellow),
+        ));
+        let center_y = inner.y + inner.height / 2;
+        frame.render_widget(
+            Paragraph::new(line1),
+            Rect::new(inner.x, center_y, inner.width, 1),
+        );
+    }
 }
 
 // ── Help Bar ──
@@ -2712,10 +3909,7 @@ fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
 
     // Filter input line
     let filter_text = format!(" > {}\u{2588}", app.picker_filter);
-    let filter_line = Line::from(Span::styled(
-        filter_text,
-        Style::default().fg(Color::White),
-    ));
+    let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
     let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(filter_line), filter_area);
 
@@ -2738,14 +3932,22 @@ fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Gray)
         };
         let prefix = if is_cursor { " > " } else { "   " };
-        let truncated: String = item.chars().take((inner.width as usize).saturating_sub(4)).collect();
-        let text = format!("{}{:<width$}", prefix, truncated, width = (inner.width as usize).saturating_sub(3));
+        let truncated: String = item
+            .chars()
+            .take((inner.width as usize).saturating_sub(4))
+            .collect();
+        let text = format!(
+            "{}{:<width$}",
+            prefix,
+            truncated,
+            width = (inner.width as usize).saturating_sub(3)
+        );
         let row_area = Rect::new(inner.x, row_y, inner.width, 1);
         frame.render_widget(Paragraph::new(text).style(style), row_area);
     }
 }
 
-fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect, title: &str) {
     let items = if app.browser_filter.is_empty() {
         BrowserNode::flatten_visible(&app.browser_tree, 0)
     } else {
@@ -2769,7 +3971,7 @@ fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let block = Block::default()
-        .title(" Samples ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::White));
     let inner = block.inner(picker_area);
@@ -2781,10 +3983,7 @@ fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
 
     // Filter input line
     let filter_text = format!("> {}\u{2588}", app.browser_filter);
-    let filter_line = Line::from(Span::styled(
-        filter_text,
-        Style::default().fg(Color::White),
-    ));
+    let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
     let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(filter_line), filter_area);
 
@@ -2806,7 +4005,11 @@ fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
 
         let indent = "  ".repeat(entry.depth);
         let icon = if entry.is_dir {
-            if entry.expanded { "\u{25bc} " } else { "\u{25b6} " }
+            if entry.expanded {
+                "\u{25bc} "
+            } else {
+                "\u{25b6} "
+            }
         } else {
             "  "
         };
@@ -2830,7 +4033,12 @@ fn draw_sample_browser(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if app.input_mode == InputMode::SampleBrowser {
+    let lines = if app.input_mode == InputMode::Audition {
+        vec![Line::from(Span::styled(
+            "  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  Enter: preview  Tab: confirm  Esc: revert",
+            Style::default().fg(Color::Yellow),
+        ))]
+    } else if app.input_mode == InputMode::SampleBrowser {
         vec![Line::from(Span::styled(
             "  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  Enter: select  Esc: close",
             Style::default().fg(Color::Yellow),
@@ -2847,43 +4055,44 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         ))]
     } else {
         match app.focused_region {
-        Region::Cirklon => {
-            if app.input_mode == InputMode::ValueEntry {
-                vec![Line::from(Span::styled(
-                    "  0-9: digits  .: decimal  -: negate  Enter: set  Esc: cancel",
-                    Style::default().fg(Color::DarkGray),
-                ))]
-            } else if app.has_selection() {
-                vec![Line::from(Span::styled(
+            Region::Cirklon => {
+                if app.input_mode == InputMode::ValueEntry {
+                    vec![Line::from(Span::styled(
+                        "  0-9: digits  .: decimal  -: negate  Enter: set  Esc: cancel",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else if app.has_selection() {
+                    vec![Line::from(Span::styled(
                     "  Shift+\u{2190}\u{2192}: extend  +/-: value  Enter: toggle  0-9: type  Esc: deselect",
                     Style::default().fg(Color::Rgb(120, 150, 220)),
                 ))]
-            } else {
-                vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: step  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  p: pat  n: add  d v s a b t c: param",
+                } else {
+                    vec![Line::from(Span::styled(
+                    "  \u{2190}\u{2192}: step  \u{2191}\u{2193}: track  +/-: value  Shift+\u{2190}\u{2192}: select  Tab: region  p: pat  n: add  *: double  /: halve",
                     Style::default().fg(Color::DarkGray),
                 ))]
+                }
             }
-        }
-        Region::Params => {
-            if app.dropdown_open {
-                vec![Line::from(Span::styled(
-                    "  \u{2191}\u{2193}: select  Enter: confirm  Esc: cancel",
-                    Style::default().fg(Color::Yellow),
-                ))]
-            } else if app.params_column == 1 {
-                vec![Line::from(Span::styled(
+            Region::Params => {
+                if app.dropdown_open {
+                    vec![Line::from(Span::styled(
+                        "  \u{2191}\u{2193}: select  Enter: confirm  Esc: cancel",
+                        Style::default().fg(Color::Yellow),
+                    ))]
+                } else if app.params_column == 1 {
+                    vec![Line::from(Span::styled(
                     "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  +/-: adjust  [/]: step  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),
                 ))]
-            } else {
-                vec![Line::from(Span::styled(
+                } else {
+                    vec![Line::from(Span::styled(
                     "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  +/-: adjust  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),
                 ))]
+                }
             }
         }
-    }};
+    };
 
     let text = Text::from(lines);
     let help = Paragraph::new(text).block(

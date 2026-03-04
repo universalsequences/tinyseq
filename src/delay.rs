@@ -94,7 +94,7 @@ unsafe extern "C" fn delay_process(
     let target_fb = *s.add(STATE_FEEDBACK);
     let target_damp = *s.add(STATE_DAMPENING);
     let target_width = *s.add(STATE_STEREO_WIDTH);
-    let _bpm = *s.add(STATE_BPM);
+    let bpm = *s.add(STATE_BPM);
     let sr = *s.add(STATE_SAMPLE_RATE);
 
     let mut smooth_wet = *s.add(STATE_SMOOTH_WET);
@@ -113,12 +113,26 @@ unsafe extern "C" fn delay_process(
     // One-pole smoothing (~20Hz)
     let smooth_coeff = 1.0 - (-2.0 * std::f32::consts::PI * 20.0 / sr).exp();
 
-    // Compute delay in samples from target_time
+    // Compute delay in ms from target_time
     let delay_ms = if synced > 0.5 {
-        // target_time is actually the delay_time in ms but when synced we'll
-        // compute from BPM. The sync division beats value is passed as delay_time
-        // by the audio callback (it computes beats * 60/bpm * 1000).
-        target_time
+        // target_time is sync division index — convert to beats then to ms
+        const SYNC_BEATS: [f32; 11] = [
+            0.125,       // 1/32
+            0.25,        // 1/16
+            1.0 / 6.0,   // 1/16t
+            0.5,         // 1/8
+            1.0 / 3.0,   // 1/8t
+            0.75,        // 1/8.
+            1.0,         // 1/4
+            2.0 / 3.0,   // 1/4t
+            1.5,         // 1/4.
+            2.0,         // 1/2
+            4.0,         // 1
+        ];
+        let idx = (target_time.round() as usize).min(SYNC_BEATS.len() - 1);
+        let beats = SYNC_BEATS[idx];
+        let bpm_safe = bpm.max(20.0);
+        beats * 60.0 / bpm_safe * 1000.0
     } else {
         target_time
     };

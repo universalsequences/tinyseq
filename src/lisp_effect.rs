@@ -150,6 +150,20 @@ pub struct LoadedDGenLib {
 unsafe impl Send for LoadedDGenLib {}
 unsafe impl Sync for LoadedDGenLib {}
 
+// ── Compile result (for async compilation) ──
+
+pub struct CompileResult {
+    pub manifest: DGenManifest,
+    pub lib: LoadedDGenLib,
+}
+
+pub fn compile_and_load(source: &str, sample_rate: u32) -> Result<CompileResult, String> {
+    let json = compile_lisp(source, sample_rate)?;
+    let manifest = parse_manifest(&json)?;
+    let lib = load_dylib(&manifest.dylib_path)?;
+    Ok(CompileResult { manifest, lib })
+}
+
 // ── Effect library storage ──
 
 const EFFECTS_DIR: &str = "effects";

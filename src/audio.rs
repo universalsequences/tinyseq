@@ -9,7 +9,8 @@ use crate::sampler::{
     PARAM_ATTACK_SAMPLES, PARAM_GATE_MODE, PARAM_GATE_SAMPLES, PARAM_PLAYHEAD,
     PARAM_RELEASE_SAMPLES, PARAM_SPEED, PARAM_TRANSPOSE, PARAM_TRIGGER, PARAM_VELOCITY,
 };
-use crate::sequencer::{SequencerClock, SequencerState, StepParam, MAX_TRACKS};
+use crate::sequencer::{KeyboardTrigger, SequencerClock, SequencerState, StepParam, MAX_TRACKS};
+use crate::voice::{VoicePool, MAX_VOICES};
 
 /// Per-track chop re-trigger state.
 struct ChopTracker {
@@ -43,9 +44,12 @@ struct AudioCallbackData {
     chop_state: Vec<ChopTracker>,
     swing_state: Vec<SwingPending>,
     sample_rate: f64,
+    last_bpm: u32,
+    voice_pools: Vec<VoicePool>,
+    keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
 }
 
-/// Send a trigger to the sampler with the given per-step params and gate length.
+/// Send a trigger to the sampler with the given per-step params, gate length, and explicit transpose.
 unsafe fn send_trigger(
     lg: *mut LiveGraph,
     lid: u64,
@@ -55,6 +59,7 @@ unsafe fn send_trigger(
     attack_samples: f32,
     release_samples: f32,
     gate_mode: f32,
+    transpose: f32,
 ) {
     params_push_wrapper(
         lg,
@@ -85,7 +90,7 @@ unsafe fn send_trigger(
         ParamMsg {
             idx: PARAM_TRANSPOSE,
             logical_id: lid,
-            fvalue: sd.get(step, StepParam::Transpose),
+            fvalue: transpose,
         },
     );
     params_push_wrapper(
@@ -130,6 +135,27 @@ unsafe fn send_trigger(
     );
 }
 
+/// Send a keyboard trigger directly to a voice (no step data lookup).
+unsafe fn send_keyboard_trigger(
+    lg: *mut LiveGraph,
+    lid: u64,
+    transpose: f32,
+    velocity: f32,
+    attack_samples: f32,
+    release_samples: f32,
+    gate_mode: f32,
+) {
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_VELOCITY, logical_id: lid, fvalue: velocity });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_SPEED, logical_id: lid, fvalue: 1.0 });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_GATE_SAMPLES, logical_id: lid, fvalue: f32::MAX });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_TRANSPOSE, logical_id: lid, fvalue: transpose });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_ATTACK_SAMPLES, logical_id: lid, fvalue: attack_samples });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_RELEASE_SAMPLES, logical_id: lid, fvalue: release_samples });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_GATE_MODE, logical_id: lid, fvalue: gate_mode });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_PLAYHEAD, logical_id: lid, fvalue: 0.0 });
+    params_push_wrapper(lg, ParamMsg { idx: PARAM_TRIGGER, logical_id: lid, fvalue: 1.0 });
+}
+
 /// Dispatch effect p-locks for all slots in a track's effect chain.
 unsafe fn dispatch_effect_chain_for_track(
     lg: *mut LiveGraph,
@@ -160,6 +186,7 @@ unsafe fn dispatch_effect_chain_for_track(
 }
 
 /// Fire a step trigger for a track (handles gate, chop setup, envelope params).
+/// Uses voice pool allocation for polyphonic playback.
 fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize) {
     let sampler_lid = data.state.sampler_lids[track_idx].load(Ordering::Acquire);
     if sampler_lid == 0 {
@@ -183,17 +210,53 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let release_samples = release_ms * data.sample_rate as f32 / 1000.0;
     let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
 
-    unsafe {
-        send_trigger(
-            data.lg.0,
-            sampler_lid,
-            sd,
-            step,
-            chop_gate,
-            attack_samples,
-            release_samples,
-            gate_mode,
-        );
+    // Sync polyphonic setting from track params
+    data.voice_pools[track_idx].polyphonic = tp.is_polyphonic();
+
+    // Check chord data: if chord has notes, trigger each note on its own voice
+    let chord_count = data.state.chord_data[track_idx].count(step);
+    if chord_count > 0 {
+        for n in 0..chord_count {
+            let transpose = data.state.chord_data[track_idx].get(step, n);
+            let voice = data.voice_pools[track_idx].allocate_voice(transpose);
+            let voice_lid = voice.logical_id;
+            let lid = if voice_lid != 0 { voice_lid } else { sampler_lid };
+            unsafe {
+                send_trigger(
+                    data.lg.0, lid, sd, step,
+                    chop_gate, attack_samples, release_samples, gate_mode,
+                    transpose,
+                );
+            }
+        }
+    } else {
+        // Single-note mode: use StepParam::Transpose
+        let transpose = sd.get(step, StepParam::Transpose);
+        let voice = data.voice_pools[track_idx].allocate_voice(transpose);
+        let voice_lid = voice.logical_id;
+        let lid = if voice_lid != 0 { voice_lid } else { sampler_lid };
+        unsafe {
+            send_trigger(
+                data.lg.0, lid, sd, step,
+                chop_gate, attack_samples, release_samples, gate_mode,
+                transpose,
+            );
+        }
+    }
+
+    // Update send gain (reverb send amount from track-level param)
+    let send_lid = data.state.send_lids[track_idx].load(Ordering::Acquire);
+    if send_lid != 0 {
+        unsafe {
+            params_push_wrapper(
+                data.lg.0,
+                ParamMsg {
+                    idx: 0,
+                    logical_id: send_lid,
+                    fvalue: tp.get_send(),
+                },
+            );
+        }
     }
 
     data.state.trigger_flash[track_idx].store(255, Ordering::Relaxed);
@@ -216,23 +279,95 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     let nframes = output.len() / data.num_channels;
     let num_tracks = data.state.active_track_count();
 
+    // Sync voice pools for any newly added tracks
+    for t in 0..num_tracks {
+        let pool = &mut data.voice_pools[t];
+        let vc = data.state.voice_counts[t].load(Ordering::Acquire) as usize;
+        if pool.num_voices < vc {
+            for v in pool.num_voices..vc {
+                let lid = data.state.voice_lids[t][v].load(Ordering::Acquire);
+                if lid != 0 {
+                    // We need the node_id too, but we can derive it from lid (they match for new nodes)
+                    pool.add_voice(lid, lid as i32);
+                }
+            }
+        }
+    }
+
+    // Process keyboard triggers
+    while let Ok(kt) = data.keyboard_rx.try_recv() {
+        if kt.track >= num_tracks {
+            continue;
+        }
+        data.voice_pools[kt.track].polyphonic = data.state.track_params[kt.track].is_polyphonic();
+
+        if kt.note_off {
+            // Note-off: find the voice playing this note and stop it
+            let pool = &mut data.voice_pools[kt.track];
+            // Find the voice with matching note and stop it by setting trigger=0
+            for v in 0..pool.num_voices {
+                if pool.voices[v].active && (pool.voices[v].note - kt.transpose).abs() < 0.01 {
+                    let lid = pool.voices[v].logical_id;
+                    pool.voices[v].active = false;
+                    if lid != 0 {
+                        unsafe {
+                            // Set gate to 0 samples to trigger release envelope
+                            params_push_wrapper(
+                                data.lg.0,
+                                ParamMsg { idx: PARAM_GATE_SAMPLES, logical_id: lid, fvalue: 0.0 },
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        } else {
+            // Note-on: allocate voice and trigger
+            let voice = data.voice_pools[kt.track].allocate_voice(kt.transpose);
+            let voice_lid = voice.logical_id;
+            if voice_lid == 0 {
+                continue;
+            }
+            let tp = &data.state.track_params[kt.track];
+            let attack_samples = tp.get_attack_ms() * data.sample_rate as f32 / 1000.0;
+            let release_samples = tp.get_release_ms() * data.sample_rate as f32 / 1000.0;
+            let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
+            unsafe {
+                send_keyboard_trigger(
+                    data.lg.0,
+                    voice_lid,
+                    kt.transpose,
+                    kt.velocity,
+                    attack_samples,
+                    release_samples,
+                    gate_mode,
+                );
+            }
+            data.state.trigger_flash[kt.track].store(255, Ordering::Relaxed);
+        }
+    }
+
     let triggers = data.clock.process_block(nframes, &data.state);
     let samples_per_step = data.clock.current_samples_per_step();
 
-    // Push BPM to all delay nodes (slot index 1 by convention)
-    let bpm = data.state.bpm.load(Ordering::Relaxed) as f32;
-    for i in 0..num_tracks {
-        let delay_lid = data.state.delay_lids[i].load(Ordering::Acquire);
-        if delay_lid != 0 {
-            unsafe {
-                params_push_wrapper(
-                    data.lg.0,
-                    ParamMsg {
-                        idx: delay::DELAY_PARAM_BPM,
-                        logical_id: delay_lid,
-                        fvalue: bpm,
-                    },
-                );
+    // Push BPM to all delay nodes only when it changes
+    let bpm = data.state.bpm.load(Ordering::Relaxed);
+    if bpm != data.last_bpm {
+        data.last_bpm = bpm;
+        let bpm_f = bpm as f32;
+        for i in 0..num_tracks {
+            let delay_lid = data.state.delay_lids[i].load(Ordering::Acquire);
+            if delay_lid != 0 {
+                unsafe {
+                    params_push_wrapper(
+                        data.lg.0,
+                        ParamMsg {
+                            idx: delay::DELAY_PARAM_BPM,
+                            logical_id: delay_lid,
+                            fvalue: bpm_f,
+                        },
+                    );
+                }
             }
         }
     }
@@ -285,28 +420,34 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         }
     }
 
-    // Process pending chop re-triggers
+    // Process pending chop re-triggers (voice-aware)
     for track_idx in 0..num_tracks {
         let cs = &mut data.chop_state[track_idx];
         if cs.remaining > 0 {
             cs.counter -= nframes as f64;
-            let sampler_lid = data.state.sampler_lids[track_idx].load(Ordering::Acquire);
-            let sd = &data.state.step_data[track_idx];
             let tp = &data.state.track_params[track_idx];
             let attack_samples = tp.get_attack_ms() * data.sample_rate as f32 / 1000.0;
             let release_samples = tp.get_release_ms() * data.sample_rate as f32 / 1000.0;
             let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
+            let sd = &data.state.step_data[track_idx];
             while cs.counter <= 0.0 && cs.remaining > 0 {
+                // Allocate a voice for the chop re-trigger
+                let transpose = sd.get(cs.step, StepParam::Transpose);
+                let voice = data.voice_pools[track_idx].allocate_voice(transpose);
+                let voice_lid = voice.logical_id;
+                let sampler_lid = data.state.sampler_lids[track_idx].load(Ordering::Acquire);
+                let lid = if voice_lid != 0 { voice_lid } else { sampler_lid };
                 unsafe {
                     send_trigger(
                         data.lg.0,
-                        sampler_lid,
+                        lid,
                         sd,
                         cs.step,
                         cs.chop_gate,
                         attack_samples,
                         release_samples,
                         gate_mode,
+                        transpose,
                     );
                 }
                 data.state.trigger_flash[track_idx].store(255, Ordering::Relaxed);
@@ -347,6 +488,7 @@ pub fn build_output_stream(
     sample_rate: u32,
     num_channels: usize,
     block_size: usize,
+    keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
 ) -> Result<Stream, String> {
     let clock = SequencerClock::new(sample_rate, state.bpm.load(Ordering::Relaxed));
 
@@ -368,6 +510,23 @@ pub fn build_output_stream(
         })
         .collect();
 
+    // Initialize voice pools from state
+    let mut voice_pools: Vec<VoicePool> = (0..MAX_TRACKS)
+        .map(|_| VoicePool::new())
+        .collect();
+
+    // Pre-populate voice pools for any existing tracks
+    let num_tracks = state.active_track_count();
+    for t in 0..num_tracks {
+        let vc = state.voice_counts[t].load(Ordering::Acquire) as usize;
+        for v in 0..vc.min(MAX_VOICES) {
+            let lid = state.voice_lids[t][v].load(Ordering::Acquire);
+            if lid != 0 {
+                voice_pools[t].add_voice(lid, lid as i32);
+            }
+        }
+    }
+
     let mut cb_data = AudioCallbackData {
         lg: LiveGraphPtr(lg),
         clock,
@@ -376,6 +535,9 @@ pub fn build_output_stream(
         chop_state,
         swing_state,
         sample_rate: sample_rate as f64,
+        last_bpm: 0,
+        voice_pools,
+        keyboard_rx,
     };
 
     let host = cpal::default_host();

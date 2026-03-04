@@ -12,10 +12,30 @@ const STATE_VELOCITY: usize = 4;
 const STATE_SPEED: usize = 5;
 const STATE_GATE_SAMPLES: usize = 6; // absolute gate length in samples (computed by audio callback)
 const STATE_TRANSPOSE: usize = 7;
-const STATE_ATTACK_SAMPLES: usize = 8;  // musical attack in samples
-const STATE_RELEASE_SAMPLES: usize = 9; // musical release in samples
-const STATE_GATE_MODE: usize = 10;      // 1.0=gate on, 0.0=gate off
-const SAMPLER_STATE_SIZE: usize = 11;
+const STATE_ATTACK_SAMPLES: usize = 8;
+const STATE_RELEASE_SAMPLES: usize = 9;
+const STATE_GATE_MODE: usize = 10;   // 1.0=gate on, 0.0=gate off
+// Persistent envelope state (not settable via params)
+const STATE_ENV_PHASE: usize = 11;   // 0=idle, 1=attack, 2=sustain, 3=release
+const STATE_ENV_LEVEL: usize = 12;   // current envelope amplitude 0.0–1.0
+const STATE_RELEASE_LEVEL: usize = 13; // level when release began (for linear ramp)
+const STATE_GATE_COUNTER: usize = 14;  // real-time sample counter for gate duration (increments by 1/sample, not by playback rate)
+const SAMPLER_STATE_SIZE: usize = 15;
+
+// Envelope phase constants
+const ENV_IDLE: f32 = 0.0;
+const ENV_ATTACK: f32 = 1.0;
+const ENV_SUSTAIN: f32 = 2.0;
+const ENV_RELEASE: f32 = 3.0;
+const ENV_RETRIGGER: f32 = 4.0; // smooth fade-down before re-attack
+
+// Minimum release to prevent clicks (in samples, ~1.5ms at 44100)
+const MIN_RELEASE_SAMPLES: f32 = 64.0;
+// Retrigger crossfade duration (~1ms at 44100). Fades old content to 0 before new attack.
+const RETRIGGER_FADE_SAMPLES: f32 = 48.0;
+// Minimum attack applied after retrigger to prevent click on ramp-up (~0.2ms at 44100).
+// Fresh triggers from silence use the user's attack value directly (even if 0).
+const MIN_RETRIGGER_ATTACK: f32 = 8.0;
 
 // Param indices (match state layout for direct write)
 pub const PARAM_PLAYHEAD: u64 = STATE_PLAYHEAD as u64;
@@ -27,11 +47,13 @@ pub const PARAM_TRANSPOSE: u64 = STATE_TRANSPOSE as u64;
 pub const PARAM_ATTACK_SAMPLES: u64 = STATE_ATTACK_SAMPLES as u64;
 pub const PARAM_RELEASE_SAMPLES: u64 = STATE_RELEASE_SAMPLES as u64;
 pub const PARAM_GATE_MODE: u64 = STATE_GATE_MODE as u64;
+pub const PARAM_BUFFER_ID: u64 = STATE_BUFFER_ID as u64;
 
 pub struct SamplerTrack {
     pub name: String,
     pub node_id: i32,
     pub logical_id: u64,
+    pub buffer_id: i32,
 }
 
 /// extern "C" init — called by audiograph when node is created.
@@ -56,10 +78,19 @@ unsafe extern "C" fn sampler_init(
     *s.add(STATE_ATTACK_SAMPLES) = 0.0;
     *s.add(STATE_RELEASE_SAMPLES) = 0.0;
     *s.add(STATE_GATE_MODE) = 1.0; // gate on by default
+    *s.add(STATE_ENV_PHASE) = ENV_IDLE;
+    *s.add(STATE_ENV_LEVEL) = 0.0;
+    *s.add(STATE_RELEASE_LEVEL) = 0.0;
+    *s.add(STATE_GATE_COUNTER) = 0.0;
 }
 
 /// extern "C" process — reads sample data from buffer, writes to output.
-/// Supports variable-rate playback with linear interpolation.
+///
+/// Envelope state machine (persists across blocks):
+///   IDLE → (trigger) → ATTACK → SUSTAIN → (gate-off) → RELEASE → IDLE
+///
+/// gate_samples=0 is treated as an explicit note-off regardless of gate_mode,
+/// so keyboard release always triggers the release phase.
 unsafe extern "C" fn sampler_process(
     _inp: *const *mut f32,
     out: *const *mut f32,
@@ -76,9 +107,13 @@ unsafe extern "C" fn sampler_process(
     let speed = *s.add(STATE_SPEED);
     let gate_samples = *s.add(STATE_GATE_SAMPLES);
     let transpose = *s.add(STATE_TRANSPOSE);
-    let musical_attack = *s.add(STATE_ATTACK_SAMPLES);
-    let musical_release = *s.add(STATE_RELEASE_SAMPLES);
+    let attack_samples = *s.add(STATE_ATTACK_SAMPLES);
+    let release_samples = *s.add(STATE_RELEASE_SAMPLES);
     let gate_mode = *s.add(STATE_GATE_MODE);
+    let mut env_phase = *s.add(STATE_ENV_PHASE);
+    let mut env_level = *s.add(STATE_ENV_LEVEL);
+    let mut release_level = *s.add(STATE_RELEASE_LEVEL);
+    let mut gate_counter = *s.add(STATE_GATE_COUNTER);
 
     let buf_desc = buffers as *const BufferDesc;
     let desc = &*buf_desc.add(buffer_id);
@@ -95,32 +130,45 @@ unsafe extern "C" fn sampler_process(
         return;
     }
 
-    // Compute effective playback rate: speed * 2^(transpose/12)
     let effective_rate = speed * (2.0_f32).powf(transpose / 12.0);
-
-    // Gate cutoff depends on gate mode
-    let max_playhead = if gate_mode > 0.5 {
-        // Gate ON: respect duration gating
-        gate_samples.min(sample_len as f32)
-    } else {
-        // Gate OFF: play full sample
-        sample_len as f32
-    };
-
-    // Amplitude: velocity * gain
     let amplitude = velocity * gain;
+    let eff_release = release_samples.max(MIN_RELEASE_SAMPLES);
+    // After a retrigger fade, use a small minimum attack to avoid click on ramp-up.
+    // For fresh triggers from silence this flag stays false → attack=0 stays punchy.
+    let mut post_retrigger = false;
 
-    // Click prevention envelope (always on, hardcoded)
-    const CLICK_ATTACK: f32 = 128.0;
-    const CLICK_RELEASE: f32 = 256.0;
-    let click_release_start = (max_playhead - CLICK_RELEASE).max(0.0);
+    // ── Trigger detection ──
+    // playhead==0 means params just reset it. Distinguish fresh vs retrigger:
+    if playhead == 0.0 && env_phase != ENV_RETRIGGER {
+        gate_counter = 0.0; // reset real-time duration counter
+        if env_level > 0.001 {
+            // Voice was still audible → smooth retrigger fade to 0 first
+            env_phase = ENV_RETRIGGER;
+            release_level = env_level; // fade from this level
+        } else {
+            // Voice was silent → clean attack from 0
+            env_phase = ENV_ATTACK;
+            env_level = 0.0;
+        }
+    }
 
-    // Musical envelope (user-controlled attack/release)
-    let mus_release_start = (max_playhead - musical_release).max(0.0);
+    // ── Pre-loop gate-off check (gate may have changed between blocks) ──
+    if env_phase == ENV_ATTACK || env_phase == ENV_SUSTAIN {
+        if gate_samples <= 0.0 {
+            env_phase = ENV_RELEASE;
+            release_level = env_level;
+        } else if gate_mode > 0.5 && gate_counter >= gate_samples {
+            env_phase = ENV_RELEASE;
+            release_level = env_level;
+        }
+    }
 
     for i in 0..nf {
-        if playhead >= max_playhead || playhead < 0.0 {
+        // Past end of sample data: stop
+        if playhead >= sample_len as f32 || playhead < 0.0 {
             *out0.add(i) = 0.0;
+            env_phase = ENV_IDLE;
+            env_level = 0.0;
             *s.add(STATE_PLAYING) = 0.0;
             for j in (i + 1)..nf {
                 *out0.add(j) = 0.0;
@@ -128,47 +176,96 @@ unsafe extern "C" fn sampler_process(
             break;
         }
 
-        // Linear interpolation for non-integer playhead
+        // ── Envelope state machine (per sample) ──
+        // Uses chained `if` (not else-if) so phase transitions within a
+        // single sample flow through immediately (e.g. retrigger→attack).
+
+        if env_phase == ENV_RETRIGGER {
+            // Fade from release_level to 0 over RETRIGGER_FADE_SAMPLES.
+            // Playhead advances during this time (we "spend" ~1ms of new
+            // sample content at fading volume — inaudible).
+            if release_level > 0.0 {
+                env_level -= release_level / RETRIGGER_FADE_SAMPLES;
+            }
+            if env_level <= 0.0 {
+                env_level = 0.0;
+                env_phase = ENV_ATTACK;
+                post_retrigger = true;
+            }
+        }
+
+        if env_phase == ENV_ATTACK {
+            // After retrigger, enforce a minimum attack to prevent click
+            // on the ramp back up (sample data at playhead≈48 != 0).
+            // Fresh triggers from silence keep attack=0 for max punch.
+            let eff_attack = if post_retrigger {
+                attack_samples.max(MIN_RETRIGGER_ATTACK)
+            } else {
+                attack_samples
+            };
+            if eff_attack > 0.0 {
+                env_level += 1.0 / eff_attack;
+            } else {
+                env_level = 1.0;
+            }
+            if env_level >= 1.0 {
+                env_level = 1.0;
+                env_phase = ENV_SUSTAIN;
+            }
+        }
+
+        if env_phase == ENV_SUSTAIN {
+            if gate_samples <= 0.0 {
+                // Explicit note-off (keyboard release)
+                env_phase = ENV_RELEASE;
+                release_level = env_level;
+            } else if gate_mode > 0.5 && gate_counter >= gate_samples {
+                // Duration gating (real-time counter, independent of playback rate)
+                env_phase = ENV_RELEASE;
+                release_level = env_level;
+            } else if gate_mode <= 0.5 && playhead >= (sample_len as f32 - eff_release) {
+                // Auto-release near end of sample (gate off = play full sample)
+                env_phase = ENV_RELEASE;
+                release_level = env_level;
+            }
+        }
+
+        if env_phase == ENV_RELEASE {
+            if release_level > 0.0 {
+                env_level -= release_level / eff_release;
+            }
+            if env_level <= 0.0 {
+                env_level = 0.0;
+                env_phase = ENV_IDLE;
+                *s.add(STATE_PLAYING) = 0.0;
+                *out0.add(i) = 0.0;
+                for j in (i + 1)..nf {
+                    *out0.add(j) = 0.0;
+                }
+                break;
+            }
+        }
+
+        // ── Read sample with linear interpolation ──
+
         let idx = playhead as usize;
         let frac = playhead - idx as f32;
-
-        let s0 = if idx < sample_len {
-            *sample_data.add(idx)
-        } else {
-            0.0
-        };
-        let s1 = if idx + 1 < sample_len {
-            *sample_data.add(idx + 1)
-        } else {
-            0.0
-        };
-
+        let s0 = if idx < sample_len { *sample_data.add(idx) } else { 0.0 };
+        let s1 = if idx + 1 < sample_len { *sample_data.add(idx + 1) } else { 0.0 };
         let sample = s0 + frac * (s1 - s0);
 
-        // Click prevention envelope
-        let click_env = if playhead < CLICK_ATTACK {
-            playhead / CLICK_ATTACK
-        } else if playhead > click_release_start {
-            ((max_playhead - playhead) / CLICK_RELEASE).max(0.0)
-        } else {
-            1.0
-        };
-
-        // Musical envelope (only applies if attack or release > 0)
-        let mus_env = if musical_attack > 0.0 && playhead < musical_attack {
-            playhead / musical_attack
-        } else if musical_release > 0.0 && playhead > mus_release_start {
-            ((max_playhead - playhead) / musical_release).max(0.0)
-        } else {
-            1.0
-        };
-
-        *out0.add(i) = sample * amplitude * click_env * mus_env;
+        *out0.add(i) = sample * amplitude * env_level;
 
         playhead += effective_rate;
+        gate_counter += 1.0; // real-time counter (1 per sample, independent of transpose/speed)
     }
 
+    // Write back persistent state
     *s.add(STATE_PLAYHEAD) = playhead;
+    *s.add(STATE_ENV_PHASE) = env_phase;
+    *s.add(STATE_ENV_LEVEL) = env_level;
+    *s.add(STATE_RELEASE_LEVEL) = release_level;
+    *s.add(STATE_GATE_COUNTER) = gate_counter;
 }
 
 pub fn sampler_vtable() -> NodeVTable {
@@ -180,11 +277,9 @@ pub fn sampler_vtable() -> NodeVTable {
     }
 }
 
-/// Load a WAV file, create an audiograph buffer and sampler node.
-pub fn create_sampler_track(
-    lg: *mut LiveGraph,
-    wav_path: &Path,
-) -> Result<SamplerTrack, String> {
+/// Load a WAV file into an audiograph buffer.
+/// Returns `(buffer_id, file_stem_name)`.
+pub fn load_wav_buffer(lg: *mut LiveGraph, wav_path: &Path) -> Result<(i32, String), String> {
     let reader =
         hound::WavReader::open(wav_path).map_err(|e| format!("Failed to open WAV: {e}"))?;
     let spec = reader.spec();
@@ -214,19 +309,45 @@ pub fn create_sampler_track(
         samples_f32
     };
 
-    let buffer_id = unsafe { create_buffer(lg, mono.len() as c_int, 1, mono.as_ptr()) };
+    // Skip leading silence: scan with 64-sample RMS windows, threshold -60dB (~0.001)
+    let skip = {
+        const WINDOW: usize = 64;
+        const THRESHOLD: f32 = 0.001;
+        let thresh_sq = THRESHOLD * THRESHOLD;
+        let mut start = 0usize;
+        for chunk in mono.chunks(WINDOW) {
+            let sum_sq: f32 = chunk.iter().map(|s| s * s).sum();
+            if sum_sq / chunk.len() as f32 > thresh_sq {
+                break;
+            }
+            start += chunk.len();
+        }
+        start.min(mono.len())
+    };
+    let trimmed = &mono[skip..];
+
+    let buffer_id = unsafe { create_buffer(lg, trimmed.len() as c_int, 1, trimmed.as_ptr()) };
     if buffer_id < 0 {
         return Err("Failed to create buffer".to_string());
     }
-
-    let initial_state = [buffer_id as f32];
 
     let name = wav_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("sample")
         .to_string();
-    let c_name = CString::new(name.as_str()).unwrap();
+
+    Ok((buffer_id, name))
+}
+
+/// Create a sampler node from an existing buffer ID.
+pub fn create_sampler_node(
+    lg: *mut LiveGraph,
+    buffer_id: i32,
+    name: &str,
+) -> Result<SamplerTrack, String> {
+    let initial_state = [buffer_id as f32];
+    let c_name = CString::new(name).unwrap();
 
     let node_id = unsafe {
         add_node(
@@ -246,8 +367,18 @@ pub fn create_sampler_track(
     }
 
     Ok(SamplerTrack {
-        name,
+        name: name.to_string(),
         node_id,
         logical_id: node_id as u64,
+        buffer_id,
     })
+}
+
+/// Load a WAV file, create an audiograph buffer and sampler node.
+pub fn create_sampler_track(
+    lg: *mut LiveGraph,
+    wav_path: &Path,
+) -> Result<SamplerTrack, String> {
+    let (buffer_id, name) = load_wav_buffer(lg, wav_path)?;
+    create_sampler_node(lg, buffer_id, &name)
 }
