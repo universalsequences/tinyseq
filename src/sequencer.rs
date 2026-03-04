@@ -601,6 +601,13 @@ pub struct SequencerState {
     pub voice_lids: Vec<[AtomicU64; MAX_VOICES]>,
     /// Number of voices per track.
     pub voice_counts: Vec<AtomicU32>,
+    /// Fractional phase within current step (0.0–1.0), written by audio thread.
+    /// Used by UI to round-to-nearest-step when recording keyboard input.
+    pub playhead_phase: AtomicU32,
+    /// Recording quantize threshold (0.0–1.0). Key presses landing past this
+    /// phase within a step snap to the next step. Default 0.5 (midpoint).
+    /// Adjust with [ / ] when armed to compensate for output latency.
+    pub record_quantize_thresh: AtomicU32,
 }
 
 impl SequencerState {
@@ -648,6 +655,8 @@ impl SequencerState {
                 .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
             voice_counts: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
+            playhead_phase: AtomicU32::new(0.0_f32.to_bits()),
+            record_quantize_thresh: AtomicU32::new(0.5_f32.to_bits()),
         }
     }
 
@@ -977,6 +986,10 @@ impl SequencerClock {
                 });
             }
         }
+
+        // Publish fractional phase so UI can round-to-nearest-step when recording.
+        let phase = (self.sample_counter / self.samples_per_step) as f32;
+        state.playhead_phase.store(phase.to_bits(), Ordering::Relaxed);
 
         triggers
     }

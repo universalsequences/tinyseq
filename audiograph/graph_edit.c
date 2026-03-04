@@ -1390,6 +1390,11 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
       sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1, NULL);
       if (sum_id < 0)
         return false;
+      // Re-derive S and D: apply_add_node may have triggered
+      // grow_node_capacity which reallocates lg->nodes, invalidating
+      // the pointers captured at the top of this function.
+      S = &lg->nodes[src_node];
+      D = &lg->nodes[dst_node];
       RTNode *SUM = &lg->nodes[sum_id];
       if (!is_node_valid(lg, sum_id) || !ensure_port_arrays(SUM)) {
         return false;

@@ -124,10 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&state),
         lg_ptr,
         sample_rate,
-        bus_l_id,
-        bus_r_id,
-        reverb_bus_id,
-        reverb_node_id,
+        ui::AudioBuses {
+            bus_l_id,
+            bus_r_id,
+            reverb_bus_id,
+            reverb_node_id,
+        },
         keyboard_tx,
     );
 
