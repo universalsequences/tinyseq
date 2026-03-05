@@ -14,6 +14,7 @@ use super::{App, InputMode, Region, BAR_HEIGHT, COL_WIDTH};
 
 impl App {
     pub(super) fn handle_cirklon_input(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.touch_follow_timer();
         let has_shift = modifiers.contains(KeyModifiers::SHIFT);
         let has_alt = modifiers.contains(KeyModifiers::ALT);
         let ns = self.num_steps();
@@ -433,6 +434,7 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     let is_playing = app.state.is_playing();
     let sd = &app.state.step_data[app.cursor_track];
     let is_transpose = app.active_param == StepParam::Transpose;
+    let is_sync = app.active_param == StepParam::Sync;
 
     let (page_start, page_end) = app.page_range();
 
@@ -449,6 +451,43 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
         let active = app.state.patterns[app.cursor_track].is_active(step);
         let playhead_on_page = playhead >= page_start && playhead < page_end;
         let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
+
+        // Sync param: show label text vertically centered instead of bars
+        if is_sync {
+            let sync_idx = raw.round() as usize;
+            let label = if sync_idx < crate::sequencer::SYNC_COUNT {
+                crate::sequencer::SYNC_RESOLUTIONS[sync_idx].2
+            } else {
+                ""
+            };
+            let fg = if sync_idx == 0 {
+                step_dim_fg(step)
+            } else if active {
+                step_active_fg(step)
+            } else {
+                step_dim_fg(step)
+            };
+            // Render label chars vertically, centered in BAR_HEIGHT
+            let chars: Vec<char> = label.chars().collect();
+            let start_row = if chars.len() < BAR_HEIGHT {
+                (BAR_HEIGHT - chars.len()) / 2
+            } else {
+                0
+            };
+            for row in 0..BAR_HEIGHT {
+                let cell_y = area.y + row as u16;
+                let ci = row.wrapping_sub(start_row);
+                let ch = if ci < chars.len() {
+                    format!(" {} ", chars[ci])
+                } else {
+                    "   ".to_string()
+                };
+                let style = Style::default().fg(fg).bg(bg);
+                let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
+                frame.render_widget(Paragraph::new(ch).style(style), cell_area);
+            }
+            continue;
+        }
 
         let fill_levels = (normalized * (BAR_HEIGHT as f32 * 2.0)).round() as usize;
 
@@ -719,7 +758,7 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let current_page = app.current_page();
+    let display_page = app.display_page();
     let playing_page = (app.state.track_step(app.cursor_track) % ns) / STEPS_PER_PAGE;
 
     let mut btn_layout: Vec<(u16, u16, usize)> = Vec::new();
@@ -730,7 +769,7 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
         let label = format!(" {} ", p + 1);
         let w = label.len().max(3) as u16;
 
-        let style = if p == current_page {
+        let style = if p == display_page {
             Style::default().fg(Color::Black).bg(Color::White).bold()
         } else {
             Style::default()

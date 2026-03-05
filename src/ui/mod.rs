@@ -225,6 +225,9 @@ pub struct App {
     pub piano_notes: Vec<(i32, Instant)>, // (semitone, expires_at)
     pub piano_last_step: usize,
     pub piano_last_track: usize,
+
+    // Page-follow: page tracks playhead unless user interacts
+    pub follow_override_until: Option<Instant>,
 }
 
 impl App {
@@ -312,6 +315,7 @@ impl App {
             piano_notes: Vec::new(),
             piano_last_step: usize::MAX,
             piano_last_track: usize::MAX,
+            follow_override_until: None,
         }
     }
 
@@ -354,10 +358,38 @@ impl App {
         self.cursor_step / STEPS_PER_PAGE
     }
 
+    /// Page to display: follows playhead when playing, unless the user recently
+    /// interacted or has a selection active.
+    fn display_page(&self) -> usize {
+        if !self.state.is_playing() {
+            return self.current_page();
+        }
+        // Selection active → stay on cursor page
+        if self.selection_anchor.is_some() {
+            return self.current_page();
+        }
+        // User recently interacted → stay on cursor page
+        if let Some(until) = self.follow_override_until {
+            if Instant::now() < until {
+                return self.current_page();
+            }
+        }
+        // Follow playhead
+        let ns = self.num_steps();
+        let ph = self.state.track_step(self.cursor_track) % ns;
+        ph / STEPS_PER_PAGE
+    }
+
     fn page_range(&self) -> (usize, usize) {
-        let page_start = self.current_page() * STEPS_PER_PAGE;
+        let page = self.display_page();
+        let page_start = page * STEPS_PER_PAGE;
         let page_end = (page_start + STEPS_PER_PAGE).min(self.num_steps());
         (page_start, page_end)
+    }
+
+    /// Pause page-follow for 10 seconds after user interaction.
+    fn touch_follow_timer(&mut self) {
+        self.follow_override_until = Some(Instant::now() + std::time::Duration::from_secs(5));
     }
 
     /// Clamp cursor_step to the current track's num_steps.

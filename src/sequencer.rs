@@ -7,7 +7,7 @@ use crate::voice::MAX_VOICES;
 pub const MAX_TRACKS: usize = 64;
 pub const MAX_STEPS: usize = 64;
 pub const STEPS_PER_PAGE: usize = 16;
-pub const NUM_PARAMS: usize = 7;
+pub const NUM_PARAMS: usize = 8;
 pub const DEFAULT_BPM: u32 = 120;
 
 /// Timebase determines the duration of each step as a note division.
@@ -118,6 +118,30 @@ impl Timebase {
     }
 }
 
+/// Sync resolution options: (stored_value, beats, label).
+/// Index 0 = Off. Indices 1..SYNC_COUNT map to beat values.
+pub const SYNC_RESOLUTIONS: [(f32, f64, &str); 8] = [
+    (0.0, 0.0, "Off"),       // 0 = off
+    (1.0, 0.25, "1/16"),     // 16th note
+    (2.0, 0.5, "1/8"),       // 8th note
+    (3.0, 1.0, "1/4"),       // quarter note
+    (4.0, 2.0, "1/2 bar"),   // half bar
+    (5.0, 4.0, "1 bar"),     // 1 bar
+    (6.0, 8.0, "2 bars"),    // 2 bars
+    (7.0, 16.0, "4 bars"),   // 4 bars
+];
+pub const SYNC_COUNT: usize = SYNC_RESOLUTIONS.len();
+
+/// Get the beat resolution for a sync param value (0.0 = off → returns 0.0).
+pub fn sync_beats(val: f32) -> f64 {
+    let idx = val.round() as usize;
+    if idx > 0 && idx < SYNC_COUNT {
+        SYNC_RESOLUTIONS[idx].1
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StepParam {
     Duration = 0,  // 0.0..4.0 (fraction of full sample)
@@ -127,6 +151,7 @@ pub enum StepParam {
     AuxB = 4,      // 0.0..1.0
     Transpose = 5, // -12.0..12.0 (semitones)
     Chop = 6,      // 1..8 (number of re-triggers per step)
+    Sync = 7,      // 0=off, 1..SYNC_COUNT = resolution index (see SYNC_RESOLUTIONS)
 }
 
 impl StepParam {
@@ -138,16 +163,18 @@ impl StepParam {
         StepParam::AuxB,
         StepParam::Transpose,
         StepParam::Chop,
+        StepParam::Sync,
     ];
 
     /// Params visible in the step param tabs (excludes Speed).
-    pub const VISIBLE: [StepParam; 6] = [
+    pub const VISIBLE: [StepParam; 7] = [
         StepParam::Duration,
         StepParam::Velocity,
         StepParam::AuxA,
         StepParam::AuxB,
         StepParam::Transpose,
         StepParam::Chop,
+        StepParam::Sync,
     ];
 
     pub fn default_value(self) -> f32 {
@@ -159,6 +186,7 @@ impl StepParam {
             StepParam::AuxB => 0.0,
             StepParam::Transpose => 0.0,
             StepParam::Chop => 1.0,
+            StepParam::Sync => 0.0,
         }
     }
 
@@ -171,6 +199,7 @@ impl StepParam {
             StepParam::AuxB => 0.0,
             StepParam::Transpose => -48.0,
             StepParam::Chop => 1.0,
+            StepParam::Sync => 0.0,
         }
     }
 
@@ -183,6 +212,7 @@ impl StepParam {
             StepParam::AuxB => 1.0,
             StepParam::Transpose => 48.0,
             StepParam::Chop => 8.0,
+            StepParam::Sync => (SYNC_COUNT - 1) as f32,
         }
     }
 
@@ -195,6 +225,7 @@ impl StepParam {
             StepParam::AuxB => 0.05,
             StepParam::Transpose => 1.0,
             StepParam::Chop => 1.0,
+            StepParam::Sync => 1.0,
         }
     }
 
@@ -207,6 +238,7 @@ impl StepParam {
             StepParam::AuxB => "Aux B",
             StepParam::Transpose => "Transpose",
             StepParam::Chop => "Chop",
+            StepParam::Sync => "Sync",
         }
     }
 
@@ -219,6 +251,7 @@ impl StepParam {
             StepParam::AuxB => "axB",
             StepParam::Transpose => "trn",
             StepParam::Chop => "chp",
+            StepParam::Sync => "syn",
         }
     }
 
@@ -236,6 +269,14 @@ impl StepParam {
         match self {
             StepParam::Transpose => format!("{:+.0}", val),
             StepParam::Chop => format!("{:.0}", val),
+            StepParam::Sync => {
+                let idx = val.round() as usize;
+                if idx < SYNC_COUNT {
+                    SYNC_RESOLUTIONS[idx].2.to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
             _ => format!("{:.2}", val),
         }
     }
@@ -267,6 +308,7 @@ impl StepParam {
             StepParam::AuxB => 'b',
             StepParam::Transpose => 't',
             StepParam::Chop => 'c',
+            StepParam::Sync => 'y',
         }
     }
 
@@ -279,6 +321,7 @@ impl StepParam {
             'b' => Some(StepParam::AuxB),
             't' => Some(StepParam::Transpose),
             'c' => Some(StepParam::Chop),
+            'y' => Some(StepParam::Sync),
             _ => None,
         }
     }
@@ -293,6 +336,7 @@ impl StepParam {
             StepParam::AuxB => ("ax", "B", ""),
             StepParam::Transpose => ("", "t", "rn"),
             StepParam::Chop => ("", "c", "hp"),
+            StepParam::Sync => ("s", "y", "n"),
         }
     }
 }
@@ -961,6 +1005,15 @@ impl SequencerState {
             self.chord_data[track].copy_step(src, step);
         }
 
+        // Copy timebase p-locks
+        for step in num_steps..new_len {
+            let src = step - num_steps;
+            match self.timebase_plocks[track].get(src) {
+                Some(tb) => self.timebase_plocks[track].set(step, tb),
+                None => self.timebase_plocks[track].clear(step),
+            }
+        }
+
         self.track_params[track].set_num_steps(new_len);
         new_len
     }
@@ -1210,13 +1263,9 @@ impl SequencerClock {
     }
 
     /// Precompute step beat-boundaries for a track (call once per block per track).
-    ///
-    /// Steps fill bars sequentially. If a step wouldn't fit in the remaining bar
-    /// space, the accumulator pads forward to the next bar boundary (dead space),
-    /// and the step starts on the downbeat. This guarantees every bar starts clean
-    /// and the pattern stays locked to the global bar grid.
+    /// Steps pack contiguously; Sync step params insert dead space before a step
+    /// to align it to a grid resolution.
     fn precompute_boundaries(&mut self, state: &SequencerState, track: usize) {
-        const BAR_BEATS: f64 = 4.0;
         const EPS: f64 = 1e-9;
 
         let tp = &state.track_params[track];
@@ -1225,10 +1274,21 @@ impl SequencerClock {
         let tc = &mut self.track_clocks[track];
 
         let mut accum = 0.0;
+        let sd = &state.step_data[track];
 
         for s in 0..ns {
             let tb = state.timebase_plocks[track].resolve(s, default_tb);
             let step_dur = tb.step_beats(ns);
+
+            // Sync point: pad to next multiple of the sync resolution
+            let sync_val = sd.get(s, StepParam::Sync);
+            let sync_b = sync_beats(sync_val);
+            if sync_b > EPS {
+                let pos_in_grid = accum % sync_b;
+                if pos_in_grid > EPS {
+                    accum += sync_b - pos_in_grid;
+                }
+            }
 
             tc.boundaries[s] = accum;
             tc.step_ends[s] = accum + step_dur;
@@ -1238,15 +1298,21 @@ impl SequencerClock {
         // boundaries[ns] = end of last step (where dead space begins)
         tc.boundaries[ns] = accum;
 
-        // Snap total cycle to next whole-bar boundary (must be >= accum).
-        // First round down, then bump up only if that's too short.
-        let bars_floor = (accum / BAR_BEATS).floor();
-        let cycle = bars_floor * BAR_BEATS;
-        tc.cycle_beats = if cycle >= accum - 1e-9 {
-            cycle.max(BAR_BEATS)
+        // Cycle = natural pattern length by default.
+        // If step 0 has a sync value, snap cycle length to that resolution
+        // so step 0 always lands on the grid when the pattern loops.
+        let sync0 = sd.get(0, StepParam::Sync);
+        let sync0_b = sync_beats(sync0);
+        if sync0_b > EPS {
+            let rem = accum % sync0_b;
+            if rem > EPS {
+                tc.cycle_beats = accum + (sync0_b - rem);
+            } else {
+                tc.cycle_beats = accum.max(EPS);
+            }
         } else {
-            (bars_floor + 1.0).max(1.0) * BAR_BEATS
-        };
+            tc.cycle_beats = accum.max(EPS);
+        }
     }
 
     /// Derive the local step index from the current beat position within a track's cycle.

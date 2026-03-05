@@ -550,6 +550,7 @@ impl App {
 
         // Page blocks: click navigates to that page
         if rect_contains(l.page_blocks_area, col, row) {
+            self.touch_follow_timer();
             for &(x_start, x_end, page_idx) in &self.page_btn_layout {
                 if col >= x_start && col < x_end {
                     self.cursor_step = page_idx * crate::sequencer::STEPS_PER_PAGE;
@@ -574,6 +575,7 @@ impl App {
     }
 
     fn handle_step_click(&mut self, step: usize) {
+        self.touch_follow_timer();
         let now = Instant::now();
         let is_double = self
             .last_step_click
