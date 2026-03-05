@@ -970,7 +970,7 @@ pub(super) fn draw_effects_column(
                     let pv = slot.plocks.get(app.cursor_step, i);
                     (pv.unwrap_or(default_val), pv.is_some())
                 } else if app.state.is_playing() {
-                    let step = app.state.current_step();
+                    let step = app.state.track_step(app.cursor_track);
                     let pv = slot.plocks.get(step, i);
                     (pv.unwrap_or(default_val), pv.is_some())
                 } else {

@@ -428,8 +428,8 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let ns = app.num_steps();
-    let global_playhead = app.state.current_step();
-    let playhead = global_playhead % ns;
+    let track_ph = app.state.track_step(app.cursor_track);
+    let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
     let sd = &app.state.step_data[app.cursor_track];
     let is_transpose = app.active_param == StepParam::Transpose;
@@ -582,8 +582,8 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
     let slot = &chain[slot_idx];
 
     let ns = app.num_steps();
-    let global_playhead = app.state.current_step();
-    let playhead = global_playhead % ns;
+    let track_ph = app.state.track_step(track);
+    let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
     let (page_start, page_end) = app.page_range();
     let x_offset = 2u16;
@@ -650,8 +650,8 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let ns = app.num_steps();
-    let global_playhead = app.state.current_step();
-    let playhead = global_playhead % ns;
+    let track_ph = app.state.track_step(app.cursor_track);
+    let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
     let (page_start, page_end) = app.page_range();
     let x_offset = 2u16;
@@ -720,7 +720,7 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let current_page = app.current_page();
-    let playing_page = (app.state.current_step() % ns) / STEPS_PER_PAGE;
+    let playing_page = (app.state.track_step(app.cursor_track) % ns) / STEPS_PER_PAGE;
 
     let mut btn_layout: Vec<(u16, u16, usize)> = Vec::new();
     let mut x = area.x + 2;
@@ -897,7 +897,7 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
     // Detect new step triggers and add notes with duration-based expiry
     if app.state.is_playing() {
         let ns = app.num_steps();
-        let step = app.state.current_step() % ns;
+        let step = app.state.track_step(app.cursor_track) % ns;
 
         if step != app.piano_last_step {
             app.piano_last_step = step;

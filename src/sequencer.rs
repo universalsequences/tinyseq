@@ -10,6 +10,114 @@ pub const STEPS_PER_PAGE: usize = 16;
 pub const NUM_PARAMS: usize = 7;
 pub const DEFAULT_BPM: u32 = 120;
 
+/// Timebase determines the duration of each step as a note division.
+/// Inspired by the Sequentix Cirklon sequencer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Timebase {
+    Whole = 0,              // 1  — each step = whole note
+    Half = 1,               // 2  — each step = half note
+    Quarter = 2,            // 4  — each step = quarter note
+    Eighth = 3,             // 8  — each step = eighth note
+    Sixteenth = 4,          // 16 — each step = sixteenth note (default)
+    ThirtySecond = 5,       // 32
+    SixtyFourth = 6,        // 64
+    HalfTriplet = 7,        // 2T
+    QuarterTriplet = 8,     // 4T
+    EighthTriplet = 9,      // 8T
+    SixteenthTriplet = 10,  // 16T
+    ThirtySecondTriplet = 11, // 32T
+    SixtyFourthTriplet = 12,  // 64T
+    Polyrhythm = 13,        // Prh — bar ÷ num_steps
+}
+
+impl Timebase {
+    pub const COUNT: usize = 14;
+
+    pub const ALL: [Timebase; Self::COUNT] = [
+        Timebase::Whole,
+        Timebase::Half,
+        Timebase::Quarter,
+        Timebase::Eighth,
+        Timebase::Sixteenth,
+        Timebase::ThirtySecond,
+        Timebase::SixtyFourth,
+        Timebase::HalfTriplet,
+        Timebase::QuarterTriplet,
+        Timebase::EighthTriplet,
+        Timebase::SixteenthTriplet,
+        Timebase::ThirtySecondTriplet,
+        Timebase::SixtyFourthTriplet,
+        Timebase::Polyrhythm,
+    ];
+
+    pub fn from_index(i: u32) -> Self {
+        match i {
+            0 => Timebase::Whole,
+            1 => Timebase::Half,
+            2 => Timebase::Quarter,
+            3 => Timebase::Eighth,
+            4 => Timebase::Sixteenth,
+            5 => Timebase::ThirtySecond,
+            6 => Timebase::SixtyFourth,
+            7 => Timebase::HalfTriplet,
+            8 => Timebase::QuarterTriplet,
+            9 => Timebase::EighthTriplet,
+            10 => Timebase::SixteenthTriplet,
+            11 => Timebase::ThirtySecondTriplet,
+            12 => Timebase::SixtyFourthTriplet,
+            13 => Timebase::Polyrhythm,
+            _ => Timebase::Sixteenth, // fallback
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Timebase::Whole => "1",
+            Timebase::Half => "2",
+            Timebase::Quarter => "4",
+            Timebase::Eighth => "8",
+            Timebase::Sixteenth => "16",
+            Timebase::ThirtySecond => "32",
+            Timebase::SixtyFourth => "64",
+            Timebase::HalfTriplet => "2T",
+            Timebase::QuarterTriplet => "4T",
+            Timebase::EighthTriplet => "8T",
+            Timebase::SixteenthTriplet => "16T",
+            Timebase::ThirtySecondTriplet => "32T",
+            Timebase::SixtyFourthTriplet => "64T",
+            Timebase::Polyrhythm => "Prh",
+        }
+    }
+
+    /// Duration of one step in quarter notes (musical time).
+    /// num_steps only matters for Polyrhythm mode.
+    pub fn step_beats(&self, num_steps: usize) -> f64 {
+        match self {
+            Timebase::Whole => 4.0,
+            Timebase::Half => 2.0,
+            Timebase::Quarter => 1.0,
+            Timebase::Eighth => 0.5,
+            Timebase::Sixteenth => 0.25,
+            Timebase::ThirtySecond => 0.125,
+            Timebase::SixtyFourth => 0.0625,
+            Timebase::HalfTriplet => 4.0 / 3.0,
+            Timebase::QuarterTriplet => 2.0 / 3.0,
+            Timebase::EighthTriplet => 1.0 / 3.0,
+            Timebase::SixteenthTriplet => 1.0 / 6.0,
+            Timebase::ThirtySecondTriplet => 1.0 / 12.0,
+            Timebase::SixtyFourthTriplet => 1.0 / 24.0,
+            Timebase::Polyrhythm => 4.0 / num_steps.max(1) as f64,
+        }
+    }
+
+    /// Duration of one step in samples (for gate/chop calculations).
+    pub fn samples_per_step(&self, sample_rate: f64, bpm: f64, num_steps: usize) -> f64 {
+        let samples_per_quarter = sample_rate * 60.0 / bpm;
+        samples_per_quarter * self.step_beats(num_steps)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StepParam {
     Duration = 0,  // 0.0..4.0 (fraction of full sample)
@@ -265,6 +373,8 @@ pub struct TrackParams {
     pub send: AtomicU32,
     /// Polyphonic mode (default false = mono).
     pub polyphonic: AtomicBool,
+    /// Timebase: step duration as a note division. Index into Timebase enum.
+    pub timebase: AtomicU32,
 }
 
 impl TrackParams {
@@ -277,6 +387,7 @@ impl TrackParams {
             num_steps: AtomicU32::new(STEPS_PER_PAGE as u32),
             send: AtomicU32::new(0.0_f32.to_bits()),
             polyphonic: AtomicBool::new(true),
+            timebase: AtomicU32::new(Timebase::Sixteenth as u32),
         }
     }
 
@@ -340,6 +451,28 @@ impl TrackParams {
     pub fn toggle_polyphonic(&self) {
         self.polyphonic.fetch_xor(true, Ordering::Relaxed);
     }
+
+    pub fn get_timebase(&self) -> Timebase {
+        Timebase::from_index(self.timebase.load(Ordering::Relaxed))
+    }
+
+    pub fn set_timebase(&self, tb: Timebase) {
+        self.timebase.store(tb as u32, Ordering::Relaxed);
+    }
+
+    /// Cycle to next timebase value.
+    pub fn next_timebase(&self) {
+        let cur = self.timebase.load(Ordering::Relaxed);
+        let next = (cur + 1) % Timebase::COUNT as u32;
+        self.timebase.store(next, Ordering::Relaxed);
+    }
+
+    /// Cycle to previous timebase value.
+    pub fn prev_timebase(&self) {
+        let cur = self.timebase.load(Ordering::Relaxed);
+        let next = if cur == 0 { Timebase::COUNT as u32 - 1 } else { cur - 1 };
+        self.timebase.store(next, Ordering::Relaxed);
+    }
 }
 
 // ── Pattern snapshot (for inactive patterns in the bank) ──
@@ -353,6 +486,7 @@ pub struct TrackParamsSnapshot {
     pub num_steps: usize,
     pub send: f32,
     pub polyphonic: bool,
+    pub timebase: Timebase,
 }
 
 impl Default for TrackParamsSnapshot {
@@ -365,6 +499,7 @@ impl Default for TrackParamsSnapshot {
             num_steps: STEPS_PER_PAGE,
             send: 0.0,
             polyphonic: false,
+            timebase: Timebase::Sixteenth,
         }
     }
 }
@@ -379,6 +514,8 @@ pub struct PatternSnapshot {
     pub sample_ids: Vec<(i32, String)>,
     /// Per-track chord data snapshots.
     pub chord_snapshots: Vec<ChordSnapshot>,
+    /// Per-track timebase p-lock snapshots.
+    pub timebase_plock_snapshots: Vec<[Option<u32>; MAX_STEPS]>,
 }
 
 impl PatternSnapshot {
@@ -394,6 +531,7 @@ impl PatternSnapshot {
         let mut effect_slots = Vec::with_capacity(num_tracks);
         let mut sample_ids = Vec::with_capacity(num_tracks);
         let mut chord_snapshots = Vec::with_capacity(num_tracks);
+        let mut timebase_plock_snapshots = Vec::with_capacity(num_tracks);
 
         for t in 0..num_tracks {
             track_bits.push(state.patterns[t].load_bits());
@@ -417,6 +555,7 @@ impl PatternSnapshot {
                 num_steps: tp.get_num_steps(),
                 send: tp.get_send(),
                 polyphonic: tp.is_polyphonic(),
+                timebase: tp.get_timebase(),
             });
 
             // Capture effect chain
@@ -441,6 +580,9 @@ impl PatternSnapshot {
 
             // Capture chord data
             chord_snapshots.push(ChordSnapshot::capture(&state.chord_data[t]));
+
+            // Capture timebase p-locks
+            timebase_plock_snapshots.push(state.timebase_plocks[t].snapshot());
         }
 
         Self {
@@ -450,6 +592,7 @@ impl PatternSnapshot {
             effect_slots,
             sample_ids,
             chord_snapshots,
+            timebase_plock_snapshots,
         }
     }
 
@@ -473,6 +616,7 @@ impl PatternSnapshot {
             tp.set_num_steps(snap.num_steps);
             tp.set_send(snap.send);
             tp.polyphonic.store(snap.polyphonic, Ordering::Relaxed);
+            tp.set_timebase(snap.timebase);
 
             // Restore effect chain slots
             for (slot_idx, slot_snap) in self.effect_slots[t].iter().enumerate() {
@@ -484,6 +628,11 @@ impl PatternSnapshot {
             // Restore chord data
             if t < self.chord_snapshots.len() {
                 self.chord_snapshots[t].restore(&state.chord_data[t]);
+            }
+
+            // Restore timebase p-locks
+            if t < self.timebase_plock_snapshots.len() {
+                state.timebase_plocks[t].restore(&self.timebase_plock_snapshots[t]);
             }
         }
     }
@@ -523,6 +672,7 @@ impl PatternSnapshot {
             .push(Self::default_effect_slots(t, slot_descriptors));
         self.sample_ids.push((-1, String::new()));
         self.chord_snapshots.push(ChordSnapshot::new_default());
+        self.timebase_plock_snapshots.push([None; MAX_STEPS]);
     }
 
     pub fn new_default(num_tracks: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Self {
@@ -533,6 +683,7 @@ impl PatternSnapshot {
             effect_slots: Vec::with_capacity(num_tracks),
             sample_ids: Vec::with_capacity(num_tracks),
             chord_snapshots: Vec::with_capacity(num_tracks),
+            timebase_plock_snapshots: Vec::with_capacity(num_tracks),
         };
         for t in 0..num_tracks {
             snap.push_default_track(t, slot_descriptors);
@@ -601,6 +752,10 @@ pub struct SequencerState {
     pub voice_lids: Vec<[AtomicU64; MAX_VOICES]>,
     /// Number of voices per track.
     pub voice_counts: Vec<AtomicU32>,
+    /// Per-track step position, written by the per-track clock in audio thread.
+    pub track_playheads: Vec<AtomicU32>,
+    /// Per-track, per-step timebase p-locks.
+    pub timebase_plocks: Vec<TimebasePLockData>,
     /// Fractional phase within current step (0.0–1.0), written by audio thread.
     /// Used by UI to round-to-nearest-step when recording keyboard input.
     pub playhead_phase: AtomicU32,
@@ -655,6 +810,8 @@ impl SequencerState {
                 .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
             voice_counts: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
+            track_playheads: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
+            timebase_plocks: (0..MAX_TRACKS).map(|_| TimebasePLockData::new()).collect(),
             playhead_phase: AtomicU32::new(0.0_f32.to_bits()),
             record_quantize_thresh: AtomicU32::new(0.5_f32.to_bits()),
         }
@@ -666,6 +823,11 @@ impl SequencerState {
 
     pub fn current_step(&self) -> usize {
         self.playhead.load(Ordering::Relaxed) as usize
+    }
+
+    /// Get the current step position for a specific track (per-track timebase).
+    pub fn track_step(&self, track: usize) -> usize {
+        self.track_playheads[track].load(Ordering::Relaxed) as usize
     }
 
     pub fn is_playing(&self) -> bool {
@@ -921,75 +1083,277 @@ pub struct KeyboardTrigger {
     pub note_off: bool,
 }
 
-/// Trigger event: which step fired, and at what sample offset within the block.
+/// Trigger event: which track and step fired, and at what sample offset within the block.
 pub struct Trigger {
+    pub track: usize,
     pub step: usize,
     pub offset: usize,
 }
 
-/// Clock that runs in the audio callback, counting samples and emitting triggers.
+/// Per-step timebase p-lock data (one per track).
+/// Stores an optional `Timebase` index per step. `u32::MAX` = no override.
+pub struct TimebasePLockData {
+    overrides: [AtomicU32; MAX_STEPS],
+}
+
+impl TimebasePLockData {
+    pub fn new() -> Self {
+        Self {
+            overrides: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+        }
+    }
+
+    /// Get the timebase override for a step, or None if no p-lock.
+    pub fn get(&self, step: usize) -> Option<Timebase> {
+        let v = self.overrides[step].load(Ordering::Relaxed);
+        if v == u32::MAX {
+            None
+        } else {
+            Some(Timebase::from_index(v))
+        }
+    }
+
+    /// Set a timebase p-lock for a step.
+    pub fn set(&self, step: usize, tb: Timebase) {
+        self.overrides[step].store(tb as u32, Ordering::Relaxed);
+    }
+
+    /// Clear the p-lock for a step (revert to track default).
+    pub fn clear(&self, step: usize) {
+        self.overrides[step].store(u32::MAX, Ordering::Relaxed);
+    }
+
+    /// Check if a step has a p-lock.
+    pub fn has_plock(&self, step: usize) -> bool {
+        self.overrides[step].load(Ordering::Relaxed) != u32::MAX
+    }
+
+    /// Resolve timebase for a step: p-lock if set, else track default.
+    pub fn resolve(&self, step: usize, default: Timebase) -> Timebase {
+        self.get(step).unwrap_or(default)
+    }
+
+    /// Snapshot all overrides as Option<Timebase>.
+    pub fn snapshot(&self) -> [Option<u32>; MAX_STEPS] {
+        std::array::from_fn(|i| {
+            let v = self.overrides[i].load(Ordering::Relaxed);
+            if v == u32::MAX { None } else { Some(v) }
+        })
+    }
+
+    /// Restore from snapshot.
+    pub fn restore(&self, snap: &[Option<u32>; MAX_STEPS]) {
+        for (i, v) in snap.iter().enumerate() {
+            self.overrides[i].store(v.unwrap_or(u32::MAX), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-track clock state. Step position is derived from global beat counter,
+/// not accumulated — drift is impossible by construction.
+pub struct TrackClockState {
+    /// Last local step index (for detecting step transitions → triggers).
+    pub last_local_step: u32,
+    /// Cached samples_per_step for the current step (used by audio for gate/chop).
+    pub cached_sps: f64,
+    /// Precomputed cumulative beat boundaries for each step in the pattern.
+    /// boundaries[s] = beat offset where step s starts. boundaries[num_steps] = end of last step.
+    pub boundaries: [f64; MAX_STEPS + 1],
+    /// Precomputed end-of-step positions (may differ from boundaries[s+1] when dead space exists).
+    pub step_ends: [f64; MAX_STEPS],
+    /// Total cycle length in beats.
+    pub cycle_beats: f64,
+}
+
+/// Clock that runs in the audio callback, counting beats and emitting
+/// per-track triggers. Uses beat-based derivation so tracks never drift
+/// from the global bar grid regardless of mixed timebases or p-locks.
 pub struct SequencerClock {
     sample_rate: f64,
-    sample_counter: f64,
-    samples_per_step: f64,
+    /// Total beats (quarter notes) elapsed since play start.
+    /// THE single source of truth for all timing.
+    total_beats: f64,
+    /// Per-track state.
+    pub track_clocks: Vec<TrackClockState>,
     was_playing: bool,
 }
 
 impl SequencerClock {
-    pub fn new(sample_rate: u32, bpm: u32) -> Self {
-        let sr = sample_rate as f64;
-        let samples_per_step = sr * 60.0 / bpm as f64 / 4.0;
+    pub fn new(sample_rate: u32, _bpm: u32) -> Self {
+        let track_clocks = (0..MAX_TRACKS)
+            .map(|_| TrackClockState {
+                last_local_step: u32::MAX,
+                cached_sps: 0.0,
+                boundaries: [0.0; MAX_STEPS + 1],
+                step_ends: [0.0; MAX_STEPS],
+                cycle_beats: 4.0,
+            })
+            .collect();
         Self {
-            sample_rate: sr,
-            sample_counter: 0.0,
-            samples_per_step,
+            sample_rate: sample_rate as f64,
+            total_beats: 0.0,
+            track_clocks,
             was_playing: false,
         }
     }
 
-    pub fn update_bpm(&mut self, bpm: u32) {
-        self.samples_per_step = self.sample_rate * 60.0 / bpm as f64 / 4.0;
+    /// Get the cached samples_per_step for a track's current step.
+    pub fn samples_per_step_for_track(&self, track: usize) -> f64 {
+        self.track_clocks[track].cached_sps
     }
 
+    /// Global 16th-note samples_per_step (for backward compat).
     pub fn current_samples_per_step(&self) -> f64 {
-        self.samples_per_step
+        // Derived from current BPM — callers should use samples_per_step_for_track when possible
+        // This is a fallback; the actual value is set each block.
+        self.sample_rate * 60.0 / 120.0 / 4.0 // placeholder, overwritten in process_block
     }
 
-    pub fn process_block(&mut self, nframes: usize, state: &SequencerState) -> Vec<Trigger> {
+    /// Precompute step beat-boundaries for a track (call once per block per track).
+    ///
+    /// Steps fill bars sequentially. If a step wouldn't fit in the remaining bar
+    /// space, the accumulator pads forward to the next bar boundary (dead space),
+    /// and the step starts on the downbeat. This guarantees every bar starts clean
+    /// and the pattern stays locked to the global bar grid.
+    fn precompute_boundaries(&mut self, state: &SequencerState, track: usize) {
+        const BAR_BEATS: f64 = 4.0;
+        const EPS: f64 = 1e-9;
+
+        let tp = &state.track_params[track];
+        let ns = tp.get_num_steps();
+        let default_tb = tp.get_timebase();
+        let tc = &mut self.track_clocks[track];
+
+        let mut accum = 0.0;
+
+        for s in 0..ns {
+            let tb = state.timebase_plocks[track].resolve(s, default_tb);
+            let step_dur = tb.step_beats(ns);
+
+            tc.boundaries[s] = accum;
+            tc.step_ends[s] = accum + step_dur;
+            accum += step_dur;
+        }
+
+        // boundaries[ns] = end of last step (where dead space begins)
+        tc.boundaries[ns] = accum;
+
+        // Snap total cycle to next whole-bar boundary (must be >= accum).
+        // First round down, then bump up only if that's too short.
+        let bars_floor = (accum / BAR_BEATS).floor();
+        let cycle = bars_floor * BAR_BEATS;
+        tc.cycle_beats = if cycle >= accum - 1e-9 {
+            cycle.max(BAR_BEATS)
+        } else {
+            (bars_floor + 1.0).max(1.0) * BAR_BEATS
+        };
+    }
+
+    /// Derive the local step index from the current beat position within a track's cycle.
+    /// Returns None if we're in dead space (past all steps, waiting for next bar boundary).
+    fn derive_local_step(tc: &TrackClockState, pos_in_cycle: f64, num_steps: usize) -> Option<usize> {
+        // Past the end of the last step? Dead space until next cycle.
+        if pos_in_cycle >= tc.boundaries[num_steps] {
+            return None;
+        }
+        // Reverse scan: find the last boundary <= pos_in_cycle
+        for s in (0..num_steps).rev() {
+            if pos_in_cycle >= tc.boundaries[s] {
+                // Check we're still within this step's actual duration
+                // (there may be dead-space padding between step_ends[s] and boundaries[s+1])
+                if pos_in_cycle < tc.step_ends[s] {
+                    return Some(s);
+                } else {
+                    return None; // In dead space between steps
+                }
+            }
+        }
+        Some(0)
+    }
+
+    pub fn process_block(
+        &mut self,
+        nframes: usize,
+        state: &SequencerState,
+    ) -> Vec<Trigger> {
         if !state.is_playing() {
             self.was_playing = false;
             return Vec::new();
         }
 
-        let bpm = state.bpm.load(Ordering::Relaxed);
-        self.update_bpm(bpm);
+        let bpm = state.bpm.load(Ordering::Relaxed) as f64;
+        let beats_per_sample = bpm / (self.sample_rate * 60.0);
+        let samples_per_quarter = self.sample_rate * 60.0 / bpm;
+        let num_tracks = state.active_track_count();
 
         if !self.was_playing {
             self.was_playing = true;
-            self.sample_counter = self.samples_per_step;
-            // u32::MAX so first wrapping_add(1) yields 0
-            state.playhead.store(u32::MAX, Ordering::Relaxed);
-        }
-
-        let mut triggers = Vec::new();
-        let mut current_step = state.playhead.load(Ordering::Relaxed);
-
-        for offset in 0..nframes {
-            self.sample_counter += 1.0;
-            if self.sample_counter >= self.samples_per_step {
-                self.sample_counter -= self.samples_per_step;
-                current_step = current_step.wrapping_add(1);
-                state.playhead.store(current_step, Ordering::Relaxed);
-                triggers.push(Trigger {
-                    step: current_step as usize,
-                    offset,
-                });
+            self.total_beats = 0.0;
+            for t in 0..MAX_TRACKS {
+                self.track_clocks[t].last_local_step = u32::MAX;
             }
         }
 
-        // Publish fractional phase so UI can round-to-nearest-step when recording.
-        let phase = (self.sample_counter / self.samples_per_step) as f32;
-        state.playhead_phase.store(phase.to_bits(), Ordering::Relaxed);
+        // Precompute beat-boundaries for all active tracks
+        for t in 0..num_tracks {
+            self.precompute_boundaries(state, t);
+        }
+
+        let mut triggers = Vec::new();
+
+        for offset in 0..nframes {
+            self.total_beats += beats_per_sample;
+
+            // Global playhead: derive 16th-note step from beat position
+            let global_16th = (self.total_beats / 0.25) as u32;
+            state.playhead.store(global_16th, Ordering::Relaxed);
+
+            // Per-track step derivation
+            for t in 0..num_tracks {
+                let ns = state.track_params[t].get_num_steps();
+                let tc = &self.track_clocks[t];
+                let cycle = tc.cycle_beats;
+                if cycle <= 0.0 {
+                    continue;
+                }
+
+                // Position within the bar-snapped cycle
+                let pos_in_cycle = self.total_beats % cycle;
+
+                match Self::derive_local_step(tc, pos_in_cycle, ns) {
+                    Some(step) => {
+                        let step_u32 = step as u32;
+                        if step_u32 != self.track_clocks[t].last_local_step {
+                            let tc = &mut self.track_clocks[t];
+                            tc.last_local_step = step_u32;
+
+                            // Update cached sps for gate/chop calculations
+                            let default_tb = state.track_params[t].get_timebase();
+                            let tb = state.timebase_plocks[t].resolve(step, default_tb);
+                            tc.cached_sps = tb.step_beats(ns) * samples_per_quarter;
+
+                            // Publish track playhead for UI
+                            state.track_playheads[t].store(step_u32, Ordering::Relaxed);
+
+                            triggers.push(Trigger {
+                                track: t,
+                                step,
+                                offset,
+                            });
+                        }
+                    }
+                    None => {
+                        // Dead space: past all steps, waiting for next bar boundary.
+                        // Use a sentinel so we re-trigger step 0 when the cycle wraps.
+                        self.track_clocks[t].last_local_step = u32::MAX;
+                    }
+                }
+            }
+        }
+
+        // Publish fractional phase for recording quantize
+        let phase_16th = (self.total_beats / 0.25).fract() as f32;
+        state.playhead_phase.store(phase_16th.to_bits(), Ordering::Relaxed);
 
         triggers
     }

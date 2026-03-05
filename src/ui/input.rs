@@ -139,6 +139,9 @@ impl App {
                 self.state.toggle_play();
                 if was_playing {
                     self.state.playhead.store(0, Ordering::Relaxed);
+                    for tph in &self.state.track_playheads {
+                        tph.store(0, Ordering::Relaxed);
+                    }
                 }
                 return;
             }

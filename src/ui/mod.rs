@@ -39,8 +39,9 @@ const TP_ATTACK: usize = 1;
 const TP_RELEASE: usize = 2;
 const TP_SWING: usize = 3;
 const TP_STEPS: usize = 4;
-const TP_SEND: usize = 5;
-const TP_POLY: usize = 6;
+const TP_TIMEBASE: usize = 5;
+const TP_SEND: usize = 6;
+const TP_POLY: usize = 7;
 const TP_LAST: usize = TP_POLY;
 
 struct PendingCompile {
@@ -151,6 +152,8 @@ pub struct App {
     pub effect_param_cursor: usize, // param index within focused slot
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
+    /// True when the dropdown is for a track param (e.g. timebase), false for effect params.
+    pub track_param_dropdown: bool,
     pub layout: LayoutRects,
     last_step_click: Option<(usize, Instant)>, // (step, time) for double-click detection
     last_x_press: Option<Instant>,              // for xx (clear pattern) detection
@@ -265,6 +268,7 @@ impl App {
             effect_param_cursor: 0,
             dropdown_open: false,
             dropdown_cursor: 0,
+            track_param_dropdown: false,
             layout: LayoutRects::default(),
             last_step_click: None,
             last_x_press: None,

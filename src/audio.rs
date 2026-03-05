@@ -194,7 +194,7 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     }
     let sd = &data.state.step_data[track_idx];
     let tp = &data.state.track_params[track_idx];
-    let samples_per_step = data.clock.current_samples_per_step();
+    let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
 
     let chop = sd.get(step, StepParam::Chop).round() as u32;
     let chop = chop.max(1);
@@ -348,7 +348,6 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     }
 
     let triggers = data.clock.process_block(nframes, &data.state);
-    let samples_per_step = data.clock.current_samples_per_step();
 
     // Push BPM to all delay nodes only when it changes
     let bpm = data.state.bpm.load(Ordering::Relaxed);
@@ -372,37 +371,36 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         }
     }
 
-    // Process clock triggers
+    // Process clock triggers (each trigger is now per-track)
     for trigger in &triggers {
-        for track_idx in 0..num_tracks {
-            let num_steps = data.state.track_params[track_idx].get_num_steps();
-            let local_step = trigger.step % num_steps;
-            if data.state.patterns[track_idx].is_active(local_step) {
-                // Dispatch unified effect chain p-locks
-                unsafe {
-                    dispatch_effect_chain_for_track(
-                        data.lg.0,
-                        &data.state,
-                        track_idx,
-                        local_step,
-                    );
-                }
+        let track_idx = trigger.track;
+        let local_step = trigger.step; // already local (derived by clock)
+        if data.state.patterns[track_idx].is_active(local_step) {
+            // Dispatch unified effect chain p-locks
+            unsafe {
+                dispatch_effect_chain_for_track(
+                    data.lg.0,
+                    &data.state,
+                    track_idx,
+                    local_step,
+                );
+            }
 
-                let tp = &data.state.track_params[track_idx];
-                let swing_pct = tp.get_swing();
-                let is_odd_step = local_step % 2 == 1;
+            let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
+            let tp = &data.state.track_params[track_idx];
+            let swing_pct = tp.get_swing();
+            let is_odd_step = local_step % 2 == 1;
 
-                if is_odd_step && swing_pct > 50.0 {
-                    // Delay this trigger by swing amount
-                    let swing_delay = (swing_pct as f64 / 100.0 - 0.5) * samples_per_step;
-                    data.swing_state[track_idx] = SwingPending {
-                        countdown: swing_delay,
-                        step: local_step,
-                        active: true,
-                    };
-                } else {
-                    fire_step_trigger(data, track_idx, local_step);
-                }
+            if is_odd_step && swing_pct > 50.0 {
+                // Delay this trigger by swing amount
+                let swing_delay = (swing_pct as f64 / 100.0 - 0.5) * samples_per_step;
+                data.swing_state[track_idx] = SwingPending {
+                    countdown: swing_delay,
+                    step: local_step,
+                    active: true,
+                };
+            } else {
+                fire_step_trigger(data, track_idx, local_step);
             }
         }
     }

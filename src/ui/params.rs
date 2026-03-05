@@ -3,13 +3,19 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::sync::atomic::Ordering;
 
-use crate::sequencer::MAX_STEPS;
+use crate::sequencer::{Timebase, MAX_STEPS};
 
 use super::effects::draw_effects_column;
 use super::{
     App, InputMode, Region, TP_ATTACK, TP_GATE, TP_LAST, TP_POLY, TP_RELEASE, TP_SEND, TP_STEPS,
-    TP_SWING,
+    TP_SWING, TP_TIMEBASE,
 };
+
+/// Static labels for the timebase dropdown.
+const TIMEBASE_LABELS: [&str; Timebase::COUNT] = [
+    "1", "2", "4", "8", "16", "32", "64",
+    "2T", "4T", "8T", "16T", "32T", "64T", "Prh",
+];
 
 // ── App impl: params input ──
 
@@ -49,6 +55,20 @@ impl App {
                     tp.toggle_gate();
                 } else if self.track_param_cursor == TP_POLY {
                     tp.toggle_polyphonic();
+                } else if self.track_param_cursor == TP_TIMEBASE {
+                    self.dropdown_open = true;
+                    self.track_param_dropdown = true;
+                    // Show p-locked value for selected step, or track default
+                    let current_tb = if self.has_selection() {
+                        let step = self.selected_steps()[0];
+                        self.state.timebase_plocks[self.cursor_track]
+                            .get(step)
+                            .unwrap_or(tp.get_timebase())
+                    } else {
+                        tp.get_timebase()
+                    };
+                    self.dropdown_cursor = current_tb as u8 as usize;
+                    self.input_mode = InputMode::Dropdown;
                 }
             }
             KeyCode::Char('+') | KeyCode::Char('=') => match self.track_param_cursor {
@@ -58,6 +78,10 @@ impl App {
                 TP_STEPS => {
                     tp.set_num_steps(tp.get_num_steps() + 1);
                     self.clamp_cursor_to_steps();
+                }
+                TP_TIMEBASE => {
+                    tp.next_timebase();
+
                 }
                 TP_SEND => self.adjust_track_send(0.05),
                 _ => {}
@@ -70,11 +94,27 @@ impl App {
                     tp.set_num_steps(tp.get_num_steps().saturating_sub(1).max(1));
                     self.clamp_cursor_to_steps();
                 }
+                TP_TIMEBASE => {
+                    tp.prev_timebase();
+
+                }
                 TP_SEND => self.adjust_track_send(-0.05),
                 _ => {}
             },
+            KeyCode::Backspace | KeyCode::Delete => {
+                // Clear timebase p-locks on selected steps
+                if self.track_param_cursor == TP_TIMEBASE && self.has_selection() {
+                    for step in self.selected_steps() {
+                        self.state.timebase_plocks[self.cursor_track].clear(step);
+                    }
+
+                }
+            }
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                if self.track_param_cursor > TP_GATE && self.track_param_cursor != TP_POLY {
+                if self.track_param_cursor > TP_GATE
+                    && self.track_param_cursor != TP_POLY
+                    && self.track_param_cursor != TP_TIMEBASE
+                {
                     self.value_buffer.clear();
                     self.value_buffer.push(c);
                     self.input_mode = InputMode::ValueEntry;
@@ -124,10 +164,12 @@ impl App {
             KeyCode::Enter => {
                 self.apply_dropdown_selection();
                 self.dropdown_open = false;
+                self.track_param_dropdown = false;
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
                 self.dropdown_open = false;
+                self.track_param_dropdown = false;
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -135,6 +177,9 @@ impl App {
     }
 
     fn dropdown_max_items(&self) -> usize {
+        if self.track_param_dropdown {
+            return Timebase::COUNT;
+        }
         if let Some(desc) = self.current_slot_descriptor() {
             if self.effect_param_cursor < desc.params.len() {
                 if let crate::effects::ParamKind::Enum { ref labels } =
@@ -161,6 +206,20 @@ impl App {
     }
 
     fn apply_dropdown_selection(&self) {
+        if self.track_param_dropdown {
+            let tb = Timebase::from_index(self.dropdown_cursor as u32);
+            if self.has_selection() {
+                // P-lock: set timebase override for selected steps
+                for step in self.selected_steps() {
+                    self.state.timebase_plocks[self.cursor_track].set(step, tb);
+                }
+            } else {
+                // Track default
+                self.state.track_params[self.cursor_track].set_timebase(tb);
+            }
+            return;
+        }
+
         let val = self.dropdown_cursor as f32;
         let param_idx = self.effect_param_cursor;
 
@@ -223,6 +282,17 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     let release = tp.get_release_ms();
     let swing = tp.get_swing();
     let steps = tp.get_num_steps();
+    let default_tb = tp.get_timebase();
+    // Show p-locked timebase for selected step, or track default
+    let timebase_display = if app.has_selection() {
+        let step = app.selected_steps()[0]; // show first selected step's value
+        match app.state.timebase_plocks[app.cursor_track].get(step) {
+            Some(tb) => format!("{} [P]", tb.label()),
+            None => default_tb.label().to_string(),
+        }
+    } else {
+        default_tb.label().to_string()
+    };
 
     let send = tp.get_send();
 
@@ -251,6 +321,11 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
             "steps",
             format!("{}", steps),
             Some(steps as f32 / MAX_STEPS as f32),
+        ),
+        (
+            "timebase",
+            timebase_display,
+            None,
         ),
         ("send", format!("{:.2}", send), Some(send)),
         (
@@ -335,10 +410,21 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
         let row_area = Rect::new(inner.x, y, inner.width, 1);
         frame.render_widget(Paragraph::new(line), row_area);
     }
+
+    // Track param dropdown overlay (e.g. timebase)
+    if app.dropdown_open && app.track_param_dropdown && col_focused {
+        draw_track_param_dropdown(frame, app, inner);
+    }
 }
 
-pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let items = app.dropdown_labels();
+/// Draw a generic dropdown overlay given a list of item labels.
+fn draw_dropdown_items(
+    frame: &mut Frame,
+    items: &[&str],
+    cursor: usize,
+    area: Rect,
+    anchor_row: u16,
+) {
     if items.is_empty() {
         return;
     }
@@ -354,14 +440,14 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Scroll so the cursor is always visible
-    let scroll = if app.dropdown_cursor >= visible_count {
-        app.dropdown_cursor + 1 - visible_count
+    let scroll = if cursor >= visible_count {
+        cursor + 1 - visible_count
     } else {
         0
     };
 
-    // Position: try to start at the param row, but shift up if it would overflow
-    let ideal_y = area.y + app.effect_param_cursor as u16;
+    // Position: try to start at the anchor row, but shift up if it would overflow
+    let ideal_y = area.y + anchor_row;
     let dropdown_y = ideal_y.min((area.y + area.height).saturating_sub(visible_count as u16));
 
     for vi in 0..visible_count {
@@ -370,7 +456,7 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
         let y = dropdown_y + vi as u16;
-        let is_cursor = i == app.dropdown_cursor;
+        let is_cursor = i == cursor;
         let style = if is_cursor {
             Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
@@ -384,4 +470,19 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let cell = Rect::new(dropdown_x, y, dropdown_width, 1);
         frame.render_widget(Paragraph::new(text).style(style), cell);
     }
+}
+
+pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<&str> = app.dropdown_labels().iter().map(|s| s.as_str()).collect();
+    draw_dropdown_items(frame, &items, app.dropdown_cursor, area, app.effect_param_cursor as u16);
+}
+
+pub(super) fn draw_track_param_dropdown(frame: &mut Frame, app: &App, area: Rect) {
+    draw_dropdown_items(
+        frame,
+        &TIMEBASE_LABELS,
+        app.dropdown_cursor,
+        area,
+        app.track_param_cursor as u16,
+    );
 }
