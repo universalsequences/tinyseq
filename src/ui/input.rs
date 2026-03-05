@@ -514,10 +514,20 @@ impl App {
             && col < l.effects_block.x + l.effects_block.width
         {
             if let Some(slot_idx) = self.effect_tab_from_click_x(col) {
-                self.effect_slot_cursor = slot_idx;
-                self.effect_param_cursor = 0;
-                self.focused_region = Region::Params;
-                self.params_column = 1;
+                if slot_idx == Self::PLUS_BUTTON {
+                    // Open effect picker (same as Ctrl+L)
+                    if !self.tracks.is_empty() {
+                        self.picker_items = lisp_effect::list_saved_effects();
+                        self.picker_cursor = 0;
+                        self.picker_filter.clear();
+                        self.input_mode = InputMode::EffectPicker;
+                    }
+                } else {
+                    self.effect_slot_cursor = slot_idx;
+                    self.effect_param_cursor = 0;
+                    self.focused_region = Region::Params;
+                    self.params_column = 1;
+                }
             }
             return;
         }
@@ -598,11 +608,11 @@ impl App {
     }
 
     /// Returns the slot index for a click on the effect tab bar, or None.
+    /// Returns `Some(PLUS_BUTTON)` when the [+] button is clicked.
+    const PLUS_BUTTON: usize = usize::MAX - 1;
+
     fn effect_tab_from_click_x(&self, col: u16) -> Option<usize> {
         let visible = self.visible_effect_indices();
-        if visible.is_empty() {
-            return None;
-        }
         let descs = self.effect_descriptors.get(self.cursor_track)?;
         let mut x = self.layout.effects_block.x + 1;
         for &i in &visible {
@@ -616,6 +626,20 @@ impl App {
                 return Some(i);
             }
             x += tab_width + 1; // matches the " " separator in rendering
+        }
+        // Check [+] button
+        if self.can_add_custom_effect() {
+            let plus_width: u16 = 3; // "[+]"
+            if col >= x && col < x + plus_width {
+                return Some(Self::PLUS_BUTTON);
+            }
+            x += plus_width;
+        }
+        // Check Reverb tab (after " " separator)
+        x += 1;
+        let reverb_width: u16 = 12; // "[  Reverb  ]" or "[< Reverb >]"
+        if col >= x && col < x + reverb_width {
+            return Some(REVERB_TAB);
         }
         None
     }

@@ -43,14 +43,13 @@ impl App {
             return Vec::new();
         }
         let track = self.cursor_track;
-        let chain = &self.state.effect_chains[track];
         let descs = &self.effect_descriptors[track];
         let mut visible = Vec::new();
         for i in 0..descs.len() {
             if i < BUILTIN_SLOT_COUNT {
                 visible.push(i); // Always show built-in
-            } else if i < chain.len() && chain[i].node_id.load(Ordering::Relaxed) != 0 {
-                visible.push(i); // Show loaded custom
+            } else if !descs[i].name.is_empty() {
+                visible.push(i); // Show loaded custom (by descriptor, not pattern-local node_id)
             }
         }
         visible
@@ -102,7 +101,7 @@ impl App {
     }
 
     /// Whether there are fewer than MAX_CUSTOM_FX loaded custom effects (can add more).
-    fn can_add_custom_effect(&self) -> bool {
+    pub(super) fn can_add_custom_effect(&self) -> bool {
         self.next_free_custom_slot().is_some()
     }
 
