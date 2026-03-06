@@ -449,7 +449,7 @@ impl App {
             }
             self.ui.focused_region = Region::Sidebar;
             if self.effective_sidebar_mode() == SidebarMode::Presets {
-                let list_start_y = l.sidebar_inner.y + 2;
+                let list_start_y = l.sidebar_inner.y + 3;
                 if row >= list_start_y {
                     let vi = (row - list_start_y) as usize;
                     let idx = self.preset_browser.scroll_offset + vi;

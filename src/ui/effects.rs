@@ -662,6 +662,24 @@ impl App {
         items
     }
 
+    pub(super) fn instrument_usage_count(&self, instrument_name: &str) -> usize {
+        self.graph
+            .track_engine_ids
+            .iter()
+            .filter_map(|engine_id| engine_id.and_then(|id| self.editor.cached_instruments.get(id)))
+            .filter(|engine| engine.name == instrument_name)
+            .count()
+    }
+
+    pub(super) fn instrument_picker_label(&self, instrument_name: &str) -> String {
+        let usage_count = self.instrument_usage_count(instrument_name);
+        if usage_count == 0 {
+            instrument_name.to_string()
+        } else {
+            format!("{instrument_name}  [in use x{usage_count}]")
+        }
+    }
+
     /// Spawn a background thread to compile an instrument.
     fn start_instrument_compile(&mut self, name: &str) {
         let source = match lisp_effect::load_instrument_source(name) {
@@ -2015,6 +2033,11 @@ pub(super) fn draw_instrument_picker(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
         let is_cursor = i == app.editor.picker_cursor;
+        let display_text = if item == "+ New instrument" {
+            item.clone()
+        } else {
+            app.instrument_picker_label(item)
+        };
         let style = if is_cursor {
             Style::default().fg(Color::Black).bg(Color::White)
         } else if item == "+ New instrument" {
@@ -2023,7 +2046,7 @@ pub(super) fn draw_instrument_picker(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Gray)
         };
         let prefix = if is_cursor { " > " } else { "   " };
-        let truncated: String = item
+        let truncated: String = display_text
             .chars()
             .take((inner.width as usize).saturating_sub(4))
             .collect();

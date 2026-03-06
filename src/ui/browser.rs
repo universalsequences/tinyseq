@@ -459,6 +459,10 @@ impl App {
         items
     }
 
+    pub(super) fn current_preset_engine_name(&self) -> Option<&str> {
+        self.current_custom_instrument_name()
+    }
+
     fn current_track_preset_meta(&self) -> crate::sequencer::TrackPresetMeta {
         self.state
             .track_preset_meta
@@ -507,8 +511,8 @@ impl App {
 
     pub(super) fn preset_max_visible(&self) -> usize {
         let h = self.ui.layout.sidebar_inner.height as usize;
-        if h > 2 {
-            h - 2
+        if h > 3 {
+            h - 3
         } else {
             1
         }
@@ -774,8 +778,10 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.effective_sidebar_mode() == SidebarMode::Presets {
         app.clamp_preset_browser();
         let items = app.visible_preset_items();
-        let max_visible = (inner.height as usize).saturating_sub(2);
+        let max_visible = (inner.height as usize).saturating_sub(3);
         let meta = app.current_track_preset_meta();
+        let engine_name = app.current_preset_engine_name().unwrap_or("None");
+        let engine_header = format!(" engine: {}", engine_name);
         let loaded = meta
             .loaded_preset
             .clone()
@@ -783,10 +789,17 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         let header = format!(" preset: {}{}", loaded, if meta.dirty { " *" } else { "" });
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
+                engine_header,
+                Style::default().fg(Color::Cyan),
+            ))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
                 header,
                 Style::default().fg(Color::White),
             ))),
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
         if focused {
             let filter_text = format!("> {}\u{2588}", app.preset_browser.filter);
@@ -795,10 +808,10 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     filter_text,
                     Style::default().fg(Color::White),
                 ))),
-                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                Rect::new(inner.x, inner.y + 2, inner.width, 1),
             );
         }
-        let list_start_y = inner.y + 2;
+        let list_start_y = inner.y + 3;
         let scroll = app.preset_browser.scroll_offset;
         for (vi, i) in (scroll..items.len()).enumerate() {
             if vi >= max_visible {

@@ -1,4 +1,4 @@
-pub const MAX_VOICES: usize = 6;
+pub const MAX_VOICES: usize = 12;
 
 pub struct VoiceSlot {
     pub logical_id: u64,
@@ -120,7 +120,7 @@ mod tests {
     fn prefers_long_idle_inactive_voices_over_recently_released_ones() {
         let mut pool = VoicePool::new();
         pool.polyphonic = true;
-        for lid in 1..=6 {
+        for lid in 1..=12 {
             pool.add_voice(lid, lid as i32);
         }
 
