@@ -25,6 +25,64 @@ fn fit_cell(text: &str, width: usize) -> String {
 // ── App impl: effect methods ──
 
 impl App {
+    fn cached_instrument_engine_idx(&self, name: &str, source: &str) -> Option<usize> {
+        self.editor
+            .cached_instruments
+            .iter()
+            .position(|entry| entry.name == name && entry.source == source)
+    }
+
+    fn cache_instrument_engine(
+        &mut self,
+        name: &str,
+        source: &str,
+        manifest: &lisp_effect::DGenManifest,
+        lib: lisp_effect::LoadedDGenLib,
+    ) -> usize {
+        let lib_index = self.editor.instrument_libs.len();
+        self.editor.instrument_libs.push(lib);
+        let entry = super::CachedInstrumentEngine {
+            name: name.to_string(),
+            source: source.to_string(),
+            manifest: manifest.clone(),
+            lib_index,
+        };
+        if let Some(existing_idx) = self.cached_instrument_engine_idx(name, source) {
+            self.editor.cached_instruments[existing_idx] = entry;
+            existing_idx
+        } else {
+            self.editor.cached_instruments.push(entry);
+            self.editor.cached_instruments.len() - 1
+        }
+    }
+
+    fn try_add_cached_instrument_track(&mut self, name: &str, source: &str) -> bool {
+        let Some(cache_idx) = self.cached_instrument_engine_idx(name, source) else {
+            return false;
+        };
+        let manifest = self.editor.cached_instruments[cache_idx].manifest.clone();
+        let lib_index = self.editor.cached_instruments[cache_idx].lib_index;
+        let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+        match unsafe {
+            self.graph_controller()
+                .add_custom_track(name, cache_idx, &manifest, &*lib_ptr)
+        } {
+            Ok(idx) => {
+                self.ui.cursor_track = idx;
+                self.ui.sidebar_mode = super::SidebarMode::Presets;
+                self.ui.focused_region = super::Region::Cirklon;
+                self.editor.status_message = Some((
+                    format!("Added synth track '{}' (cached)", name),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.editor.status_message = Some((format!("Error: {}", e), Instant::now()));
+            }
+        }
+        true
+    }
+
     fn instrument_base_note_offset(&self, track: usize) -> f32 {
         f32::from_bits(self.state.instrument_base_note_offsets[track].load(Ordering::Relaxed))
     }
@@ -378,14 +436,18 @@ impl App {
         result: lisp_effect::CompileResult,
         name: &str,
     ) {
-        match self
-            .graph_controller()
-            .add_custom_track(name, &result.manifest, &result.lib)
-        {
+        let source = lisp_effect::load_instrument_source(name).unwrap_or_default();
+        let cache_idx = self.cache_instrument_engine(name, &source, &result.manifest, result.lib);
+        let manifest = self.editor.cached_instruments[cache_idx].manifest.clone();
+        let lib_index = self.editor.cached_instruments[cache_idx].lib_index;
+        let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+        match unsafe {
+            self.graph_controller()
+                .add_custom_track(name, cache_idx, &manifest, &*lib_ptr)
+        } {
             Ok(idx) => {
                 self.ui.cursor_track = idx;
-                self.editor.instrument_libs.push(result.lib);
-                self.ui.sidebar_mode = super::SidebarMode::Audition;
+                self.ui.sidebar_mode = super::SidebarMode::Presets;
                 self.ui.focused_region = super::Region::Cirklon;
                 self.editor.status_message =
                     Some((format!("Added synth track '{}'", name), Instant::now()));
@@ -416,13 +478,21 @@ impl App {
 
             if is_existing_custom {
                 let track = self.ui.cursor_track;
-                match self
-                    .graph_controller()
-                    .hot_reload_instrument(track, &r.manifest, &r.lib)
-                {
+                let cache_idx =
+                    self.cache_instrument_engine(&r.name, &r.source, &r.manifest, r.lib);
+                let manifest = self.editor.cached_instruments[cache_idx].manifest.clone();
+                let lib_index = self.editor.cached_instruments[cache_idx].lib_index;
+                let lib_ptr: *const lisp_effect::LoadedDGenLib =
+                    &self.editor.instrument_libs[lib_index];
+                match unsafe {
+                    self.graph_controller()
+                        .hot_reload_instrument(track, &manifest, &*lib_ptr)
+                } {
                     Ok(()) => {
                         self.tracks[self.ui.cursor_track] = r.name.clone();
-                        self.editor.instrument_libs.push(r.lib);
+                        if track < self.graph.track_engine_ids.len() {
+                            self.graph.track_engine_ids[track] = Some(cache_idx);
+                        }
                         self.editor.status_message =
                             Some((format!("Reloaded instrument '{}'", r.name), Instant::now()));
                     }
@@ -432,14 +502,19 @@ impl App {
                     }
                 }
             } else {
-                match self
-                    .graph_controller()
-                    .add_custom_track(&r.name, &r.manifest, &r.lib)
-                {
+                let cache_idx =
+                    self.cache_instrument_engine(&r.name, &r.source, &r.manifest, r.lib);
+                let manifest = self.editor.cached_instruments[cache_idx].manifest.clone();
+                let lib_index = self.editor.cached_instruments[cache_idx].lib_index;
+                let lib_ptr: *const lisp_effect::LoadedDGenLib =
+                    &self.editor.instrument_libs[lib_index];
+                match unsafe {
+                    self.graph_controller()
+                        .add_custom_track(&r.name, cache_idx, &manifest, &*lib_ptr)
+                } {
                     Ok(idx) => {
                         self.ui.cursor_track = idx;
-                        self.editor.instrument_libs.push(r.lib);
-                        self.ui.sidebar_mode = super::SidebarMode::Audition;
+                        self.ui.sidebar_mode = super::SidebarMode::Presets;
                         self.ui.focused_region = super::Region::Cirklon;
                         self.editor.status_message =
                             Some((format!("Added synth track '{}'", r.name), Instant::now()));
@@ -596,6 +671,9 @@ impl App {
                 return;
             }
         };
+        if self.try_add_cached_instrument_track(name, &source) {
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let sample_rate = self.graph.sample_rate;
         std::thread::spawn(move || {

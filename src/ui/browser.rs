@@ -430,6 +430,12 @@ impl App {
     fn current_custom_instrument_name(&self) -> Option<&str> {
         if self.tracks.is_empty() || self.is_sampler_track(self.ui.cursor_track) {
             None
+        } else if let Some(Some(engine_id)) = self.graph.track_engine_ids.get(self.ui.cursor_track)
+        {
+            self.editor
+                .cached_instruments
+                .get(*engine_id)
+                .map(|engine| engine.name.as_str())
         } else {
             self.tracks.get(self.ui.cursor_track).map(String::as_str)
         }

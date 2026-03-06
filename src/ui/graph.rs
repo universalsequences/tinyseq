@@ -34,6 +34,7 @@ enum InstrumentRegistration<'a> {
         sampler_ids: Vec<i32>,
     },
     Custom {
+        engine_id: usize,
         synth_ids: Vec<i32>,
         gatepitch_ids: Vec<i32>,
         manifest: &'a DGenManifest,
@@ -85,6 +86,7 @@ impl GraphController<'_> {
     pub fn add_custom_track(
         &mut self,
         name: &str,
+        engine_id: usize,
         manifest: &DGenManifest,
         lib: &LoadedDGenLib,
     ) -> Result<usize, String> {
@@ -101,6 +103,7 @@ impl GraphController<'_> {
             shell,
             voice_lids: voices.voice_lids,
             instrument: InstrumentRegistration::Custom {
+                engine_id,
                 synth_ids: voices.synth_ids,
                 gatepitch_ids: voices.gatepitch_ids,
                 manifest,
@@ -466,12 +469,14 @@ impl GraphController<'_> {
                 });
                 self.app.graph.track_synth_node_ids.push(Vec::new());
                 self.app.graph.track_gatepitch_node_ids.push(Vec::new());
+                self.app.graph.track_engine_ids.push(None);
                 self.app
                     .graph
                     .instrument_descriptors
                     .push(EffectDescriptor::empty_custom_slot());
             }
             InstrumentRegistration::Custom {
+                engine_id,
                 synth_ids,
                 gatepitch_ids,
                 manifest,
@@ -489,6 +494,7 @@ impl GraphController<'_> {
                 });
                 self.app.graph.track_synth_node_ids.push(synth_ids);
                 self.app.graph.track_gatepitch_node_ids.push(gatepitch_ids);
+                self.app.graph.track_engine_ids.push(Some(engine_id));
                 self.initialize_instrument_slot(idx, &track_name, manifest);
                 self.push_instrument_defaults(idx, manifest);
             }

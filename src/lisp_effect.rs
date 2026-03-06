@@ -118,6 +118,7 @@ fn dgenlisp_vtable() -> NodeVTable {
 
 // ── Manifest types ──
 
+#[derive(Clone)]
 pub struct DGenManifest {
     pub dylib_path: PathBuf,
     pub total_memory_slots: usize,
@@ -139,6 +140,7 @@ pub struct DGenParam {
     pub unit: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct TensorInit {
     pub offset: usize,
     pub data: Vec<f32>,

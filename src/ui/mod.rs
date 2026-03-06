@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::EffectDescriptor;
-use crate::lisp_effect::LoadedDGenLib;
+use crate::lisp_effect::{DGenManifest, LoadedDGenLib};
 use crate::sequencer::{
     InstrumentType, KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE,
 };
@@ -77,6 +77,13 @@ struct PendingCompile {
     tick: usize,
 }
 
+pub struct CachedInstrumentEngine {
+    pub name: String,
+    pub source: String,
+    pub manifest: DGenManifest,
+    pub lib_index: usize,
+}
+
 pub struct EditorState {
     pending_editor: Option<PendingEditor>,
     pending_compile: Option<PendingCompile>,
@@ -86,6 +93,7 @@ pub struct EditorState {
     pub picker_filter: String,
     pub picker_items: Vec<String>,
     pub status_message: Option<(String, Instant)>,
+    pub cached_instruments: Vec<CachedInstrumentEngine>,
 }
 
 pub struct BrowserState {
@@ -112,6 +120,7 @@ pub struct GraphState {
     pub track_buffer_ids: Vec<i32>,
     pub track_voice_lids: Vec<Vec<u64>>,
     pub track_instrument_types: Vec<InstrumentType>,
+    pub track_engine_ids: Vec<Option<usize>>,
     pub track_synth_node_ids: Vec<Vec<i32>>,
     pub track_gatepitch_node_ids: Vec<Vec<i32>>,
     pub effect_descriptors: Vec<Vec<EffectDescriptor>>,
@@ -337,6 +346,7 @@ impl App {
                 picker_filter: String::new(),
                 picker_items: Vec::new(),
                 status_message: None,
+                cached_instruments: Vec::new(),
             },
             browser: BrowserState {
                 tree: browser_tree,
@@ -360,6 +370,7 @@ impl App {
                 track_buffer_ids: Vec::new(),
                 track_voice_lids: Vec::new(),
                 track_instrument_types: Vec::new(),
+                track_engine_ids: Vec::new(),
                 track_synth_node_ids: Vec::new(),
                 track_gatepitch_node_ids: Vec::new(),
                 effect_descriptors: Vec::new(),
