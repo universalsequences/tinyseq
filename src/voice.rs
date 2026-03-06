@@ -46,7 +46,9 @@ impl VoicePool {
 
     /// Allocate a voice for the given note.
     /// Mono mode: always returns voice 0.
-    /// Poly mode: finds first free voice, or steals oldest.
+    /// Poly mode: prefers the oldest inactive voice, or steals the oldest active one.
+    /// This avoids immediately reusing a voice that just entered release when
+    /// there are other inactive voices available.
     pub fn allocate_voice(&mut self, note: f32) -> &mut VoiceSlot {
         self.age_counter += 1;
 
@@ -59,16 +61,18 @@ impl VoicePool {
             return slot;
         }
 
-        // Poly: find first free voice
+        // Poly: prefer the oldest inactive voice so freshly released voices are
+        // only reused after longer-idle voices have been consumed.
         let mut free_idx = None;
+        let mut free_age = u64::MAX;
         let mut oldest_idx = 0;
         let mut oldest_age = u64::MAX;
 
         for i in 0..self.num_voices {
             if !self.voices[i].active {
-                if free_idx.is_none() {
+                if self.voices[i].age < free_age {
                     free_idx = Some(i);
-                    break;
+                    free_age = self.voices[i].age;
                 }
             }
             if self.voices[i].age < oldest_age {
@@ -94,9 +98,41 @@ impl VoicePool {
         }
     }
 
+    pub fn release_voice_by_logical_id(&mut self, logical_id: u64) {
+        for i in 0..self.num_voices {
+            if self.voices[i].logical_id == logical_id {
+                self.voices[i].active = false;
+                return;
+            }
+        }
+    }
+
     pub fn all_logical_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.voices[..self.num_voices]
             .iter()
             .map(|v| v.logical_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VoicePool;
+
+    #[test]
+    fn prefers_long_idle_inactive_voices_over_recently_released_ones() {
+        let mut pool = VoicePool::new();
+        pool.polyphonic = true;
+        for lid in 1..=6 {
+            pool.add_voice(lid, lid as i32);
+        }
+
+        assert_eq!(pool.allocate_voice(0.0).logical_id, 1);
+        assert_eq!(pool.allocate_voice(4.0).logical_id, 2);
+
+        pool.release_voice_by_note(0.0);
+        pool.release_voice_by_note(4.0);
+
+        assert_eq!(pool.allocate_voice(7.0).logical_id, 3);
+        assert_eq!(pool.allocate_voice(11.0).logical_id, 4);
     }
 }

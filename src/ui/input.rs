@@ -24,7 +24,12 @@ impl App {
                     let slot_idx = pending.slot_idx;
                     let track = pending.cursor_track;
                     self.pending_compile = None;
-                    self.apply_compiled_effect(compile_result, &name, slot_idx, track);
+                    if slot_idx == usize::MAX {
+                        // Instrument compile result
+                        self.apply_compiled_instrument(compile_result, &name);
+                    } else {
+                        self.apply_compiled_effect(compile_result, &name, slot_idx, track);
+                    }
                 }
                 Ok(Err(e)) => {
                     self.status_message = Some((format!("Compile error: {}", e), Instant::now()));
@@ -98,6 +103,7 @@ impl App {
                         InputMode::Dropdown => self.handle_dropdown(key.code),
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
+                        InputMode::InstrumentPicker => self.handle_instrument_picker_overlay(key.code),
                         InputMode::StepInsert => {
                             self.handle_step_insert(key.code, key.modifiers)
                         }
@@ -175,6 +181,15 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Char('i') if modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+I: edit instrument on current custom track
+                if !self.tracks.is_empty() && !self.is_sampler_track(self.cursor_track) {
+                    let name = self.tracks[self.cursor_track].clone();
+                    self.pending_instrument_name = Some(name);
+                    self.pending_instrument_edit = true;
+                }
+                return;
+            }
             KeyCode::Tab => {
                 let leaving_sidebar = self.focused_region == Region::Sidebar;
                 self.focused_region = self.focused_region.next();
@@ -214,12 +229,10 @@ impl App {
                 }
                 return;
             }
-            // Ctrl+N: focus sidebar in AddTrack mode
+            // Ctrl+N: focus sidebar in InstrumentPicker mode
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.browser_cursor = 0;
-                self.browser_filter.clear();
-                self.browser_scroll_offset = 0;
-                self.sidebar_mode = SidebarMode::AddTrack;
+                self.instrument_picker_cursor = 0;
+                self.sidebar_mode = SidebarMode::InstrumentPicker;
                 self.focused_region = Region::Sidebar;
                 return;
             }
@@ -416,6 +429,7 @@ impl App {
                                 num_tracks,
                                 &self.track_buffer_ids,
                                 &self.tracks,
+                                &self.track_instrument_types,
                             ) {
                                 self.apply_sample_ids(&sample_ids);
                             }
@@ -423,9 +437,12 @@ impl App {
                         }
                         PatternBtn::Clone => {
                             let num_tracks = self.tracks.len();
-                            let new_idx = self
-                                .state
-                                .clone_pattern(num_tracks, &self.track_buffer_ids, &self.tracks);
+                            let new_idx = self.state.clone_pattern(
+                                num_tracks,
+                                &self.track_buffer_ids,
+                                &self.tracks,
+                                &self.track_instrument_types,
+                            );
                             // Show the page containing the new pattern
                             self.pattern_page = new_idx / 10;
                         }
@@ -435,6 +452,7 @@ impl App {
                                 num_tracks,
                                 &self.track_buffer_ids,
                                 &self.tracks,
+                                &self.track_instrument_types,
                             ) {
                                 self.apply_sample_ids(&sample_ids);
                             }
@@ -527,7 +545,13 @@ impl App {
                     }
                 } else {
                     self.effect_slot_cursor = slot_idx;
-                    self.effect_param_cursor = 0;
+                    if slot_idx == super::SYNTH_TAB {
+                        self.instrument_param_cursor = 0;
+                    } else if slot_idx == REVERB_TAB {
+                        self.reverb_param_cursor = 0;
+                    } else {
+                        self.effect_param_cursor = 0;
+                    }
                     self.focused_region = Region::Params;
                     self.params_column = 1;
                 }
@@ -538,7 +562,19 @@ impl App {
         // Effects inner: click selects effect param row
         if rect_contains(l.effects_inner, col, row) {
             let row_idx = (row - l.effects_inner.y) as usize;
-            if let Some(desc) = self.current_slot_descriptor() {
+            if self.effect_slot_cursor == super::SYNTH_TAB {
+                if row_idx < self.synth_row_count() {
+                    self.focused_region = Region::Params;
+                    self.params_column = 1;
+                    self.instrument_param_cursor = row_idx;
+                }
+            } else if self.effect_slot_cursor == REVERB_TAB {
+                if row_idx < 3 {
+                    self.focused_region = Region::Params;
+                    self.params_column = 1;
+                    self.reverb_param_cursor = row_idx;
+                }
+            } else if let Some(desc) = self.current_slot_descriptor() {
                 if row_idx < desc.params.len() {
                     self.focused_region = Region::Params;
                     self.params_column = 1;
@@ -614,12 +650,22 @@ impl App {
 
     /// Returns the slot index for a click on the effect tab bar, or None.
     /// Returns `Some(PLUS_BUTTON)` when the [+] button is clicked.
-    const PLUS_BUTTON: usize = usize::MAX - 1;
+    const PLUS_BUTTON: usize = usize::MAX - 2;
 
     fn effect_tab_from_click_x(&self, col: u16) -> Option<usize> {
         let visible = self.visible_effect_indices();
         let descs = self.effect_descriptors.get(self.cursor_track)?;
         let mut x = self.layout.effects_block.x + 1;
+
+        // Synth tab (prepended for custom instrument tracks)
+        if self.is_current_custom_track() {
+            let synth_width: u16 = 11; // "[< Synth >]" or "[  Synth  ]"
+            if col >= x && col < x + synth_width {
+                return Some(super::SYNTH_TAB);
+            }
+            x += synth_width + 1; // matches the " " separator in rendering
+        }
+
         for &i in &visible {
             if i >= descs.len() {
                 continue;
@@ -728,6 +774,35 @@ impl App {
                     }
                 } else if self.effect_slot_cursor == REVERB_TAB {
                     self.set_reverb_param(self.reverb_param_cursor, val);
+                } else if self.effect_slot_cursor == super::SYNTH_TAB {
+                    // Synth tab value entry
+                    let track = self.cursor_track;
+                    if self.instrument_param_cursor == 0 {
+                        let store_val = val.clamp(-48.0, 48.0);
+                        self.state.instrument_base_note_offsets[track]
+                            .store(store_val.to_bits(), Ordering::Relaxed);
+                    } else {
+                        let param_idx = self.instrument_param_cursor - 1;
+                        let desc = match self.instrument_descriptors.get(track) {
+                            Some(d) => d,
+                            None => return,
+                        };
+                        if param_idx >= desc.params.len() {
+                            return;
+                        }
+                        let param_desc = &desc.params[param_idx];
+                        let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
+                        let slot = &self.state.instrument_slots[track];
+
+                        if self.has_selection() {
+                            for step in self.selected_steps() {
+                                slot.plocks.set(step, param_idx, store_val);
+                            }
+                        } else {
+                            slot.defaults.set(param_idx, store_val);
+                            self.send_instrument_param(track, param_idx, store_val);
+                        }
+                    }
                 } else {
                     // Unified effect slot value entry
                     let track = self.cursor_track;
@@ -849,10 +924,12 @@ impl App {
             }
             KeyCode::Char('x') => {
                 let num_tracks = self.tracks.len();
-                if let Some(sample_ids) =
-                    self.state
-                        .delete_pattern(num_tracks, &self.track_buffer_ids, &self.tracks)
-                {
+                if let Some(sample_ids) = self.state.delete_pattern(
+                    num_tracks,
+                    &self.track_buffer_ids,
+                    &self.tracks,
+                    &self.track_instrument_types,
+                ) {
                     self.apply_sample_ids(&sample_ids);
                 }
                 self.clamp_cursor_to_steps();
@@ -863,8 +940,12 @@ impl App {
             KeyCode::Enter => {
                 if self.pattern_clone_pending {
                     let num_tracks = self.tracks.len();
-                    self.state
-                        .clone_pattern(num_tracks, &self.track_buffer_ids, &self.tracks);
+                    self.state.clone_pattern(
+                        num_tracks,
+                        &self.track_buffer_ids,
+                        &self.tracks,
+                        &self.track_instrument_types,
+                    );
                 } else if let Ok(n) = self.value_buffer.parse::<usize>() {
                     if n >= 1 {
                         let num_tracks = self.tracks.len();
@@ -876,6 +957,7 @@ impl App {
                                 num_tracks,
                                 &self.track_buffer_ids,
                                 &self.tracks,
+                                &self.track_instrument_types,
                             ) {
                                 self.apply_sample_ids(&sample_ids);
                             }

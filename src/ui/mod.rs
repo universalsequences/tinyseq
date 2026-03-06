@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::{EffectDescriptor, BUILTIN_SLOT_COUNT};
 use crate::lisp_effect::LoadedDGenLib;
-use crate::sequencer::{KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE};
+use crate::sequencer::{InstrumentType, KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE};
 
 mod browser;
 mod cirklon;
@@ -23,6 +23,8 @@ const COL_WIDTH: u16 = 3;
 
 /// Sentinel value for `effect_slot_cursor` indicating the Reverb tab is selected.
 const REVERB_TAB: usize = usize::MAX;
+/// Sentinel value for `effect_slot_cursor` indicating the Synth tab is selected.
+const SYNTH_TAB: usize = usize::MAX - 1;
 
 #[derive(Clone, Debug)]
 pub enum PatternBtn {
@@ -59,6 +61,7 @@ pub enum InputMode {
     Dropdown,
     PatternSelect,
     EffectPicker,
+    InstrumentPicker,
     StepInsert,
     StepSelect,
     StepArm,
@@ -66,6 +69,7 @@ pub enum InputMode {
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum SidebarMode {
+    InstrumentPicker,
     AddTrack,
     Audition,
 }
@@ -228,6 +232,22 @@ pub struct App {
 
     // Page-follow: page tracks playhead unless user interacts
     pub follow_override_until: Option<Instant>,
+
+    // Per-track instrument type
+    pub track_instrument_types: Vec<InstrumentType>,
+    // Instrument picker cursor (0=Sampler, 1=Custom)
+    pub instrument_picker_cursor: usize,
+
+    // Custom instrument support
+    pub pending_instrument_edit: bool,
+    pub pending_instrument_name: Option<String>,
+    pub instrument_libs: Vec<LoadedDGenLib>,
+    pub track_synth_node_ids: Vec<Vec<i32>>,
+    pub track_gatepitch_node_ids: Vec<Vec<i32>>,
+
+    // Per-track instrument param descriptors (for Synth tab)
+    pub instrument_descriptors: Vec<EffectDescriptor>,
+    pub instrument_param_cursor: usize,
 }
 
 impl App {
@@ -247,7 +267,7 @@ impl App {
         let sidebar_mode = if has_tracks {
             SidebarMode::Audition
         } else {
-            SidebarMode::AddTrack
+            SidebarMode::InstrumentPicker
         };
 
         let browser_tree = BrowserNode::scan_root("samples");
@@ -316,6 +336,15 @@ impl App {
             piano_last_step: usize::MAX,
             piano_last_track: usize::MAX,
             follow_override_until: None,
+            track_instrument_types: Vec::new(),
+            instrument_picker_cursor: 0,
+            pending_instrument_edit: false,
+            pending_instrument_name: None,
+            instrument_libs: Vec::new(),
+            track_synth_node_ids: Vec::new(),
+            track_gatepitch_node_ids: Vec::new(),
+            instrument_descriptors: Vec::new(),
+            instrument_param_cursor: 0,
         }
     }
 
@@ -387,9 +416,15 @@ impl App {
         (page_start, page_end)
     }
 
-    /// Pause page-follow for 10 seconds after user interaction.
+    /// Pause page-follow for 5 seconds after user interaction.
     fn touch_follow_timer(&mut self) {
         self.follow_override_until = Some(Instant::now() + std::time::Duration::from_secs(5));
+    }
+
+    /// Whether the given track is a Sampler instrument.
+    pub fn is_sampler_track(&self, track: usize) -> bool {
+        track >= self.track_instrument_types.len()
+            || self.track_instrument_types[track] == InstrumentType::Sampler
     }
 
     /// Clamp cursor_step to the current track's num_steps.

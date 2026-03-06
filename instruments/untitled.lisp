@@ -1,0 +1,15 @@
+; DGenLisp instrument — generates audio from gate, pitch, velocity, and trigger
+; Inputs: gate (ch 1), pitch_hz (ch 2), velocity (ch 3)
+; Helper input injected at compile time: trigger (ch 4)
+; Output: audio (ch 1)
+; Helpers injected at compile time: (adsr attack_ms decay_ms sustain release_ms)
+
+(def gate (in 1 @name gate))
+(param attack @min 1 @max 5000 @default 1 @unit ms)
+(param decay @min 1 @max 5000 @default 1 @unit ms)
+(param sustain @min 0 @max 1 @default 0.5)
+(param release @min 1 @max 5000 @default 1 @unit ms)
+(def pitch (in 2 @name pitch))
+(def velocity (in 3 @name velocity))
+(def osc (scale (< (phasor pitch) 0.5) 0 1 -1 1))
+(out (* osc (adsr attack decay sustain release) velocity) 1 @name audio)

@@ -10,6 +10,24 @@ pub const STEPS_PER_PAGE: usize = 16;
 pub const NUM_PARAMS: usize = 8;
 pub const DEFAULT_BPM: u32 = 120;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InstrumentType {
+    Sampler,
+    Custom, // placeholder for future Lisp-defined instruments
+}
+
+impl InstrumentType {
+    pub const COUNT: usize = 2;
+    pub const ALL: [Self; Self::COUNT] = [Self::Sampler, Self::Custom];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            InstrumentType::Sampler => "Sampler",
+            InstrumentType::Custom => "Custom",
+        }
+    }
+}
+
 /// Timebase determines the duration of each step as a note division.
 /// Inspired by the Sequentix Cirklon sequencer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,24 +69,13 @@ impl Timebase {
         Timebase::Polyrhythm,
     ];
 
+    pub const LABELS: [&'static str; Self::COUNT] = [
+        "1", "2", "4", "8", "16", "32", "64",
+        "2T", "4T", "8T", "16T", "32T", "64T", "Prh",
+    ];
+
     pub fn from_index(i: u32) -> Self {
-        match i {
-            0 => Timebase::Whole,
-            1 => Timebase::Half,
-            2 => Timebase::Quarter,
-            3 => Timebase::Eighth,
-            4 => Timebase::Sixteenth,
-            5 => Timebase::ThirtySecond,
-            6 => Timebase::SixtyFourth,
-            7 => Timebase::HalfTriplet,
-            8 => Timebase::QuarterTriplet,
-            9 => Timebase::EighthTriplet,
-            10 => Timebase::SixteenthTriplet,
-            11 => Timebase::ThirtySecondTriplet,
-            12 => Timebase::SixtyFourthTriplet,
-            13 => Timebase::Polyrhythm,
-            _ => Timebase::Sixteenth, // fallback
-        }
+        Self::ALL.get(i as usize).copied().unwrap_or(Timebase::Sixteenth)
     }
 
     pub fn label(&self) -> &'static str {
@@ -118,17 +125,17 @@ impl Timebase {
     }
 }
 
-/// Sync resolution options: (stored_value, beats, label).
+/// Sync resolution options: (beats, label).
 /// Index 0 = Off. Indices 1..SYNC_COUNT map to beat values.
-pub const SYNC_RESOLUTIONS: [(f32, f64, &str); 8] = [
-    (0.0, 0.0, "Off"),       // 0 = off
-    (1.0, 0.25, "1/16"),     // 16th note
-    (2.0, 0.5, "1/8"),       // 8th note
-    (3.0, 1.0, "1/4"),       // quarter note
-    (4.0, 2.0, "1/2 bar"),   // half bar
-    (5.0, 4.0, "1 bar"),     // 1 bar
-    (6.0, 8.0, "2 bars"),    // 2 bars
-    (7.0, 16.0, "4 bars"),   // 4 bars
+pub const SYNC_RESOLUTIONS: [(f64, &str); 8] = [
+    (0.0, "Off"),       // 0 = off
+    (0.25, "1/16"),     // 16th note
+    (0.5, "1/8"),       // 8th note
+    (1.0, "1/4"),       // quarter note
+    (2.0, "1/2 bar"),   // half bar
+    (4.0, "1 bar"),     // 1 bar
+    (8.0, "2 bars"),    // 2 bars
+    (16.0, "4 bars"),   // 4 bars
 ];
 pub const SYNC_COUNT: usize = SYNC_RESOLUTIONS.len();
 
@@ -136,9 +143,20 @@ pub const SYNC_COUNT: usize = SYNC_RESOLUTIONS.len();
 pub fn sync_beats(val: f32) -> f64 {
     let idx = val.round() as usize;
     if idx > 0 && idx < SYNC_COUNT {
-        SYNC_RESOLUTIONS[idx].1
+        SYNC_RESOLUTIONS[idx].0
     } else {
         0.0
+    }
+}
+
+/// Round `value` up to the next multiple of `grid`. Returns `value` unchanged
+/// if already on the grid (within epsilon tolerance).
+fn ceil_to_grid(value: f64, grid: f64) -> f64 {
+    let rem = value % grid;
+    if rem > 1e-9 {
+        value + (grid - rem)
+    } else {
+        value
     }
 }
 
@@ -166,14 +184,11 @@ impl StepParam {
         StepParam::Sync,
     ];
 
-    /// Params visible in the step param tabs (excludes Speed).
-    pub const VISIBLE: [StepParam; 7] = [
+    /// Params visible in the step param tabs.
+    pub const VISIBLE: [StepParam; 4] = [
         StepParam::Duration,
         StepParam::Velocity,
-        StepParam::AuxA,
-        StepParam::AuxB,
         StepParam::Transpose,
-        StepParam::Chop,
         StepParam::Sync,
     ];
 
@@ -272,7 +287,7 @@ impl StepParam {
             StepParam::Sync => {
                 let idx = val.round() as usize;
                 if idx < SYNC_COUNT {
-                    SYNC_RESOLUTIONS[idx].2.to_string()
+                    SYNC_RESOLUTIONS[idx].1.to_string()
                 } else {
                     "Off".to_string()
                 }
@@ -317,10 +332,7 @@ impl StepParam {
             'd' => Some(StepParam::Duration),
             'v' => Some(StepParam::Velocity),
             's' => Some(StepParam::Speed),
-            'a' => Some(StepParam::AuxA),
-            'b' => Some(StepParam::AuxB),
             't' => Some(StepParam::Transpose),
-            'c' => Some(StepParam::Chop),
             'y' => Some(StepParam::Sync),
             _ => None,
         }
@@ -560,6 +572,8 @@ pub struct PatternSnapshot {
     pub chord_snapshots: Vec<ChordSnapshot>,
     /// Per-track timebase p-lock snapshots.
     pub timebase_plock_snapshots: Vec<[Option<u32>; MAX_STEPS]>,
+    /// Per-track instrument type.
+    pub instrument_types: Vec<InstrumentType>,
 }
 
 impl PatternSnapshot {
@@ -568,6 +582,7 @@ impl PatternSnapshot {
         num_tracks: usize,
         track_buffer_ids: &[i32],
         track_names: &[String],
+        instrument_types: &[InstrumentType],
     ) -> Self {
         let mut track_bits = Vec::with_capacity(num_tracks);
         let mut step_data = Vec::with_capacity(num_tracks);
@@ -576,6 +591,7 @@ impl PatternSnapshot {
         let mut sample_ids = Vec::with_capacity(num_tracks);
         let mut chord_snapshots = Vec::with_capacity(num_tracks);
         let mut timebase_plock_snapshots = Vec::with_capacity(num_tracks);
+        let mut inst_types = Vec::with_capacity(num_tracks);
 
         for t in 0..num_tracks {
             track_bits.push(state.patterns[t].load_bits());
@@ -627,6 +643,15 @@ impl PatternSnapshot {
 
             // Capture timebase p-locks
             timebase_plock_snapshots.push(state.timebase_plocks[t].snapshot());
+
+            // Capture instrument type
+            inst_types.push(
+                if t < instrument_types.len() {
+                    instrument_types[t]
+                } else {
+                    InstrumentType::Sampler
+                },
+            );
         }
 
         Self {
@@ -637,6 +662,7 @@ impl PatternSnapshot {
             sample_ids,
             chord_snapshots,
             timebase_plock_snapshots,
+            instrument_types: inst_types,
         }
     }
 
@@ -717,6 +743,7 @@ impl PatternSnapshot {
         self.sample_ids.push((-1, String::new()));
         self.chord_snapshots.push(ChordSnapshot::new_default());
         self.timebase_plock_snapshots.push([None; MAX_STEPS]);
+        self.instrument_types.push(InstrumentType::Sampler);
     }
 
     pub fn new_default(num_tracks: usize, slot_descriptors: &[Vec<EffectDescriptor>]) -> Self {
@@ -728,6 +755,7 @@ impl PatternSnapshot {
             sample_ids: Vec::with_capacity(num_tracks),
             chord_snapshots: Vec::with_capacity(num_tracks),
             timebase_plock_snapshots: Vec::with_capacity(num_tracks),
+            instrument_types: Vec::with_capacity(num_tracks),
         };
         for t in 0..num_tracks {
             snap.push_default_track(t, slot_descriptors);
@@ -807,6 +835,14 @@ pub struct SequencerState {
     /// phase within a step snap to the next step. Default 0.5 (midpoint).
     /// Adjust with [ / ] when armed to compensate for output latency.
     pub record_quantize_thresh: AtomicU32,
+    /// Per-track instrument type flag: 0=Sampler, 1=Custom. Read by audio thread.
+    pub instrument_type_flags: Vec<AtomicU32>,
+    /// Per-track synth node IDs (up to MAX_VOICES per track), for sending instrument params.
+    pub synth_node_ids: Vec<[AtomicU32; MAX_VOICES]>,
+    /// Per-track instrument param slots (synth params for custom instruments).
+    pub instrument_slots: Vec<EffectSlotState>,
+    /// Per-track host-side semitone offset for custom instrument pitch interpretation.
+    pub instrument_base_note_offsets: Vec<AtomicU32>,
 }
 
 impl SequencerState {
@@ -858,6 +894,14 @@ impl SequencerState {
             timebase_plocks: (0..MAX_TRACKS).map(|_| TimebasePLockData::new()).collect(),
             playhead_phase: AtomicU32::new(0.0_f32.to_bits()),
             record_quantize_thresh: AtomicU32::new(0.5_f32.to_bits()),
+            instrument_type_flags: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
+            synth_node_ids: (0..MAX_TRACKS)
+                .map(|_| std::array::from_fn(|_| AtomicU32::new(0)))
+                .collect(),
+            instrument_slots: (0..MAX_TRACKS).map(|_| EffectSlotState::empty()).collect(),
+            instrument_base_note_offsets: (0..MAX_TRACKS)
+                .map(|_| AtomicU32::new(0.0_f32.to_bits()))
+                .collect(),
         }
     }
 
@@ -890,23 +934,30 @@ impl SequencerState {
         num_tracks: usize,
         buffer_ids: &[i32],
         names: &[String],
+        instrument_types: &[InstrumentType],
     ) -> Option<Vec<(i32, String)>> {
         let mut bank = self.pattern_bank.lock().unwrap();
         let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
         if new_idx == cur || new_idx >= bank.len() {
             return None;
         }
-        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names);
+        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names, instrument_types);
         bank[new_idx].restore(self);
         self.current_pattern
             .store(new_idx as u32, Ordering::Relaxed);
         Some(bank[new_idx].sample_ids.clone())
     }
 
-    pub fn clone_pattern(&self, num_tracks: usize, buffer_ids: &[i32], names: &[String]) -> usize {
+    pub fn clone_pattern(
+        &self,
+        num_tracks: usize,
+        buffer_ids: &[i32],
+        names: &[String],
+        instrument_types: &[InstrumentType],
+    ) -> usize {
         let mut bank = self.pattern_bank.lock().unwrap();
         let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
-        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names);
+        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names, instrument_types);
         let cloned = bank[cur].clone();
         bank.push(cloned);
         let new_idx = bank.len() - 1;
@@ -924,6 +975,7 @@ impl SequencerState {
         num_tracks: usize,
         buffer_ids: &[i32],
         names: &[String],
+        instrument_types: &[InstrumentType],
     ) -> Option<Vec<(i32, String)>> {
         let mut bank = self.pattern_bank.lock().unwrap();
         if bank.len() <= 1 {
@@ -931,7 +983,7 @@ impl SequencerState {
         }
         let cur = self.current_pattern.load(Ordering::Relaxed) as usize;
         // Capture current before removing (so other patterns stay consistent)
-        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names);
+        bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names, instrument_types);
         bank.remove(cur);
         let new_idx = cur.min(bank.len() - 1);
         bank[new_idx].restore(self);
@@ -1281,13 +1333,9 @@ impl SequencerClock {
             let step_dur = tb.step_beats(ns);
 
             // Sync point: pad to next multiple of the sync resolution
-            let sync_val = sd.get(s, StepParam::Sync);
-            let sync_b = sync_beats(sync_val);
+            let sync_b = sync_beats(sd.get(s, StepParam::Sync));
             if sync_b > EPS {
-                let pos_in_grid = accum % sync_b;
-                if pos_in_grid > EPS {
-                    accum += sync_b - pos_in_grid;
-                }
+                accum = ceil_to_grid(accum, sync_b);
             }
 
             tc.boundaries[s] = accum;
@@ -1301,18 +1349,12 @@ impl SequencerClock {
         // Cycle = natural pattern length by default.
         // If step 0 has a sync value, snap cycle length to that resolution
         // so step 0 always lands on the grid when the pattern loops.
-        let sync0 = sd.get(0, StepParam::Sync);
-        let sync0_b = sync_beats(sync0);
-        if sync0_b > EPS {
-            let rem = accum % sync0_b;
-            if rem > EPS {
-                tc.cycle_beats = accum + (sync0_b - rem);
-            } else {
-                tc.cycle_beats = accum.max(EPS);
-            }
+        let sync0_b = sync_beats(sd.get(0, StepParam::Sync));
+        tc.cycle_beats = if sync0_b > EPS {
+            ceil_to_grid(accum, sync0_b).max(EPS)
         } else {
-            tc.cycle_beats = accum.max(EPS);
-        }
+            accum.max(EPS)
+        };
     }
 
     /// Derive the local step index from the current beat position within a track's cycle.
@@ -1322,19 +1364,17 @@ impl SequencerClock {
         if pos_in_cycle >= tc.boundaries[num_steps] {
             return None;
         }
-        // Reverse scan: find the last boundary <= pos_in_cycle
-        for s in (0..num_steps).rev() {
-            if pos_in_cycle >= tc.boundaries[s] {
-                // Check we're still within this step's actual duration
-                // (there may be dead-space padding between step_ends[s] and boundaries[s+1])
-                if pos_in_cycle < tc.step_ends[s] {
-                    return Some(s);
-                } else {
-                    return None; // In dead space between steps
-                }
-            }
+        // Binary search: find the last boundary <= pos_in_cycle.
+        // partition_point returns the first index where boundary > pos_in_cycle.
+        let idx = tc.boundaries[..num_steps + 1].partition_point(|&b| b <= pos_in_cycle);
+        let s = if idx > 0 { idx - 1 } else { 0 };
+        // Check we're still within this step's actual duration
+        // (there may be dead-space padding between step_ends[s] and boundaries[s+1])
+        if pos_in_cycle < tc.step_ends[s] {
+            Some(s)
+        } else {
+            None
         }
-        Some(0)
     }
 
     pub fn process_block(
@@ -1366,13 +1406,17 @@ impl SequencerClock {
         }
 
         let mut triggers = Vec::new();
+        let mut last_global_16th = (self.total_beats / 0.25) as u32;
 
         for offset in 0..nframes {
             self.total_beats += beats_per_sample;
 
-            // Global playhead: derive 16th-note step from beat position
+            // Global playhead: only store when value changes
             let global_16th = (self.total_beats / 0.25) as u32;
-            state.playhead.store(global_16th, Ordering::Relaxed);
+            if global_16th != last_global_16th {
+                state.playhead.store(global_16th, Ordering::Relaxed);
+                last_global_16th = global_16th;
+            }
 
             // Per-track step derivation
             for t in 0..num_tracks {

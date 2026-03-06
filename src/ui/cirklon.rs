@@ -456,29 +456,28 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
         if is_sync {
             let sync_idx = raw.round() as usize;
             let label = if sync_idx < crate::sequencer::SYNC_COUNT {
-                crate::sequencer::SYNC_RESOLUTIONS[sync_idx].2
+                crate::sequencer::SYNC_RESOLUTIONS[sync_idx].1
             } else {
                 ""
             };
-            let fg = if sync_idx == 0 {
+            let fg = if sync_idx == 0 || !active {
                 step_dim_fg(step)
-            } else if active {
-                step_active_fg(step)
             } else {
-                step_dim_fg(step)
+                step_active_fg(step)
             };
-            // Render label chars vertically, centered in BAR_HEIGHT
-            let chars: Vec<char> = label.chars().collect();
-            let start_row = if chars.len() < BAR_HEIGHT {
-                (BAR_HEIGHT - chars.len()) / 2
+            // Render label bytes vertically, centered in BAR_HEIGHT (labels are ASCII)
+            let label_bytes = label.as_bytes();
+            let label_len = label_bytes.len();
+            let start_row = if label_len < BAR_HEIGHT {
+                (BAR_HEIGHT - label_len) / 2
             } else {
                 0
             };
             for row in 0..BAR_HEIGHT {
                 let cell_y = area.y + row as u16;
                 let ci = row.wrapping_sub(start_row);
-                let ch = if ci < chars.len() {
-                    format!(" {} ", chars[ci])
+                let ch = if ci < label_len {
+                    format!(" {} ", label_bytes[ci] as char)
                 } else {
                     "   ".to_string()
                 };

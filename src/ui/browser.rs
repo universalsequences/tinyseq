@@ -207,6 +207,10 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
+        // Skip browser sync for non-sampler tracks
+        if !self.is_sampler_track(self.cursor_track) {
+            return;
+        }
         let sample_name = &self.tracks[self.cursor_track];
         if sample_name.is_empty() {
             return;
@@ -248,6 +252,12 @@ impl App {
     }
 
     pub(super) fn handle_sidebar_input(&mut self, code: KeyCode) {
+        // Instrument picker mode: separate input handling
+        if self.sidebar_mode == SidebarMode::InstrumentPicker {
+            self.handle_instrument_picker_input(code);
+            return;
+        }
+
         match code {
             KeyCode::Char(c) => {
                 self.browser_filter.push(c);
@@ -322,9 +332,50 @@ impl App {
         }
     }
 
+    fn handle_instrument_picker_input(&mut self, code: KeyCode) {
+        use crate::sequencer::InstrumentType;
+        match code {
+            KeyCode::Up => {
+                if self.instrument_picker_cursor > 0 {
+                    self.instrument_picker_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.instrument_picker_cursor + 1 < InstrumentType::COUNT {
+                    self.instrument_picker_cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                match InstrumentType::ALL[self.instrument_picker_cursor] {
+                    InstrumentType::Sampler => {
+                        self.browser_cursor = 0;
+                        self.browser_filter.clear();
+                        self.browser_scroll_offset = 0;
+                        self.sidebar_mode = SidebarMode::AddTrack;
+                    }
+                    InstrumentType::Custom => {
+                        // Open instrument picker overlay
+                        self.picker_cursor = 0;
+                        self.picker_filter.clear();
+                        self.picker_items = crate::lisp_effect::list_saved_instruments();
+                        self.input_mode = super::InputMode::InstrumentPicker;
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.focused_region = Region::Cirklon;
+                if !self.tracks.is_empty() {
+                    self.sidebar_mode = SidebarMode::Audition;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Execute the sidebar action for a file selection (Enter or click).
     pub(super) fn sidebar_select_file(&mut self, path: &std::path::Path) {
         match self.sidebar_mode {
+            SidebarMode::InstrumentPicker => return, // no file selection in picker
             SidebarMode::AddTrack => {
                 match self.add_track(path) {
                     Ok(idx) => {
@@ -392,6 +443,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         " Samples "
     } else {
         match app.sidebar_mode {
+            SidebarMode::InstrumentPicker => " Instrument ",
             SidebarMode::AddTrack => " + Add Track ",
             SidebarMode::Audition => " \u{266b} Audition ",
         }
@@ -416,6 +468,36 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         for x in inner.x..(inner.x + inner.width) {
             buf[(x, y)].reset();
         }
+    }
+
+    // Instrument picker mode: draw simple list instead of browser
+    if app.sidebar_mode == SidebarMode::InstrumentPicker && focused {
+        for (i, inst) in crate::sequencer::InstrumentType::ALL.iter().enumerate() {
+            let label = inst.label();
+            if i as u16 >= inner.height {
+                break;
+            }
+            let is_cursor = i == app.instrument_picker_cursor;
+            let style = if is_cursor {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let text = format!("  {} ", label);
+            let buf = frame.buffer_mut();
+            buf.set_string(inner.x, inner.y + i as u16, &text, style);
+            let text_width = UnicodeWidthStr::width(text.as_str());
+            let remaining = (inner.width as usize).saturating_sub(text_width);
+            if remaining > 0 {
+                buf.set_string(
+                    inner.x + text_width as u16,
+                    inner.y + i as u16,
+                    &" ".repeat(remaining),
+                    style,
+                );
+            }
+        }
+        return;
     }
 
     let items = app.browser_visible_items();

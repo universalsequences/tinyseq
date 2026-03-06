@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::audiograph::*;
 use crate::delay;
+use crate::gatepitch;
 use crate::sampler::{
     PARAM_ATTACK_SAMPLES, PARAM_GATE_MODE, PARAM_GATE_SAMPLES, PARAM_PLAYHEAD,
     PARAM_RELEASE_SAMPLES, PARAM_SPEED, PARAM_TRANSPOSE, PARAM_TRIGGER, PARAM_VELOCITY,
@@ -36,6 +37,59 @@ struct SwingPending {
     active: bool,
 }
 
+/// Pending gate-off events for custom instrument voices.
+struct GateOffPending {
+    lid: u64,
+    countdown: f64,
+}
+
+/// Per-track gate-off queue for custom instruments.
+struct GateOffTracker {
+    pending: Vec<GateOffPending>,
+}
+
+impl GateOffTracker {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Schedule a gate-off after `delay_samples` for the given voice LID.
+    fn schedule(&mut self, lid: u64, delay_samples: f64) {
+        // If there's already a pending gate-off for this LID, replace it
+        for p in &mut self.pending {
+            if p.lid == lid {
+                p.countdown = delay_samples;
+                return;
+            }
+        }
+        self.pending.push(GateOffPending {
+            lid,
+            countdown: delay_samples,
+        });
+    }
+
+    fn cancel(&mut self, lid: u64) {
+        self.pending.retain(|p| p.lid != lid);
+    }
+
+    /// Advance all countdowns by nframes. Returns LIDs that expired.
+    fn process(&mut self, nframes: usize) -> Vec<u64> {
+        let mut expired = Vec::new();
+        self.pending.retain_mut(|p| {
+            p.countdown -= nframes as f64;
+            if p.countdown <= 0.0 {
+                expired.push(p.lid);
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+}
+
 struct AudioCallbackData {
     lg: LiveGraphPtr,
     clock: SequencerClock,
@@ -43,6 +97,7 @@ struct AudioCallbackData {
     num_channels: usize,
     chop_state: Vec<ChopTracker>,
     swing_state: Vec<SwingPending>,
+    gate_off_state: Vec<GateOffTracker>,
     sample_rate: f64,
     last_bpm: u32,
     voice_pools: Vec<VoicePool>,
@@ -156,6 +211,62 @@ unsafe fn send_keyboard_trigger(
     params_push_wrapper(lg, ParamMsg { idx: PARAM_TRIGGER, logical_id: lid, fvalue: 1.0 });
 }
 
+/// Send a gate-on trigger to a GatePitch node with pitch in Hz and normalized velocity.
+unsafe fn send_custom_trigger(lg: *mut LiveGraph, gatepitch_lid: u64, pitch_hz: f32, velocity: f32) {
+    params_push_wrapper(
+        lg,
+        ParamMsg {
+            idx: gatepitch::PARAM_TRIGGER,
+            logical_id: gatepitch_lid,
+            fvalue: 1.0,
+        },
+    );
+    params_push_wrapper(
+        lg,
+        ParamMsg {
+            idx: gatepitch::PARAM_PITCH,
+            logical_id: gatepitch_lid,
+            fvalue: pitch_hz,
+        },
+    );
+    params_push_wrapper(
+        lg,
+        ParamMsg {
+            idx: gatepitch::PARAM_VELOCITY,
+            logical_id: gatepitch_lid,
+            fvalue: velocity,
+        },
+    );
+    params_push_wrapper(
+        lg,
+        ParamMsg {
+            idx: gatepitch::PARAM_GATE,
+            logical_id: gatepitch_lid,
+            fvalue: 1.0,
+        },
+    );
+}
+
+/// Send a gate-off to a GatePitch node.
+unsafe fn send_custom_note_off(lg: *mut LiveGraph, gatepitch_lid: u64) {
+    params_push_wrapper(
+        lg,
+        ParamMsg {
+            idx: gatepitch::PARAM_GATE,
+            logical_id: gatepitch_lid,
+            fvalue: 0.0,
+        },
+    );
+}
+
+fn custom_pitch_hz(transpose: f32, base_note_offset: f32) -> f32 {
+    440.0 * 2f32.powf((transpose + base_note_offset) / 12.0)
+}
+
+fn is_mono_voice_pool(pool: &VoicePool) -> bool {
+    !pool.polyphonic || pool.num_voices <= 1
+}
+
 /// Dispatch effect p-locks for all slots in a track's effect chain.
 unsafe fn dispatch_effect_chain_for_track(
     lg: *mut LiveGraph,
@@ -185,6 +296,42 @@ unsafe fn dispatch_effect_chain_for_track(
     }
 }
 
+/// Dispatch instrument param values (with p-lock support) to all synth nodes for a custom track.
+unsafe fn dispatch_instrument_params_for_track(
+    lg: *mut LiveGraph,
+    state: &SequencerState,
+    track_idx: usize,
+    step: usize,
+) {
+    let slot = &state.instrument_slots[track_idx];
+    let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+    if num_params == 0 {
+        return;
+    }
+    let vc = state.voice_counts[track_idx].load(Ordering::Acquire) as usize;
+    for v in 0..vc {
+        let synth_id = state.synth_node_ids[track_idx][v].load(Ordering::Relaxed);
+        if synth_id == 0 {
+            continue;
+        }
+        for param_idx in 0..num_params {
+            let value = slot
+                .plocks
+                .get(step, param_idx)
+                .unwrap_or_else(|| slot.defaults.get(param_idx));
+            let idx = slot.resolve_node_idx(param_idx);
+            params_push_wrapper(
+                lg,
+                ParamMsg {
+                    idx,
+                    logical_id: synth_id as u64,
+                    fvalue: value,
+                },
+            );
+        }
+    }
+}
+
 /// Fire a step trigger for a track (handles gate, chop setup, envelope params).
 /// Uses voice pool allocation for polyphonic playback.
 fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize) {
@@ -195,6 +342,7 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let sd = &data.state.step_data[track_idx];
     let tp = &data.state.track_params[track_idx];
     let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
+    let is_custom = data.state.instrument_type_flags[track_idx].load(Ordering::Relaxed) == 1;
 
     let chop = sd.get(step, StepParam::Chop).round() as u32;
     let chop = chop.max(1);
@@ -209,6 +357,10 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let attack_samples = attack_ms * data.sample_rate as f32 / 1000.0;
     let release_samples = release_ms * data.sample_rate as f32 / 1000.0;
     let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
+    let velocity = sd.get(step, StepParam::Velocity);
+    let base_note_offset = f32::from_bits(
+        data.state.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed),
+    );
 
     // Sync polyphonic setting from track params
     data.voice_pools[track_idx].polyphonic = tp.is_polyphonic();
@@ -221,12 +373,24 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
             let voice = data.voice_pools[track_idx].allocate_voice(transpose);
             let voice_lid = voice.logical_id;
             let lid = if voice_lid != 0 { voice_lid } else { sampler_lid };
-            unsafe {
-                send_trigger(
-                    data.lg.0, lid, sd, step,
-                    chop_gate, attack_samples, release_samples, gate_mode,
-                    transpose,
-                );
+            if is_custom {
+                let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
+                if is_mono_voice_pool(&data.voice_pools[track_idx]) {
+                    data.gate_off_state[track_idx].cancel(lid);
+                    unsafe { send_custom_note_off(data.lg.0, lid); }
+                }
+                unsafe { send_custom_trigger(data.lg.0, lid, pitch_hz, velocity); }
+                if gate_mode > 0.5 {
+                    data.gate_off_state[track_idx].schedule(lid, total_gate as f64);
+                }
+            } else {
+                unsafe {
+                    send_trigger(
+                        data.lg.0, lid, sd, step,
+                        chop_gate, attack_samples, release_samples, gate_mode,
+                        transpose,
+                    );
+                }
             }
         }
     } else {
@@ -235,12 +399,24 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
         let voice = data.voice_pools[track_idx].allocate_voice(transpose);
         let voice_lid = voice.logical_id;
         let lid = if voice_lid != 0 { voice_lid } else { sampler_lid };
-        unsafe {
-            send_trigger(
-                data.lg.0, lid, sd, step,
-                chop_gate, attack_samples, release_samples, gate_mode,
-                transpose,
-            );
+        if is_custom {
+            let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
+            if is_mono_voice_pool(&data.voice_pools[track_idx]) {
+                data.gate_off_state[track_idx].cancel(lid);
+                unsafe { send_custom_note_off(data.lg.0, lid); }
+            }
+            unsafe { send_custom_trigger(data.lg.0, lid, pitch_hz, velocity); }
+            if gate_mode > 0.5 {
+                data.gate_off_state[track_idx].schedule(lid, total_gate as f64);
+            }
+        } else {
+            unsafe {
+                send_trigger(
+                    data.lg.0, lid, sd, step,
+                    chop_gate, attack_samples, release_samples, gate_mode,
+                    transpose,
+                );
+            }
         }
     }
 
@@ -261,8 +437,20 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
 
     data.state.trigger_flash[track_idx].store(255, Ordering::Relaxed);
 
-    // Setup chop re-triggers
-    if chop > 1 {
+    // Dispatch instrument params (synth tab p-locks) for custom tracks
+    if is_custom {
+        unsafe {
+            dispatch_instrument_params_for_track(
+                data.lg.0,
+                &data.state,
+                track_idx,
+                step,
+            );
+        }
+    }
+
+    // Setup chop re-triggers (sampler only — custom instruments handle gate duration internally)
+    if !is_custom && chop > 1 {
         data.chop_state[track_idx] = ChopTracker {
             remaining: chop - 1,
             counter: samples_per_step / chop as f64,
@@ -300,22 +488,36 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
             continue;
         }
         data.voice_pools[kt.track].polyphonic = data.state.track_params[kt.track].is_polyphonic();
+        let is_custom = data.state.instrument_type_flags[kt.track].load(Ordering::Relaxed) == 1;
+        let base_note_offset = f32::from_bits(
+            data.state.instrument_base_note_offsets[kt.track].load(Ordering::Relaxed),
+        );
 
         if kt.note_off {
             // Note-off: find the voice playing this note and stop it
             let pool = &mut data.voice_pools[kt.track];
-            // Find the voice with matching note and stop it by setting trigger=0
+            if is_custom && is_mono_voice_pool(pool) && pool.num_voices > 0 {
+                let lid = pool.voices[0].logical_id;
+                pool.voices[0].active = false;
+                if lid != 0 {
+                    unsafe { send_custom_note_off(data.lg.0, lid); }
+                }
+                continue;
+            }
             for v in 0..pool.num_voices {
                 if pool.voices[v].active && (pool.voices[v].note - kt.transpose).abs() < 0.01 {
                     let lid = pool.voices[v].logical_id;
                     pool.voices[v].active = false;
                     if lid != 0 {
                         unsafe {
-                            // Set gate to 0 samples to trigger release envelope
-                            params_push_wrapper(
-                                data.lg.0,
-                                ParamMsg { idx: PARAM_GATE_SAMPLES, logical_id: lid, fvalue: 0.0 },
-                            );
+                            if is_custom {
+                                send_custom_note_off(data.lg.0, lid);
+                            } else {
+                                params_push_wrapper(
+                                    data.lg.0,
+                                    ParamMsg { idx: PARAM_GATE_SAMPLES, logical_id: lid, fvalue: 0.0 },
+                                );
+                            }
                         }
                     }
                     break;
@@ -328,20 +530,28 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
             if voice_lid == 0 {
                 continue;
             }
-            let tp = &data.state.track_params[kt.track];
-            let attack_samples = tp.get_attack_ms() * data.sample_rate as f32 / 1000.0;
-            let release_samples = tp.get_release_ms() * data.sample_rate as f32 / 1000.0;
-            let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
-            unsafe {
-                send_keyboard_trigger(
-                    data.lg.0,
-                    voice_lid,
-                    kt.transpose,
-                    kt.velocity,
-                    attack_samples,
-                    release_samples,
-                    gate_mode,
-                );
+            if is_custom {
+                let pitch_hz = custom_pitch_hz(kt.transpose, base_note_offset);
+                if is_mono_voice_pool(&data.voice_pools[kt.track]) {
+                    unsafe { send_custom_note_off(data.lg.0, voice_lid); }
+                }
+                unsafe { send_custom_trigger(data.lg.0, voice_lid, pitch_hz, kt.velocity); }
+            } else {
+                let tp = &data.state.track_params[kt.track];
+                let attack_samples = tp.get_attack_ms() * data.sample_rate as f32 / 1000.0;
+                let release_samples = tp.get_release_ms() * data.sample_rate as f32 / 1000.0;
+                let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
+                unsafe {
+                    send_keyboard_trigger(
+                        data.lg.0,
+                        voice_lid,
+                        kt.transpose,
+                        kt.velocity,
+                        attack_samples,
+                        release_samples,
+                        gate_mode,
+                    );
+                }
             }
             data.state.trigger_flash[kt.track].store(255, Ordering::Relaxed);
         }
@@ -455,6 +665,17 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         }
     }
 
+    // Process pending gate-off events for custom instruments
+    for track_idx in 0..num_tracks {
+        let expired = data.gate_off_state[track_idx].process(nframes);
+        for lid in expired {
+            data.voice_pools[track_idx].release_voice_by_logical_id(lid);
+            unsafe {
+                send_custom_note_off(data.lg.0, lid);
+            }
+        }
+    }
+
     unsafe {
         process_next_block(data.lg.0, output.as_mut_ptr(), nframes as i32);
     }
@@ -525,6 +746,10 @@ pub fn build_output_stream(
         }
     }
 
+    let gate_off_state = (0..MAX_TRACKS)
+        .map(|_| GateOffTracker::new())
+        .collect();
+
     let mut cb_data = AudioCallbackData {
         lg: LiveGraphPtr(lg),
         clock,
@@ -532,6 +757,7 @@ pub fn build_output_stream(
         num_channels,
         chop_state,
         swing_state,
+        gate_off_state,
         sample_rate: sample_rate as f64,
         last_bpm: 0,
         voice_pools,

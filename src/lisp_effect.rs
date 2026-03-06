@@ -123,6 +123,8 @@ pub struct DGenManifest {
     pub n_inputs: usize,
     pub n_outputs: usize,
     pub tensor_init_data: Vec<TensorInit>,
+    /// Memory cell that holds the voice index (0-5) for voice-aware instruments.
+    pub voice_cell_id: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -312,6 +314,8 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
         })
         .unwrap_or_default();
 
+    let voice_cell_id = v["voiceCellId"].as_u64().map(|id| id as usize);
+
     Ok(DGenManifest {
         dylib_path,
         total_memory_slots: v["totalMemorySlots"].as_u64().unwrap_or(256) as usize,
@@ -319,6 +323,7 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
         n_inputs,
         n_outputs,
         tensor_init_data,
+        voice_cell_id,
     })
 }
 
@@ -627,4 +632,366 @@ fn sanitize_effect_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Instrument (synth) support — parallel to effect infrastructure
+// ══════════════════════════════════════════════════════════════════
+
+use crate::voice::MAX_VOICES;
+
+const INSTRUMENTS_DIR: &str = "instruments";
+
+const INSTRUMENT_REGISTRY_SIZE: usize = MAX_TRACKS * MAX_VOICES;
+static DGEN_INSTRUMENT_FNS: [AtomicUsize; INSTRUMENT_REGISTRY_SIZE] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; INSTRUMENT_REGISTRY_SIZE]
+};
+
+pub fn set_dgen_instrument_fn(slot_id: usize, f: DGenProcessFn) {
+    DGEN_INSTRUMENT_FNS[slot_id % INSTRUMENT_REGISTRY_SIZE].store(f as usize, Ordering::Release);
+}
+
+/// Wrapper process function for instrument nodes — reads from DGEN_INSTRUMENT_FNS.
+unsafe extern "C" fn dgenlisp_instrument_wrapper_process(
+    inp: *const *mut f32,
+    out: *const *mut f32,
+    nframes: c_int,
+    state: *mut c_void,
+    _buffers: *mut c_void,
+) {
+    let s = state as *mut f32;
+    let slot_id = (*s) as usize;
+    let fn_ptr = DGEN_INSTRUMENT_FNS[slot_id % INSTRUMENT_REGISTRY_SIZE].load(Ordering::Acquire);
+    if fn_ptr != 0 {
+        let process_fn: DGenProcessFn = std::mem::transmute(fn_ptr);
+        let memory = s.add(HEADER_SLOTS) as *mut c_void;
+        process_fn(inp, out, nframes, memory, memory);
+    } else {
+        // Silence output
+        let nf = nframes as usize;
+        let out0 = *out.add(0);
+        for i in 0..nf {
+            *out0.add(i) = 0.0;
+        }
+    }
+}
+
+pub fn dgenlisp_instrument_vtable() -> NodeVTable {
+    NodeVTable {
+        process: Some(dgenlisp_instrument_wrapper_process),
+        init: Some(dgenlisp_init),
+        reset: None,
+        migrate: None,
+    }
+}
+
+/// Build init message for a voice-aware instrument node.
+/// Sets slot_id, total_memory_slots, param defaults, tensor data,
+/// and voice_cell_id = voice_index.
+pub fn build_init_message_for_voice(
+    slot_id: usize,
+    manifest: &DGenManifest,
+    voice_index: usize,
+) -> Vec<f32> {
+    let mut entries: Vec<(usize, f32)> = Vec::new();
+
+    for param in &manifest.params {
+        if param.cell_id < manifest.total_memory_slots && param.default != 0.0 {
+            entries.push((param.cell_id, param.default));
+        }
+    }
+
+    for tensor in &manifest.tensor_init_data {
+        for (i, &val) in tensor.data.iter().enumerate() {
+            let idx = tensor.offset + i;
+            if idx < manifest.total_memory_slots && val != 0.0 {
+                entries.push((idx, val));
+            }
+        }
+    }
+
+    // Set voice cell to voice_index
+    if let Some(cell) = manifest.voice_cell_id {
+        if cell < manifest.total_memory_slots {
+            entries.push((cell, voice_index as f32));
+        }
+    }
+
+    let mut msg = Vec::with_capacity(3 + entries.len() * 2);
+    msg.push(slot_id as f32);
+    msg.push(manifest.total_memory_slots as f32);
+    msg.push(entries.len() as f32);
+    for (idx, val) in &entries {
+        msg.push(*idx as f32);
+        msg.push(*val);
+    }
+    msg
+}
+
+// ── Instrument storage ──
+
+pub fn save_instrument(name: &str, source: &str) -> io::Result<()> {
+    let dir = Path::new(INSTRUMENTS_DIR);
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{}.lisp", name));
+    std::fs::write(&path, source)
+}
+
+pub fn list_saved_instruments() -> Vec<String> {
+    let dir = Path::new(INSTRUMENTS_DIR);
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().map(|ext| ext == "lisp").unwrap_or(false) {
+                        path.file_stem().map(|s| s.to_string_lossy().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+pub fn load_instrument_source(name: &str) -> io::Result<String> {
+    let path = Path::new(INSTRUMENTS_DIR).join(format!("{}.lisp", name));
+    std::fs::read_to_string(&path)
+}
+
+// ── Instrument compilation ──
+
+const INSTRUMENT_PREAMBLE: &str = r#"; Shared instrument helpers injected at compile time.
+; Assumes 44.1 kHz for envelope coefficient conversion.
+
+(def trigger (in 4 @name trigger))
+
+(defmacro adsr (attack_ms decay_ms sustain release_ms)
+  (make-history env)
+  (make-history gate_hist)
+  (make-history stage_hist)
+
+  (def sr 44100.0)
+  (def attack_coeff (- 1.0 (exp (/ -1.0 (* attack_ms 0.001 sr)))))
+  (def decay_coeff (- 1.0 (exp (/ -1.0 (* decay_ms 0.001 sr)))))
+  (def release_coeff (- 1.0 (exp (/ -1.0 (* release_ms 0.001 sr)))))
+
+  (def prev_env (read-history env))
+  (def prev_gate (read-history gate_hist))
+  (def prev_stage (read-history stage_hist))
+
+  (def gate_on (gt gate 0.5))
+  (def gate_rising (* gate_on (lte prev_gate 0.5)))
+  (def retrigger (max gate_rising trigger))
+  (def attack_stage 1.0)
+  (def decay_stage 2.0)
+  (def attack_done (gte prev_env 0.999))
+
+  (def stage_from_gate
+    (gswitch gate_on
+      (gswitch retrigger attack_stage prev_stage)
+      0.0))
+
+  (def stage
+    (gswitch attack_done
+      (gswitch (eq stage_from_gate attack_stage) decay_stage stage_from_gate)
+      stage_from_gate))
+
+  (def target
+    (gswitch gate_on
+      (gswitch (eq stage attack_stage) 1.0 sustain)
+      0.0))
+
+  (def rate
+    (gswitch gate_on
+      (gswitch (eq stage attack_stage) attack_coeff decay_coeff)
+      release_coeff))
+
+  (def level_raw (+ prev_env (* rate (- target prev_env))))
+  (def level (clip level_raw 0 1))
+  (write-history env level)
+  (write-history gate_hist gate)
+  (write-history stage_hist stage)
+  level)
+"#;
+
+pub fn compile_instrument(source: &str, sample_rate: u32) -> Result<String, String> {
+    let dir = output_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
+
+    let seq = COMPILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dylib_name = format!("instrument_{}", seq);
+
+    let src_path = dir.join("instrument.lisp");
+    let source_with_preamble = format!("{INSTRUMENT_PREAMBLE}\n\n{source}");
+    std::fs::write(&src_path, source_with_preamble)
+        .map_err(|e| format!("Failed to write source: {e}"))?;
+
+    let tool_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("tools/DGenLisp");
+    let output = std::process::Command::new(&tool_path)
+        .args(["compile", src_path.to_str().unwrap()])
+        .args(["-o", dir.to_str().unwrap()])
+        .args(["--name", &dylib_name])
+        .args(["--sample-rate", &sample_rate.to_string()])
+        .args(["--voices", "6"])
+        .output()
+        .map_err(|e| format!("Failed to run DGenLisp: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("{}{}", stderr, stdout));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout)
+}
+
+pub fn compile_and_load_instrument(
+    source: &str,
+    sample_rate: u32,
+) -> Result<CompileResult, String> {
+    let json = compile_instrument(source, sample_rate)?;
+    let manifest = parse_manifest(&json)?;
+    let lib = load_dylib(&manifest.dylib_path)?;
+    Ok(CompileResult { manifest, lib })
+}
+
+// ── Instrument editor flow ──
+
+const INSTRUMENT_TEMPLATE: &str = r#"; DGenLisp instrument — generates audio from gate, pitch, velocity, and trigger
+; Inputs: gate (ch 1), pitch_hz (ch 2), velocity (ch 3)
+; Helper input injected at compile time: trigger (ch 4)
+; Output: audio (ch 1)
+; Helpers injected at compile time: (adsr attack_ms decay_ms sustain release_ms)
+
+(def gate (in 1 @name gate))
+(def pitch (in 2 @name pitch))
+(def velocity (in 3 @name velocity))
+(def osc (sin (* (phasor pitch) twopi)))
+(out (* osc gate velocity) 1 @name audio)
+"#;
+
+pub struct InstrumentEditResult {
+    pub manifest: DGenManifest,
+    pub lib: LoadedDGenLib,
+    pub source: String,
+    pub params: Vec<DGenParam>,
+    pub name: String,
+}
+
+/// Run the instrument edit → compile → name → save flow.
+/// Called while terminal is in normal (non-raw) mode.
+/// Does NOT wire nodes — the caller handles graph wiring.
+pub fn run_instrument_editor_flow(
+    last_source: &str,
+    existing_name: Option<&str>,
+    sample_rate: u32,
+) -> Option<InstrumentEditResult> {
+    let initial = if last_source.is_empty() {
+        INSTRUMENT_TEMPLATE.to_string()
+    } else {
+        last_source.to_string()
+    };
+
+    let mut source = initial;
+
+    loop {
+        match edit_text(&source) {
+            Ok(edited) => {
+                source = edited;
+            }
+            Err(e) => {
+                eprintln!("Editor error: {e}");
+                return None;
+            }
+        }
+
+        print!("Compiling instrument...");
+        io::stdout().flush().ok();
+
+        match compile_instrument(&source, sample_rate) {
+            Ok(json) => match parse_manifest(&json) {
+                Ok(manifest) => match load_dylib(&manifest.dylib_path) {
+                    Ok(lib) => {
+                        println!(" OK!");
+                        let n = manifest.params.len();
+                        if n > 0 {
+                            println!("  Parameters:");
+                            for p in &manifest.params {
+                                println!(
+                                    "    {} = {} [{}, {}]{}",
+                                    p.name,
+                                    p.default,
+                                    p.min,
+                                    p.max,
+                                    p.unit
+                                        .as_deref()
+                                        .map(|u| format!(" {u}"))
+                                        .unwrap_or_default()
+                                );
+                            }
+                        }
+
+                        let default_name = existing_name.unwrap_or("");
+                        if default_name.is_empty() {
+                            print!("\nInstrument name: ");
+                        } else {
+                            print!("\nInstrument name [{}]: ", default_name);
+                        }
+                        io::stdout().flush().ok();
+                        let mut name_buf = String::new();
+                        std::io::stdin().read_line(&mut name_buf).ok();
+                        let name_input = name_buf.trim();
+                        let name = if name_input.is_empty() {
+                            if default_name.is_empty() {
+                                "untitled".to_string()
+                            } else {
+                                default_name.to_string()
+                            }
+                        } else {
+                            sanitize_effect_name(name_input)
+                        };
+
+                        match save_instrument(&name, &source) {
+                            Ok(()) => println!("Saved to instruments/{}.lisp", name),
+                            Err(e) => eprintln!("Warning: failed to save: {e}"),
+                        }
+
+                        println!("\nInstrument '{}' compiled successfully.", name);
+                        let params = manifest.params.clone();
+                        return Some(InstrumentEditResult {
+                            manifest,
+                            lib,
+                            source,
+                            params,
+                            name,
+                        });
+                    }
+                    Err(e) => eprintln!(" Failed to load dylib: {e}"),
+                },
+                Err(e) => eprintln!(" Failed to parse manifest: {e}"),
+            },
+            Err(e) => {
+                println!();
+                eprintln!("Compile error:\n{e}");
+            }
+        }
+
+        eprint!("\nPress Enter to re-edit, or 'q' + Enter to cancel: ");
+        io::stdout().flush().ok();
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
+        if buf.trim() == "q" {
+            return None;
+        }
+    }
 }

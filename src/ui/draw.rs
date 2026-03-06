@@ -7,7 +7,7 @@ use crate::sequencer::StepParam;
 
 use super::browser::draw_sidebar;
 use super::cirklon::draw_cirklon_region;
-use super::effects::{draw_compiling_overlay, draw_effect_picker};
+use super::effects::{draw_compiling_overlay, draw_effect_picker, draw_instrument_picker};
 use super::params::draw_params_region;
 use super::{App, InputMode, Region, SidebarMode};
 
@@ -73,6 +73,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.input_mode == InputMode::EffectPicker {
         draw_effect_picker(frame, app, area);
     }
+    if app.input_mode == InputMode::InstrumentPicker {
+        draw_instrument_picker(frame, app, area);
+    }
 
     // Draw compiling overlay
     if let Some(ref pending) = app.pending_compile {
@@ -126,6 +129,16 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     )];
 
     if !app.tracks.is_empty() {
+        let track = app.cursor_track;
+        let tp = &app.state.track_params[track];
+        let default_tb = tp.get_timebase();
+        let current_step = app.state.track_step(track);
+        let resolved_tb = app.state.timebase_plocks[track].resolve(current_step, default_tb);
+        spans.push(Span::styled(
+            format!("  {:<3}", resolved_tb.label()),
+            Style::default().fg(Color::Yellow),
+        ));
+
         let sample_name = &app.tracks[app.cursor_track];
         spans.push(Span::styled(
             format!("  {}", sample_name),
@@ -319,12 +332,21 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Rgb(220, 180, 100)),
         ))]
     } else if app.focused_region == Region::Sidebar {
-        let mode_hint = match app.sidebar_mode {
-            SidebarMode::AddTrack => "Enter: add track",
-            SidebarMode::Audition => "Enter: swap sample",
+        let hint_text = match app.sidebar_mode {
+            SidebarMode::InstrumentPicker => {
+                "  \u{2191}\u{2193}: navigate  Enter: select instrument  Esc: back".to_string()
+            }
+            _ => {
+                let action = match app.sidebar_mode {
+                    SidebarMode::AddTrack => "Enter: add track",
+                    SidebarMode::Audition => "Enter: swap sample",
+                    _ => unreachable!(),
+                };
+                format!("  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  {}  Esc: back", action)
+            }
         };
         vec![Line::from(Span::styled(
-            format!("  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  {}  Esc: back", mode_hint),
+            hint_text,
             Style::default().fg(Color::Yellow),
         ))]
     } else if app.input_mode == InputMode::EffectPicker {
@@ -365,12 +387,12 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                     ))]
                 } else if app.params_column == 1 {
                     vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  +/-: adjust  [/]: step  Enter: toggle  Tab: region",
+                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  [/]: step  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),
                 ))]
                 } else {
                     vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  +/-: adjust  Enter: toggle  Tab: region",
+                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),
                 ))]
                 }

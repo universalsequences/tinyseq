@@ -11,11 +11,8 @@ use super::{
     TP_SWING, TP_TIMEBASE,
 };
 
-/// Static labels for the timebase dropdown.
-const TIMEBASE_LABELS: [&str; Timebase::COUNT] = [
-    "1", "2", "4", "8", "16", "32", "64",
-    "2T", "4T", "8T", "16T", "32T", "64T", "Prh",
-];
+/// Static labels for the timebase dropdown (derived from Timebase::LABELS).
+const TIMEBASE_LABELS: [&str; Timebase::COUNT] = Timebase::LABELS;
 
 // ── App impl: params input ──
 
@@ -27,7 +24,7 @@ impl App {
 
         match self.params_column {
             0 => self.handle_track_params_column(code),
-            1 => self.handle_effects_column(code),
+            1 => self.handle_effects_column(code, _modifiers),
             _ => {}
         }
     }
@@ -48,6 +45,14 @@ impl App {
             }
             KeyCode::Right => {
                 self.params_column = 1;
+                if self.is_current_custom_track() && self.effect_slot_cursor != super::SYNTH_TAB && self.effect_slot_cursor != super::REVERB_TAB {
+                    // Default to Synth tab for custom tracks
+                    let visible = self.visible_effect_indices();
+                    if !visible.contains(&self.effect_slot_cursor) {
+                        self.effect_slot_cursor = super::SYNTH_TAB;
+                        self.instrument_param_cursor = 0;
+                    }
+                }
             }
             KeyCode::Left => {} // Already at leftmost column
             KeyCode::Enter => {
@@ -79,10 +84,7 @@ impl App {
                     tp.set_num_steps(tp.get_num_steps() + 1);
                     self.clamp_cursor_to_steps();
                 }
-                TP_TIMEBASE => {
-                    tp.next_timebase();
-
-                }
+                TP_TIMEBASE => tp.next_timebase(),
                 TP_SEND => self.adjust_track_send(0.05),
                 _ => {}
             },
@@ -94,10 +96,7 @@ impl App {
                     tp.set_num_steps(tp.get_num_steps().saturating_sub(1).max(1));
                     self.clamp_cursor_to_steps();
                 }
-                TP_TIMEBASE => {
-                    tp.prev_timebase();
-
-                }
+                TP_TIMEBASE => tp.prev_timebase(),
                 TP_SEND => self.adjust_track_send(-0.05),
                 _ => {}
             },
@@ -180,6 +179,19 @@ impl App {
         if self.track_param_dropdown {
             return Timebase::COUNT;
         }
+        // Synth tab dropdown
+        if self.effect_slot_cursor == super::SYNTH_TAB {
+            if let Some(desc) = self.current_instrument_descriptor() {
+                if self.instrument_param_cursor < desc.params.len() {
+                    if let crate::effects::ParamKind::Enum { ref labels } =
+                        desc.params[self.instrument_param_cursor].kind
+                    {
+                        return labels.len();
+                    }
+                }
+            }
+            return 0;
+        }
         if let Some(desc) = self.current_slot_descriptor() {
             if self.effect_param_cursor < desc.params.len() {
                 if let crate::effects::ParamKind::Enum { ref labels } =
@@ -193,6 +205,19 @@ impl App {
     }
 
     pub(super) fn dropdown_labels(&self) -> &[String] {
+        // Synth tab dropdown
+        if self.effect_slot_cursor == super::SYNTH_TAB {
+            if let Some(desc) = self.current_instrument_descriptor() {
+                if self.instrument_param_cursor < desc.params.len() {
+                    if let crate::effects::ParamKind::Enum { ref labels } =
+                        desc.params[self.instrument_param_cursor].kind
+                    {
+                        return labels;
+                    }
+                }
+            }
+            return &[];
+        }
         if let Some(desc) = self.current_slot_descriptor() {
             if self.effect_param_cursor < desc.params.len() {
                 if let crate::effects::ParamKind::Enum { ref labels } =
@@ -216,6 +241,22 @@ impl App {
             } else {
                 // Track default
                 self.state.track_params[self.cursor_track].set_timebase(tb);
+            }
+            return;
+        }
+
+        // Synth tab dropdown
+        if self.effect_slot_cursor == super::SYNTH_TAB {
+            let val = self.dropdown_cursor as f32;
+            let param_idx = self.instrument_param_cursor;
+            let slot = &self.state.instrument_slots[self.cursor_track];
+            if self.has_selection() {
+                for step in self.selected_steps() {
+                    slot.plocks.set(step, param_idx, val);
+                }
+            } else {
+                slot.defaults.set(param_idx, val);
+                self.send_instrument_param(self.cursor_track, param_idx, val);
             }
             return;
         }

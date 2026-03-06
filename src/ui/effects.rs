@@ -1,4 +1,4 @@
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::sync::atomic::Ordering;
@@ -8,14 +8,32 @@ use crate::effects::{
     EffectDescriptor, EffectSlotState, ParamKind, SyncDivision, BUILTIN_SLOT_COUNT,
 };
 use crate::lisp_effect::{self, MAX_CUSTOM_FX};
+use crate::sequencer::InstrumentType;
 use crate::reverb;
 
 use super::params::draw_dropdown;
-use super::{App, InputMode, PendingCompile, Region, REVERB_TAB};
+use super::{App, InputMode, PendingCompile, Region, REVERB_TAB, SYNTH_TAB};
 
 // ── App impl: effect methods ──
 
 impl App {
+    fn instrument_base_note_offset(&self, track: usize) -> f32 {
+        f32::from_bits(
+            self.state.instrument_base_note_offsets[track].load(Ordering::Relaxed),
+        )
+    }
+
+    fn set_instrument_base_note_offset(&self, track: usize, value: f32) {
+        self.state.instrument_base_note_offsets[track]
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub(super) fn synth_row_count(&self) -> usize {
+        self.current_instrument_descriptor()
+            .map(|d| d.params.len() + 1)
+            .unwrap_or(1)
+    }
+
     /// Get the current slot's descriptor, if available.
     pub(super) fn current_slot_descriptor(&self) -> Option<&EffectDescriptor> {
         if self.tracks.is_empty() {
@@ -255,6 +273,80 @@ impl App {
         }
     }
 
+    /// Apply a compiled instrument result: add a custom track.
+    pub(super) fn apply_compiled_instrument(
+        &mut self,
+        result: lisp_effect::CompileResult,
+        name: &str,
+    ) {
+        match self.add_custom_track(name, &result.manifest, &result.lib) {
+            Ok(idx) => {
+                self.cursor_track = idx;
+                self.instrument_libs.push(result.lib);
+                self.sidebar_mode = super::SidebarMode::Audition;
+                self.focused_region = super::Region::Cirklon;
+                self.status_message =
+                    Some((format!("Added synth track '{}'", name), Instant::now()));
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Error: {}", e), Instant::now()));
+            }
+        }
+    }
+
+    /// Called from main loop after terminal is suspended — instrument editor flow.
+    pub fn run_instrument_editor_flow(&mut self) {
+        let last_source = match &self.pending_instrument_name {
+            Some(name) => lisp_effect::load_instrument_source(name).unwrap_or_default(),
+            None => String::new(),
+        };
+        let existing_name = self.pending_instrument_name.clone();
+
+        let result = lisp_effect::run_instrument_editor_flow(
+            &last_source,
+            existing_name.as_deref(),
+            self.sample_rate,
+        );
+
+        if let Some(r) = result {
+            // Hot-reload if editing an existing custom track
+            let is_existing_custom = self.cursor_track < self.track_instrument_types.len()
+                && self.track_instrument_types[self.cursor_track] == InstrumentType::Custom;
+
+            if is_existing_custom {
+                match self.hot_reload_instrument(self.cursor_track, &r.manifest, &r.lib) {
+                    Ok(()) => {
+                        self.tracks[self.cursor_track] = r.name.clone();
+                        self.instrument_libs.push(r.lib);
+                        self.status_message = Some((
+                            format!("Reloaded instrument '{}'", r.name),
+                            Instant::now(),
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                    }
+                }
+            } else {
+                match self.add_custom_track(&r.name, &r.manifest, &r.lib) {
+                    Ok(idx) => {
+                        self.cursor_track = idx;
+                        self.instrument_libs.push(r.lib);
+                        self.sidebar_mode = super::SidebarMode::Audition;
+                        self.focused_region = super::Region::Cirklon;
+                        self.status_message =
+                            Some((format!("Added synth track '{}'", r.name), Instant::now()));
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                    }
+                }
+            }
+        }
+
+        self.pending_instrument_name = None;
+    }
+
     fn filtered_picker_items(&self) -> Vec<String> {
         let mut items = vec!["+ New effect".to_string()];
         let filter_lower = self.picker_filter.to_lowercase();
@@ -315,36 +407,230 @@ impl App {
         }
     }
 
-    pub(super) fn handle_effects_column(&mut self, code: KeyCode) {
+    /// Handle keyboard input for the instrument picker overlay.
+    pub(super) fn handle_instrument_picker_overlay(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => {
+                self.picker_filter.push(c);
+                self.picker_cursor = 0;
+            }
+            KeyCode::Backspace => {
+                self.picker_filter.pop();
+                self.picker_cursor = 0;
+            }
+            KeyCode::Up => {
+                if self.picker_cursor > 0 {
+                    self.picker_cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let max = self.filtered_instrument_items().len();
+                if self.picker_cursor + 1 < max {
+                    self.picker_cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let items = self.filtered_instrument_items();
+                if self.picker_cursor < items.len() {
+                    let selected = &items[self.picker_cursor];
+                    if selected == "+ New instrument" {
+                        self.pending_instrument_name = None;
+                        self.pending_instrument_edit = true;
+                    } else {
+                        // Load saved instrument (compile in background, add track)
+                        let name = selected.clone();
+                        self.start_instrument_compile(&name);
+                    }
+                }
+                self.input_mode = super::InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                self.input_mode = super::InputMode::Normal;
+                if !self.tracks.is_empty() {
+                    self.sidebar_mode = super::SidebarMode::Audition;
+                    self.focused_region = super::Region::Cirklon;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn filtered_instrument_items(&self) -> Vec<String> {
+        let mut items = vec!["+ New instrument".to_string()];
+        let filter_lower = self.picker_filter.to_lowercase();
+        for name in &self.picker_items {
+            if filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower) {
+                items.push(name.clone());
+            }
+        }
+        items
+    }
+
+    /// Spawn a background thread to compile an instrument.
+    fn start_instrument_compile(&mut self, name: &str) {
+        let source = match lisp_effect::load_instrument_source(name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_message = Some((format!("Error: {e}"), Instant::now()));
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sample_rate = self.sample_rate;
+        std::thread::spawn(move || {
+            let result = lisp_effect::compile_and_load_instrument(&source, sample_rate);
+            let _ = tx.send(result);
+        });
+        self.pending_compile = Some(PendingCompile {
+            receiver: rx,
+            name: name.to_string(),
+            slot_idx: usize::MAX, // sentinel: instrument, not effect
+            cursor_track: self.cursor_track,
+            tick: 0,
+        });
+    }
+
+    pub(super) fn handle_effects_column(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Synth tab input handling
+        if self.effect_slot_cursor == SYNTH_TAB {
+            let shift = modifiers.contains(KeyModifiers::SHIFT);
+            match code {
+                KeyCode::Left => {
+                    self.params_column = 0; // Go to track params column
+                }
+                KeyCode::Right => {
+                    let visible = self.visible_effect_indices();
+                    if let Some(&first) = visible.first() {
+                        self.effect_slot_cursor = first;
+                        self.effect_param_cursor = 0;
+                    } else {
+                        self.effect_slot_cursor = REVERB_TAB;
+                        self.reverb_param_cursor = 0;
+                    }
+                }
+                KeyCode::Up => {
+                    if shift {
+                        if self.instrument_param_cursor == 0 {
+                            let next =
+                                (self.instrument_base_note_offset(self.cursor_track) + 1.0)
+                                    .clamp(-48.0, 48.0);
+                            self.set_instrument_base_note_offset(self.cursor_track, next);
+                        } else {
+                            self.adjust_instrument_param(1.0);
+                        }
+                    } else if self.instrument_param_cursor > 0 {
+                        self.instrument_param_cursor -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if shift {
+                        if self.instrument_param_cursor == 0 {
+                            let next =
+                                (self.instrument_base_note_offset(self.cursor_track) - 1.0)
+                                    .clamp(-48.0, 48.0);
+                            self.set_instrument_base_note_offset(self.cursor_track, next);
+                        } else {
+                            self.adjust_instrument_param(-1.0);
+                        }
+                    } else {
+                        let max = self.synth_row_count().saturating_sub(1);
+                        if self.instrument_param_cursor < max {
+                            self.instrument_param_cursor += 1;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if self.instrument_param_cursor == 0 {
+                        self.value_buffer.clear();
+                        self.input_mode = InputMode::ValueEntry;
+                    } else if let Some(desc) = self.current_instrument_descriptor() {
+                        let param_idx = self.instrument_param_cursor - 1;
+                        if param_idx < desc.params.len() {
+                            let param = &desc.params[param_idx];
+                            if param.is_boolean() {
+                                self.toggle_instrument_boolean();
+                            } else if param.is_enum() {
+                                self.dropdown_open = true;
+                                self.dropdown_cursor = 0;
+                                self.input_mode = InputMode::Dropdown;
+                                let slot = &self.state.instrument_slots[self.cursor_track];
+                                let val = slot.defaults.get(param_idx);
+                                self.dropdown_cursor = val.round() as usize;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+                    if self.instrument_param_cursor == 0 {
+                        self.value_buffer.clear();
+                        self.value_buffer.push(c);
+                        self.input_mode = InputMode::ValueEntry;
+                    } else if let Some(desc) = self.current_instrument_descriptor() {
+                        let param_idx = self.instrument_param_cursor - 1;
+                        if param_idx < desc.params.len() {
+                            let param = &desc.params[param_idx];
+                            if !param.is_boolean() {
+                                self.value_buffer.clear();
+                                self.value_buffer.push(c);
+                                self.input_mode = InputMode::ValueEntry;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('[') => {
+                    let ns = self.num_steps();
+                    self.cursor_step = if self.cursor_step == 0 {
+                        ns - 1
+                    } else {
+                        self.cursor_step - 1
+                    };
+                    self.selection_anchor = Some(self.cursor_step);
+                }
+                KeyCode::Char(']') => {
+                    let ns = self.num_steps();
+                    self.cursor_step = if self.cursor_step + 1 >= ns {
+                        0
+                    } else {
+                        self.cursor_step + 1
+                    };
+                    self.selection_anchor = Some(self.cursor_step);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.effect_slot_cursor == REVERB_TAB {
+            let shift = modifiers.contains(KeyModifiers::SHIFT);
             match code {
                 KeyCode::Left => {
                     let visible = self.visible_effect_indices();
                     if let Some(&last) = visible.last() {
                         self.effect_slot_cursor = last;
                         self.effect_param_cursor = 0;
+                    } else if self.is_current_custom_track() {
+                        self.effect_slot_cursor = SYNTH_TAB;
+                        self.instrument_param_cursor = 0;
                     } else {
                         self.params_column = 0;
                     }
                 }
                 KeyCode::Right => {} // Already at rightmost tab
                 KeyCode::Up => {
-                    if self.reverb_param_cursor > 0 {
+                    if shift {
+                        self.adjust_reverb_param(0.05);
+                    } else if self.reverb_param_cursor > 0 {
                         self.reverb_param_cursor -= 1;
                     }
                 }
                 KeyCode::Down => {
-                    if self.reverb_param_cursor < 2 {
+                    if shift {
+                        self.adjust_reverb_param(-0.05);
+                    } else if self.reverb_param_cursor < 2 {
                         self.reverb_param_cursor += 1;
                     }
                 }
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    self.adjust_reverb_param(0.05);
-                }
-                KeyCode::Char('-') => {
-                    self.adjust_reverb_param(-0.05);
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
                     self.value_buffer.clear();
                     self.value_buffer.push(c);
                     self.input_mode = InputMode::ValueEntry;
@@ -373,6 +659,7 @@ impl App {
         }
 
         let visible = self.visible_effect_indices();
+        let shift = modifiers.contains(KeyModifiers::SHIFT);
 
         match code {
             KeyCode::Left => {
@@ -380,9 +667,15 @@ impl App {
                     if pos > 0 {
                         self.effect_slot_cursor = visible[pos - 1];
                         self.effect_param_cursor = 0;
+                    } else if self.is_current_custom_track() {
+                        self.effect_slot_cursor = SYNTH_TAB;
+                        self.instrument_param_cursor = 0;
                     } else {
                         self.params_column = 0;
                     }
+                } else if self.is_current_custom_track() {
+                    self.effect_slot_cursor = SYNTH_TAB;
+                    self.instrument_param_cursor = 0;
                 } else {
                     self.params_column = 0;
                 }
@@ -404,12 +697,16 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if self.effect_param_cursor > 0 {
+                if shift {
+                    self.adjust_slot_param(1.0);
+                } else if self.effect_param_cursor > 0 {
                     self.effect_param_cursor -= 1;
                 }
             }
             KeyCode::Down => {
-                if let Some(desc) = self.current_slot_descriptor() {
+                if shift {
+                    self.adjust_slot_param(-1.0);
+                } else if let Some(desc) = self.current_slot_descriptor() {
                     let max = desc.params.len().saturating_sub(1);
                     if self.effect_param_cursor < max {
                         self.effect_param_cursor += 1;
@@ -433,13 +730,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.adjust_slot_param(1.0);
-            }
-            KeyCode::Char('-') => {
-                self.adjust_slot_param(-1.0);
-            }
-            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
                 if let Some(desc) = self.current_slot_descriptor() {
                     if self.effect_param_cursor < desc.params.len() {
                         let param = &desc.params[self.effect_param_cursor];
@@ -670,6 +961,102 @@ impl App {
             None => 0.0,
         }
     }
+
+    /// Whether the current track is a custom instrument (has Synth tab).
+    pub(super) fn is_current_custom_track(&self) -> bool {
+        !self.is_sampler_track(self.cursor_track)
+    }
+
+    /// Get the instrument descriptor for the current track, if it's a custom instrument.
+    pub(super) fn current_instrument_descriptor(&self) -> Option<&EffectDescriptor> {
+        if !self.is_current_custom_track() {
+            return None;
+        }
+        self.instrument_descriptors.get(self.cursor_track)
+    }
+
+    /// Adjust an instrument param (Synth tab) by direction (+1 or -1).
+    fn adjust_instrument_param(&self, direction: f32) {
+        let track = self.cursor_track;
+        if self.instrument_param_cursor == 0 {
+            return;
+        }
+        let param_idx = self.instrument_param_cursor - 1;
+
+        let desc = match self.instrument_descriptors.get(track) {
+            Some(d) => d,
+            None => return,
+        };
+        if param_idx >= desc.params.len() {
+            return;
+        }
+        let param_desc = &desc.params[param_idx];
+        let slot = &self.state.instrument_slots[track];
+
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let inc = param_desc.increment(current);
+                let new_val = param_desc.clamp(current + direction * inc);
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let old = slot.defaults.get(param_idx);
+            let inc = param_desc.increment(old);
+            let new_val = param_desc.clamp(old + direction * inc);
+            slot.defaults.set(param_idx, new_val);
+            self.send_instrument_param(track, param_idx, new_val);
+        }
+    }
+
+    /// Send an instrument param value to ALL synth nodes for a track.
+    pub(super) fn send_instrument_param(&self, track: usize, param_idx: usize, value: f32) {
+        let slot = &self.state.instrument_slots[track];
+        let idx = slot.resolve_node_idx(param_idx);
+        if let Some(synth_ids) = self.track_synth_node_ids.get(track) {
+            for &synth_id in synth_ids {
+                unsafe {
+                    crate::audiograph::params_push_wrapper(
+                        self.lg.0,
+                        crate::audiograph::ParamMsg {
+                            idx,
+                            logical_id: synth_id as u64,
+                            fvalue: value,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Toggle a boolean instrument param (Synth tab).
+    fn toggle_instrument_boolean(&self) {
+        let track = self.cursor_track;
+        if self.instrument_param_cursor == 0 {
+            return;
+        }
+        let param_idx = self.instrument_param_cursor - 1;
+        let slot = &self.state.instrument_slots[track];
+
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let current = slot.defaults.get(param_idx);
+            let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+            slot.defaults.set(param_idx, new_val);
+            self.send_instrument_param(track, param_idx, new_val);
+        }
+    }
 }
 
 // ── Drawing ──
@@ -690,6 +1077,31 @@ pub(super) fn draw_effects_column(
     // Build title with slot tabs — only show non-empty slots + [+] button
     let visible = app.visible_effect_indices();
     let mut title_spans = vec![];
+
+    // Synth tab (only for custom instrument tracks, shown first)
+    if app.is_current_custom_track() {
+        let synth_selected = app.effect_slot_cursor == SYNTH_TAB;
+        let synth_style = if synth_selected && col_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(100, 200, 140))
+                .bold()
+        } else if synth_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(60, 120, 80))
+        } else {
+            Style::default().fg(Color::Rgb(60, 120, 80))
+        };
+        let synth_label = if synth_selected {
+            "[< Synth >]"
+        } else {
+            "[  Synth  ]"
+        };
+        title_spans.push(Span::styled(synth_label, synth_style));
+        title_spans.push(Span::raw(" "));
+    }
+
     if let Some(descs) = app.effect_descriptors.get(app.cursor_track) {
         for &i in &visible {
             if i >= descs.len() {
@@ -758,6 +1170,176 @@ pub(super) fn draw_effects_column(
     app.layout.effects_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
+        return;
+    }
+
+    // Synth tab rendering
+    if app.effect_slot_cursor == SYNTH_TAB {
+        let desc = match app.instrument_descriptors.get(app.cursor_track) {
+            Some(d) if !d.params.is_empty() => d,
+            _ => return,
+        };
+        let slot = &app.state.instrument_slots[app.cursor_track];
+        let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+
+        for row_idx in 0..app.synth_row_count() {
+            let row_y = inner.y + row_idx as u16;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+
+            let is_base_row = row_idx == 0;
+            let param_idx = row_idx.saturating_sub(1);
+            let param_desc = if is_base_row {
+                None
+            } else {
+                Some(&desc.params[param_idx])
+            };
+            let default_val = if is_base_row {
+                app.instrument_base_note_offset(app.cursor_track)
+            } else {
+                slot.defaults.get(param_idx)
+            };
+            let is_cursor_row = col_focused && app.instrument_param_cursor == row_idx;
+            let cursor = if is_cursor_row { "> " } else { "  " };
+            let cursor_style = if is_cursor_row {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Rgb(100, 200, 140))
+            };
+
+            let label_width = 12;
+            let value_width = 14;
+
+            // Value entry mode
+            if is_cursor_row && is_entering_value {
+                let target_label = if !app.visual_steps.is_empty() {
+                    format!("p-lock {} steps", app.visual_steps.len())
+                } else if app.selection_anchor.is_some() {
+                    let (lo, hi) = app.selected_range();
+                    format!("p-lock steps {}-{}", lo + 1, hi + 1)
+                } else {
+                    "default".to_string()
+                };
+                let spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(
+                        format!(
+                            "{:<width$}",
+                            if is_base_row { "base_note" } else { &param_desc.unwrap().name },
+                            width = label_width
+                        ),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("{}\u{2588}", app.value_buffer),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 60, 20))
+                            .bold(),
+                    ),
+                    Span::styled(
+                        format!("  ({})  Enter: set  Esc: cancel", target_label),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                let line = Line::from(spans);
+                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+                frame.render_widget(Paragraph::new(line), row_area);
+                continue;
+            }
+
+            // Determine display value and p-lock status
+            let (display_val, plock_label) = if !is_base_row && app.has_selection() && is_cursor_row {
+                let plock_val = slot.plocks.get(app.cursor_step, param_idx);
+                match plock_val {
+                    Some(v) => (v, Some(" (p-lock)")),
+                    None => (default_val, None),
+                }
+            } else {
+                (default_val, None)
+            };
+
+            let formatted = if is_base_row {
+                format!("{:.0} st", display_val)
+            } else {
+                param_desc.unwrap().format_value(display_val)
+            };
+
+            let mut spans = vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(
+                    format!(
+                        "{:<width$}",
+                        if is_base_row { "base_note" } else { &param_desc.unwrap().name },
+                        width = label_width
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("{:<width$}", formatted, width = value_width),
+                    cursor_style,
+                ),
+            ];
+
+            if let Some(lbl) = plock_label {
+                spans.push(Span::styled(lbl, Style::default().fg(Color::White)));
+            }
+
+            // Slider
+            if is_base_row || !param_desc.unwrap().is_boolean() {
+                let range = if is_base_row {
+                    96.0
+                } else {
+                    param_desc.unwrap().max - param_desc.unwrap().min
+                };
+                if range > 0.0 {
+                    let (slider_val, is_plock) = if is_base_row {
+                        (default_val, false)
+                    } else if app.has_selection() {
+                        let pv = slot.plocks.get(app.cursor_step, param_idx);
+                        (pv.unwrap_or(default_val), pv.is_some())
+                    } else if app.state.is_playing() {
+                        let step = app.state.track_step(app.cursor_track);
+                        let pv = slot.plocks.get(step, param_idx);
+                        (pv.unwrap_or(default_val), pv.is_some())
+                    } else {
+                        (default_val, false)
+                    };
+                    let norm = if is_base_row {
+                        ((slider_val + 48.0) / 96.0).clamp(0.0, 1.0)
+                    } else {
+                        param_desc.unwrap().normalize(slider_val)
+                    };
+                    let slider_width =
+                        (inner.width as usize).saturating_sub(label_width + value_width + 6);
+                    if slider_width > 2 {
+                        let filled =
+                            ((norm * slider_width as f32).round() as usize).min(slider_width);
+                        let bar: String =
+                            "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
+                        let slider_color = if is_plock {
+                            Color::Cyan
+                        } else {
+                            Color::Rgb(100, 200, 140)
+                        };
+                        spans.push(Span::styled(
+                            format!("[{}]", bar),
+                            Style::default().fg(slider_color),
+                        ));
+                    }
+                }
+            }
+
+            let line = Line::from(spans);
+            let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+            frame.render_widget(Paragraph::new(line), row_area);
+        }
+
+        // Dropdown overlay for synth tab
+        if app.dropdown_open && col_focused {
+            draw_dropdown(frame, app, inner);
+        }
         return;
     }
 
@@ -1117,5 +1699,70 @@ pub(super) fn draw_compiling_overlay(frame: &mut Frame, pending: &PendingCompile
             Paragraph::new(line1),
             Rect::new(inner.x, center_y, inner.width, 1),
         );
+    }
+}
+
+pub(super) fn draw_instrument_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app.filtered_instrument_items();
+    let max_visible = 10usize;
+    let list_height = items.len().min(max_visible) as u16;
+    let w = 36u16;
+    let h = list_height + 4;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let picker_area = Rect::new(x, y, w, h);
+
+    let bg = Style::default().bg(Color::Rgb(20, 20, 20));
+    for row in 0..h {
+        let row_area = Rect::new(x, y + row, w, 1);
+        frame.render_widget(Paragraph::new(" ".repeat(w as usize)).style(bg), row_area);
+    }
+
+    let block = Block::default()
+        .title(" Instruments ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+
+    let filter_text = format!(" > {}\u{2588}", app.picker_filter);
+    let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
+    let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(Paragraph::new(filter_line), filter_area);
+
+    let list_start_y = inner.y + 1;
+    for (i, item) in items.iter().enumerate() {
+        if i >= max_visible {
+            break;
+        }
+        let row_y = list_start_y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let is_cursor = i == app.picker_cursor;
+        let style = if is_cursor {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else if item == "+ New instrument" {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let prefix = if is_cursor { " > " } else { "   " };
+        let truncated: String = item
+            .chars()
+            .take((inner.width as usize).saturating_sub(4))
+            .collect();
+        let text = format!(
+            "{}{:<width$}",
+            prefix,
+            truncated,
+            width = (inner.width as usize).saturating_sub(3)
+        );
+        let row_area = Rect::new(inner.x, row_y, inner.width, 1);
+        frame.render_widget(Paragraph::new(text).style(style), row_area);
     }
 }

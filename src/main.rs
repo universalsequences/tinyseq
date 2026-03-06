@@ -7,6 +7,8 @@ mod effects;
 #[allow(dead_code)]
 mod filter;
 #[allow(dead_code)]
+mod gatepitch;
+#[allow(dead_code)]
 mod lisp_effect;
 #[allow(dead_code)]
 mod reverb;
@@ -21,9 +23,10 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ensure samples/ and effects/ directories exist
+    // Ensure samples/, effects/, and instruments/ directories exist
     std::fs::create_dir_all("samples").ok();
     std::fs::create_dir_all("effects").ok();
+    std::fs::create_dir_all("instruments").ok();
 
     // Query audio device
     let (sample_rate, channels) = audio::query_device_config()?;
@@ -154,6 +157,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             terminal.show_cursor()?;
 
             app.run_lisp_editor_flow();
+
+            // Resume terminal
+            crossterm::terminal::enable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+            terminal.clear()?;
+        }
+        if app.pending_instrument_edit {
+            app.pending_instrument_edit = false;
+
+            // Suspend terminal for editor
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+
+            app.run_instrument_editor_flow();
 
             // Resume terminal
             crossterm::terminal::enable_raw_mode()?;
