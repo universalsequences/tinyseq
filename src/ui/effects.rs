@@ -1233,7 +1233,24 @@ impl App {
     pub(super) fn send_instrument_param(&self, track: usize, param_idx: usize, value: f32) {
         let slot = &self.state.instrument_slots[track];
         let idx = slot.resolve_node_idx(param_idx);
-        if let Some(synth_ids) = self.graph.track_synth_node_ids.get(track) {
+        let Some(engine_id) = self.graph.track_engine_ids.get(track).and_then(|id| *id) else {
+            return;
+        };
+        let engine_track_uses = self
+            .graph
+            .track_engine_ids
+            .iter()
+            .filter(|bound| **bound == Some(engine_id))
+            .count();
+        if engine_track_uses > 1 {
+            return;
+        }
+        let synth_ids = self
+            .graph
+            .engine_node_ids
+            .get(engine_id)
+            .and_then(|engine| engine.as_ref().map(|engine| &engine.synth_ids));
+        if let Some(synth_ids) = synth_ids {
             for &synth_id in synth_ids {
                 unsafe {
                     crate::audiograph::params_push_wrapper(

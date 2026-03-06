@@ -888,6 +888,16 @@ pub struct SequencerState {
     pub instrument_type_flags: Vec<AtomicU32>,
     /// Per-track synth node IDs (up to MAX_VOICES per track), for sending instrument params.
     pub synth_node_ids: Vec<[AtomicU32; MAX_VOICES]>,
+    /// Per-track engine binding. `u32::MAX` means no engine / sampler track.
+    pub track_engine_ids: Vec<AtomicU32>,
+    /// Per-engine custom voice logical IDs (GatePitch node LIDs).
+    pub engine_voice_lids: Vec<[AtomicU64; MAX_VOICES]>,
+    /// Per-engine synth node IDs.
+    pub engine_synth_node_ids: Vec<[AtomicU32; MAX_VOICES]>,
+    /// Number of voices allocated for each engine.
+    pub engine_voice_counts: Vec<AtomicU32>,
+    /// Per-engine, per-voice, per-track route gain logical IDs.
+    pub engine_route_lids: Vec<[[AtomicU64; MAX_TRACKS]; MAX_VOICES]>,
     /// Per-track instrument param slots (synth params for custom instruments).
     pub instrument_slots: Vec<EffectSlotState>,
     /// Per-track host-side semitone offset for custom instrument pitch interpretation.
@@ -963,6 +973,19 @@ impl SequencerState {
             instrument_type_flags: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
             synth_node_ids: (0..MAX_TRACKS)
                 .map(|_| std::array::from_fn(|_| AtomicU32::new(0)))
+                .collect(),
+            track_engine_ids: (0..MAX_TRACKS).map(|_| AtomicU32::new(u32::MAX)).collect(),
+            engine_voice_lids: (0..MAX_TRACKS)
+                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+                .collect(),
+            engine_synth_node_ids: (0..MAX_TRACKS)
+                .map(|_| std::array::from_fn(|_| AtomicU32::new(0)))
+                .collect(),
+            engine_voice_counts: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
+            engine_route_lids: (0..MAX_TRACKS)
+                .map(|_| {
+                    std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+                })
                 .collect(),
             instrument_slots: (0..MAX_TRACKS).map(|_| EffectSlotState::empty()).collect(),
             instrument_base_note_offsets: (0..MAX_TRACKS)

@@ -84,6 +84,12 @@ pub struct CachedInstrumentEngine {
     pub lib_index: usize,
 }
 
+pub struct EngineNodeIds {
+    pub synth_ids: Vec<i32>,
+    pub gatepitch_ids: Vec<i32>,
+    pub route_gain_ids: Vec<Vec<i32>>,
+}
+
 pub struct EditorState {
     pending_editor: Option<PendingEditor>,
     pending_compile: Option<PendingCompile>,
@@ -123,6 +129,7 @@ pub struct GraphState {
     pub track_engine_ids: Vec<Option<usize>>,
     pub track_synth_node_ids: Vec<Vec<i32>>,
     pub track_gatepitch_node_ids: Vec<Vec<i32>>,
+    pub engine_node_ids: Vec<Option<EngineNodeIds>>,
     pub effect_descriptors: Vec<Vec<EffectDescriptor>>,
     pub instrument_descriptors: Vec<EffectDescriptor>,
     pub record_armed: Vec<bool>,
@@ -373,6 +380,7 @@ impl App {
                 track_engine_ids: Vec::new(),
                 track_synth_node_ids: Vec::new(),
                 track_gatepitch_node_ids: Vec::new(),
+                engine_node_ids: Vec::new(),
                 effect_descriptors: Vec::new(),
                 instrument_descriptors: Vec::new(),
                 record_armed: Vec::new(),

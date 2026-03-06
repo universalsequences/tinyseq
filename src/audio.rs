@@ -101,7 +101,121 @@ struct AudioCallbackData {
     sample_rate: f64,
     last_bpm: u32,
     voice_pools: Vec<VoicePool>,
+    custom_engine_pools: Vec<CustomEnginePool>,
     keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
+}
+
+struct CustomVoiceSlot {
+    logical_id: u64,
+    age: u64,
+    active: bool,
+    note: f32,
+    assigned_track: Option<usize>,
+}
+
+struct CustomEnginePool {
+    voices: [CustomVoiceSlot; MAX_VOICES],
+    num_voices: usize,
+    age_counter: u64,
+}
+
+impl CustomEnginePool {
+    fn new() -> Self {
+        Self {
+            voices: std::array::from_fn(|_| CustomVoiceSlot {
+                logical_id: 0,
+                age: 0,
+                active: false,
+                note: 0.0,
+                assigned_track: None,
+            }),
+            num_voices: 0,
+            age_counter: 0,
+        }
+    }
+
+    fn add_voice(&mut self, logical_id: u64) {
+        if self.num_voices < MAX_VOICES {
+            self.voices[self.num_voices] = CustomVoiceSlot {
+                logical_id,
+                age: 0,
+                active: false,
+                note: 0.0,
+                assigned_track: None,
+            };
+            self.num_voices += 1;
+        }
+    }
+
+    fn allocate_voice(&mut self, track: usize, note: f32, polyphonic: bool) -> usize {
+        self.age_counter += 1;
+        if !polyphonic {
+            if let Some(idx) = (0..self.num_voices)
+                .find(|&i| self.voices[i].assigned_track == Some(track))
+            {
+                let slot = &mut self.voices[idx];
+                slot.age = self.age_counter;
+                slot.active = true;
+                slot.note = note;
+                slot.assigned_track = Some(track);
+                return idx;
+            }
+        }
+
+        let mut free_idx = None;
+        let mut free_age = u64::MAX;
+        let mut oldest_same_track = None;
+        let mut oldest_same_track_age = u64::MAX;
+        let mut oldest_idx = 0;
+        let mut oldest_age = u64::MAX;
+
+        for i in 0..self.num_voices {
+            let voice = &self.voices[i];
+            if !voice.active && voice.age < free_age {
+                free_idx = Some(i);
+                free_age = voice.age;
+            }
+            if voice.assigned_track == Some(track) && voice.age < oldest_same_track_age {
+                oldest_same_track = Some(i);
+                oldest_same_track_age = voice.age;
+            }
+            if voice.age < oldest_age {
+                oldest_idx = i;
+                oldest_age = voice.age;
+            }
+        }
+
+        let idx = free_idx.or(oldest_same_track).unwrap_or(oldest_idx);
+        let slot = &mut self.voices[idx];
+        slot.age = self.age_counter;
+        slot.active = true;
+        slot.note = note;
+        slot.assigned_track = Some(track);
+        idx
+    }
+
+    fn release_voice_by_note(&mut self, track: usize, note: f32) -> Option<u64> {
+        for i in 0..self.num_voices {
+            let voice = &mut self.voices[i];
+            if voice.active
+                && voice.assigned_track == Some(track)
+                && (voice.note - note).abs() < 0.01
+            {
+                voice.active = false;
+                return Some(voice.logical_id);
+            }
+        }
+        None
+    }
+
+    fn release_voice_by_logical_id(&mut self, logical_id: u64) {
+        for i in 0..self.num_voices {
+            if self.voices[i].logical_id == logical_id {
+                self.voices[i].active = false;
+                return;
+            }
+        }
+    }
 }
 
 /// Send a trigger to the sampler with the given per-step params, gate length, and explicit transpose.
@@ -331,8 +445,13 @@ fn custom_pitch_hz(transpose: f32, base_note_offset: f32) -> f32 {
     440.0 * 2f32.powf((transpose + base_note_offset) / 12.0)
 }
 
-fn is_mono_voice_pool(pool: &VoicePool) -> bool {
-    !pool.polyphonic || pool.num_voices <= 1
+fn track_engine_id(state: &SequencerState, track_idx: usize) -> Option<usize> {
+    let engine_id = state.track_engine_ids[track_idx].load(Ordering::Relaxed);
+    if engine_id == u32::MAX {
+        None
+    } else {
+        Some(engine_id as usize)
+    }
 }
 
 /// Dispatch effect p-locks for all slots in a track's effect chain.
@@ -366,53 +485,92 @@ unsafe fn dispatch_effect_chain_for_track(
     }
 }
 
-/// Dispatch instrument param values (with p-lock support) to all synth nodes for a custom track.
-unsafe fn dispatch_instrument_params_for_track(
+unsafe fn route_custom_voice_to_track(
+    lg: *mut LiveGraph,
+    state: &SequencerState,
+    engine_id: usize,
+    voice_idx: usize,
+    track_idx: usize,
+) {
+    let num_tracks = state.active_track_count();
+    for t in 0..num_tracks {
+        let lid = state.engine_route_lids[engine_id][voice_idx][t].load(Ordering::Relaxed);
+        if lid == 0 {
+            continue;
+        }
+        params_push_wrapper(
+            lg,
+            ParamMsg {
+                idx: 0,
+                logical_id: lid,
+                fvalue: if t == track_idx { 1.0 } else { 0.0 },
+            },
+        );
+    }
+}
+
+/// Dispatch instrument param values (with p-lock support) to a selected synth node.
+unsafe fn dispatch_instrument_params_to_voice(
     lg: *mut LiveGraph,
     state: &SequencerState,
     track_idx: usize,
     step: usize,
+    synth_id: u64,
 ) {
     let slot = &state.instrument_slots[track_idx];
     let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
     if num_params == 0 {
         return;
     }
-    let vc = state.voice_counts[track_idx].load(Ordering::Acquire) as usize;
-    for v in 0..vc {
-        let synth_id = state.synth_node_ids[track_idx][v].load(Ordering::Relaxed);
-        if synth_id == 0 {
-            continue;
-        }
-        for param_idx in 0..num_params {
-            let value = slot
-                .plocks
-                .get(step, param_idx)
-                .unwrap_or_else(|| slot.defaults.get(param_idx));
-            let idx = slot.resolve_node_idx(param_idx);
-            params_push_wrapper(
-                lg,
-                ParamMsg {
-                    idx,
-                    logical_id: synth_id as u64,
-                    fvalue: value,
-                },
-            );
-        }
+    for param_idx in 0..num_params {
+        let value = slot
+            .plocks
+            .get(step, param_idx)
+            .unwrap_or_else(|| slot.defaults.get(param_idx));
+        let idx = slot.resolve_node_idx(param_idx);
+        params_push_wrapper(
+            lg,
+            ParamMsg {
+                idx,
+                logical_id: synth_id,
+                fvalue: value,
+            },
+        );
+    }
+}
+
+unsafe fn dispatch_instrument_defaults_to_voice(
+    lg: *mut LiveGraph,
+    state: &SequencerState,
+    track_idx: usize,
+    synth_id: u64,
+) {
+    let slot = &state.instrument_slots[track_idx];
+    let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+    for param_idx in 0..num_params {
+        let idx = slot.resolve_node_idx(param_idx);
+        params_push_wrapper(
+            lg,
+            ParamMsg {
+                idx,
+                logical_id: synth_id,
+                fvalue: slot.defaults.get(param_idx),
+            },
+        );
     }
 }
 
 /// Fire a step trigger for a track (handles gate, chop setup, envelope params).
 /// Uses voice pool allocation for polyphonic playback.
 fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize) {
-    let sampler_lid = data.state.sampler_lids[track_idx].load(Ordering::Acquire);
-    if sampler_lid == 0 {
-        return;
-    }
     let sd = &data.state.step_data[track_idx];
     let tp = &data.state.track_params[track_idx];
     let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
     let is_custom = data.state.instrument_type_flags[track_idx].load(Ordering::Relaxed) == 1;
+    let sampler_lid = data.state.sampler_lids[track_idx].load(Ordering::Acquire);
+    if !is_custom && sampler_lid == 0 {
+        return;
+    }
 
     let chop = sd.get(step, StepParam::Chop).round() as u32;
     let chop = chop.max(1);
@@ -432,26 +590,55 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
         f32::from_bits(data.state.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed));
 
     // Sync polyphonic setting from track params
-    data.voice_pools[track_idx].polyphonic = tp.is_polyphonic();
+    let track_polyphonic = tp.is_polyphonic();
+    data.voice_pools[track_idx].polyphonic = track_polyphonic;
+    let engine_id = if is_custom {
+        track_engine_id(&data.state, track_idx)
+    } else {
+        None
+    };
 
     // Check chord data: if chord has notes, trigger each note on its own voice
     let chord_count = data.state.chord_data[track_idx].count(step);
     if chord_count > 0 {
         for n in 0..chord_count {
             let transpose = data.state.chord_data[track_idx].get(step, n);
-            let voice = data.voice_pools[track_idx].allocate_voice(transpose);
-            let voice_lid = voice.logical_id;
-            let lid = if voice_lid != 0 {
-                voice_lid
-            } else {
-                sampler_lid
-            };
             if is_custom {
+                let Some(engine_id) = engine_id else {
+                    continue;
+                };
+                let voice_idx = data.custom_engine_pools[engine_id]
+                    .allocate_voice(track_idx, transpose, track_polyphonic);
+                let lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+                let synth_id =
+                    data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+                if lid == 0 || synth_id == 0 {
+                    continue;
+                }
                 let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
-                if is_mono_voice_pool(&data.voice_pools[track_idx]) {
+                if !track_polyphonic {
                     data.gate_off_state[track_idx].cancel(lid);
                     unsafe {
+                        route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
+                        dispatch_instrument_params_to_voice(
+                            data.lg.0,
+                            &data.state,
+                            track_idx,
+                            step,
+                            synth_id as u64,
+                        );
                         send_custom_note_off(data.lg.0, lid);
+                    }
+                } else {
+                    unsafe {
+                        route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
+                        dispatch_instrument_params_to_voice(
+                            data.lg.0,
+                            &data.state,
+                            track_idx,
+                            step,
+                            synth_id as u64,
+                        );
                     }
                 }
                 unsafe {
@@ -461,6 +648,13 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                     data.gate_off_state[track_idx].schedule(lid, total_gate as f64);
                 }
             } else {
+                let voice = data.voice_pools[track_idx].allocate_voice(transpose);
+                let voice_lid = voice.logical_id;
+                let lid = if voice_lid != 0 {
+                    voice_lid
+                } else {
+                    sampler_lid
+                };
                 unsafe {
                     send_trigger(
                         data.lg.0,
@@ -479,19 +673,42 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     } else {
         // Single-note mode: use StepParam::Transpose
         let transpose = sd.get(step, StepParam::Transpose);
-        let voice = data.voice_pools[track_idx].allocate_voice(transpose);
-        let voice_lid = voice.logical_id;
-        let lid = if voice_lid != 0 {
-            voice_lid
-        } else {
-            sampler_lid
-        };
         if is_custom {
+            let Some(engine_id) = engine_id else {
+                return;
+            };
+            let voice_idx = data.custom_engine_pools[engine_id]
+                .allocate_voice(track_idx, transpose, track_polyphonic);
+            let lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+            let synth_id =
+                data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+            if lid == 0 || synth_id == 0 {
+                return;
+            }
             let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
-            if is_mono_voice_pool(&data.voice_pools[track_idx]) {
+            if !track_polyphonic {
                 data.gate_off_state[track_idx].cancel(lid);
                 unsafe {
+                    route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
+                    dispatch_instrument_params_to_voice(
+                        data.lg.0,
+                        &data.state,
+                        track_idx,
+                        step,
+                        synth_id as u64,
+                    );
                     send_custom_note_off(data.lg.0, lid);
+                }
+            } else {
+                unsafe {
+                    route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
+                    dispatch_instrument_params_to_voice(
+                        data.lg.0,
+                        &data.state,
+                        track_idx,
+                        step,
+                        synth_id as u64,
+                    );
                 }
             }
             unsafe {
@@ -501,6 +718,13 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                 data.gate_off_state[track_idx].schedule(lid, total_gate as f64);
             }
         } else {
+            let voice = data.voice_pools[track_idx].allocate_voice(transpose);
+            let voice_lid = voice.logical_id;
+            let lid = if voice_lid != 0 {
+                voice_lid
+            } else {
+                sampler_lid
+            };
             unsafe {
                 send_trigger(
                     data.lg.0,
@@ -534,13 +758,6 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
 
     data.state.trigger_flash[track_idx].store(255, Ordering::Relaxed);
 
-    // Dispatch instrument params (synth tab p-locks) for custom tracks
-    if is_custom {
-        unsafe {
-            dispatch_instrument_params_for_track(data.lg.0, &data.state, track_idx, step);
-        }
-    }
-
     // Setup chop re-triggers (sampler only — custom instruments handle gate duration internally)
     if !is_custom && chop > 1 {
         data.chop_state[track_idx] = ChopTracker {
@@ -572,6 +789,19 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 }
             }
         }
+
+        if let Some(engine_id) = track_engine_id(&data.state, t) {
+            let pool = &mut data.custom_engine_pools[engine_id];
+            let vc = data.state.engine_voice_counts[engine_id].load(Ordering::Acquire) as usize;
+            if pool.num_voices < vc {
+                for v in pool.num_voices..vc.min(MAX_VOICES) {
+                    let lid = data.state.engine_voice_lids[engine_id][v].load(Ordering::Acquire);
+                    if lid != 0 {
+                        pool.add_voice(lid);
+                    }
+                }
+            }
+        }
     }
 
     // Process keyboard triggers
@@ -579,34 +809,41 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         if kt.track >= num_tracks {
             continue;
         }
-        data.voice_pools[kt.track].polyphonic = data.state.track_params[kt.track].is_polyphonic();
         let is_custom = data.state.instrument_type_flags[kt.track].load(Ordering::Relaxed) == 1;
+        let track_polyphonic = data.state.track_params[kt.track].is_polyphonic();
+        data.voice_pools[kt.track].polyphonic = track_polyphonic;
         let base_note_offset = f32::from_bits(
             data.state.instrument_base_note_offsets[kt.track].load(Ordering::Relaxed),
         );
 
         if kt.note_off {
             // Note-off: find the voice playing this note and stop it
-            let pool = &mut data.voice_pools[kt.track];
-            if is_custom && is_mono_voice_pool(pool) && pool.num_voices > 0 {
-                let lid = pool.voices[0].logical_id;
-                pool.voices[0].active = false;
-                if lid != 0 {
+            if is_custom {
+                let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
+                    continue;
+                };
+                let pool = &mut data.custom_engine_pools[engine_id];
+                if !track_polyphonic {
+                    if let Some(lid) = pool.release_voice_by_note(kt.track, kt.transpose) {
+                        unsafe {
+                            send_custom_note_off(data.lg.0, lid);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(lid) = pool.release_voice_by_note(kt.track, kt.transpose) {
                     unsafe {
                         send_custom_note_off(data.lg.0, lid);
                     }
                 }
-                continue;
-            }
-            for v in 0..pool.num_voices {
-                if pool.voices[v].active && (pool.voices[v].note - kt.transpose).abs() < 0.01 {
-                    let lid = pool.voices[v].logical_id;
-                    pool.voices[v].active = false;
-                    if lid != 0 {
-                        unsafe {
-                            if is_custom {
-                                send_custom_note_off(data.lg.0, lid);
-                            } else {
+            } else {
+                let pool = &mut data.voice_pools[kt.track];
+                for v in 0..pool.num_voices {
+                    if pool.voices[v].active && (pool.voices[v].note - kt.transpose).abs() < 0.01 {
+                        let lid = pool.voices[v].logical_id;
+                        pool.voices[v].active = false;
+                        if lid != 0 {
+                            unsafe {
                                 params_push_wrapper(
                                     data.lg.0,
                                     ParamMsg {
@@ -617,20 +854,41 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                                 );
                             }
                         }
+                        break;
                     }
-                    break;
                 }
             }
         } else {
             // Note-on: allocate voice and trigger
-            let voice = data.voice_pools[kt.track].allocate_voice(kt.transpose);
-            let voice_lid = voice.logical_id;
-            if voice_lid == 0 {
-                continue;
-            }
             if is_custom {
+                let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
+                    continue;
+                };
+                let voice_idx = data.custom_engine_pools[engine_id]
+                    .allocate_voice(kt.track, kt.transpose, track_polyphonic);
+                let voice_lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+                let synth_id =
+                    data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+                if voice_lid == 0 || synth_id == 0 {
+                    continue;
+                }
                 let pitch_hz = custom_pitch_hz(kt.transpose, base_note_offset);
-                if is_mono_voice_pool(&data.voice_pools[kt.track]) {
+                unsafe {
+                    route_custom_voice_to_track(
+                        data.lg.0,
+                        &data.state,
+                        engine_id,
+                        voice_idx,
+                        kt.track,
+                    );
+                    dispatch_instrument_defaults_to_voice(
+                        data.lg.0,
+                        &data.state,
+                        kt.track,
+                        synth_id as u64,
+                    );
+                }
+                if !track_polyphonic {
                     unsafe {
                         send_custom_note_off(data.lg.0, voice_lid);
                     }
@@ -639,6 +897,11 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                     send_custom_trigger(data.lg.0, voice_lid, pitch_hz, kt.velocity);
                 }
             } else {
+                let voice = data.voice_pools[kt.track].allocate_voice(kt.transpose);
+                let voice_lid = voice.logical_id;
+                if voice_lid == 0 {
+                    continue;
+                }
                 let tp = &data.state.track_params[kt.track];
                 let attack_samples = tp.get_attack_ms() * data.sample_rate as f32 / 1000.0;
                 let release_samples = tp.get_release_ms() * data.sample_rate as f32 / 1000.0;
@@ -770,7 +1033,11 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     for track_idx in 0..num_tracks {
         let expired = data.gate_off_state[track_idx].process(nframes);
         for lid in expired {
-            data.voice_pools[track_idx].release_voice_by_logical_id(lid);
+            if let Some(engine_id) = track_engine_id(&data.state, track_idx) {
+                data.custom_engine_pools[engine_id].release_voice_by_logical_id(lid);
+            } else {
+                data.voice_pools[track_idx].release_voice_by_logical_id(lid);
+            }
             unsafe {
                 send_custom_note_off(data.lg.0, lid);
             }
@@ -832,6 +1099,8 @@ pub fn build_output_stream(
 
     // Initialize voice pools from state
     let mut voice_pools: Vec<VoicePool> = (0..MAX_TRACKS).map(|_| VoicePool::new()).collect();
+    let mut custom_engine_pools: Vec<CustomEnginePool> =
+        (0..MAX_TRACKS).map(|_| CustomEnginePool::new()).collect();
 
     // Pre-populate voice pools for any existing tracks
     let num_tracks = state.active_track_count();
@@ -841,6 +1110,16 @@ pub fn build_output_stream(
             let lid = state.voice_lids[t][v].load(Ordering::Acquire);
             if lid != 0 {
                 voice_pools[t].add_voice(lid, lid as i32);
+            }
+        }
+
+        if let Some(engine_id) = track_engine_id(&state, t) {
+            let vc = state.engine_voice_counts[engine_id].load(Ordering::Acquire) as usize;
+            for v in custom_engine_pools[engine_id].num_voices..vc.min(MAX_VOICES) {
+                let lid = state.engine_voice_lids[engine_id][v].load(Ordering::Acquire);
+                if lid != 0 {
+                    custom_engine_pools[engine_id].add_voice(lid);
+                }
             }
         }
     }
@@ -858,6 +1137,7 @@ pub fn build_output_stream(
         sample_rate: sample_rate as f64,
         last_bpm: 0,
         voice_pools,
+        custom_engine_pools,
         keyboard_rx,
     };
 

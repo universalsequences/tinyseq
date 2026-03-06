@@ -8,7 +8,7 @@ use crate::lisp_effect::{self, DGenManifest, LoadedDGenLib};
 use crate::sequencer::{InstrumentType, MAX_TRACKS};
 use crate::voice::MAX_VOICES;
 
-use super::{App, TrackNodeIds};
+use super::{App, EngineNodeIds, TrackNodeIds};
 
 struct TrackShell {
     voice_sum_id: i32,
@@ -22,12 +22,6 @@ struct SamplerVoiceSetup {
     voice_lids: Vec<u64>,
 }
 
-struct CustomVoiceSetup {
-    synth_ids: Vec<i32>,
-    gatepitch_ids: Vec<i32>,
-    voice_lids: Vec<u64>,
-}
-
 enum InstrumentRegistration<'a> {
     Sampler {
         buffer_id: i32,
@@ -35,8 +29,6 @@ enum InstrumentRegistration<'a> {
     },
     Custom {
         engine_id: usize,
-        synth_ids: Vec<i32>,
-        gatepitch_ids: Vec<i32>,
         manifest: &'a DGenManifest,
     },
 }
@@ -96,16 +88,15 @@ impl GraphController<'_> {
         }
 
         let shell = self.create_track_shell(name);
-        let voices = self.build_custom_voices(idx, name, manifest, lib, shell.voice_sum_id);
+        self.ensure_custom_engine_runtime(engine_id, name, manifest, lib);
+        self.connect_engine_to_track(engine_id, idx, name, shell.voice_sum_id);
         self.finish_track_registration(TrackRegistration {
             idx,
             track_name: name.to_string(),
             shell,
-            voice_lids: voices.voice_lids,
+            voice_lids: Vec::new(),
             instrument: InstrumentRegistration::Custom {
                 engine_id,
-                synth_ids: voices.synth_ids,
-                gatepitch_ids: voices.gatepitch_ids,
                 manifest,
             },
         });
@@ -125,77 +116,18 @@ impl GraphController<'_> {
             return Err("Not a custom instrument track".to_string());
         }
 
-        let old_synth_ids = &self.app.graph.track_synth_node_ids[track];
-        let gatepitch_ids = &self.app.graph.track_gatepitch_node_ids[track];
-        let voice_sum_id = self.app.graph.track_node_ids[track].voice_sum_id;
-        let mut new_synth_ids = Vec::with_capacity(MAX_VOICES);
+        let Some(engine_id) = self.app.graph.track_engine_ids[track] else {
+            return Err("Custom track has no engine binding".to_string());
+        };
 
-        for v in 0..MAX_VOICES {
-            let old_synth = old_synth_ids[v];
-            let gp_id = gatepitch_ids[v];
+        self.rebuild_custom_engine_runtime(engine_id, manifest, lib)?;
 
-            unsafe {
-                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 0, old_synth, 0);
-                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 1, old_synth, 1);
-                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 2, old_synth, 2);
-                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 3, old_synth, 3);
-                crate::audiograph::graph_disconnect(
-                    self.app.graph.lg.0,
-                    old_synth,
-                    0,
-                    voice_sum_id,
-                    0,
-                );
-                crate::audiograph::delete_node(self.app.graph.lg.0, old_synth);
+        for bound_track in 0..self.app.tracks.len() {
+            if self.app.graph.track_engine_ids.get(bound_track) == Some(&Some(engine_id)) {
+                let track_name = self.app.tracks[bound_track].clone();
+                self.initialize_instrument_slot(bound_track, &track_name, manifest);
             }
-
-            let slot_id = track * MAX_VOICES + v;
-            lisp_effect::set_dgen_instrument_fn(slot_id, lib.process_fn);
-
-            let init_msg = lisp_effect::build_init_message_for_voice(slot_id, manifest, v);
-            let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
-            let state_size = (lisp_effect::HEADER_SLOTS + manifest.total_memory_slots)
-                * std::mem::size_of::<f32>();
-            let synth_name =
-                CString::new(format!("{}_synth_{}", self.app.tracks[track], v)).unwrap();
-            let synth_id = unsafe {
-                crate::audiograph::add_node(
-                    self.app.graph.lg.0,
-                    lisp_effect::dgenlisp_instrument_vtable(),
-                    state_size,
-                    synth_name.as_ptr(),
-                    manifest.n_inputs as i32,
-                    1,
-                    init_msg.as_ptr() as *const c_void,
-                    init_msg_size,
-                )
-            };
-
-            unsafe {
-                crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 0, synth_id, 0);
-                if manifest.n_inputs > 1 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 1, synth_id, 1);
-                }
-                if manifest.n_inputs > 2 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 2, synth_id, 2);
-                }
-                if manifest.n_inputs > 3 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 3, synth_id, 3);
-                }
-                crate::audiograph::graph_connect(self.app.graph.lg.0, synth_id, 0, voice_sum_id, 0);
-            }
-
-            new_synth_ids.push(synth_id);
         }
-
-        self.app.graph.track_synth_node_ids[track] = new_synth_ids.clone();
-        for (v, &sid) in new_synth_ids.iter().enumerate() {
-            self.app.state.synth_node_ids[track][v].store(sid as u32, Ordering::Release);
-        }
-
-        let track_name = self.app.tracks[track].clone();
-        self.initialize_instrument_slot(track, &track_name, manifest);
-        self.push_instrument_defaults(track, manifest);
 
         Ok(())
     }
@@ -340,14 +272,24 @@ impl GraphController<'_> {
         })
     }
 
-    fn build_custom_voices(
+    fn ensure_engine_slot(&mut self, engine_id: usize) {
+        while self.app.graph.engine_node_ids.len() <= engine_id {
+            self.app.graph.engine_node_ids.push(None);
+        }
+    }
+
+    fn ensure_custom_engine_runtime(
         &mut self,
-        track_idx: usize,
+        engine_id: usize,
         name: &str,
         manifest: &DGenManifest,
         lib: &LoadedDGenLib,
-        voice_sum_id: i32,
-    ) -> CustomVoiceSetup {
+    ) {
+        self.ensure_engine_slot(engine_id);
+        if self.app.graph.engine_node_ids[engine_id].is_some() {
+            return;
+        }
+
         let mut gatepitch_ids = Vec::with_capacity(MAX_VOICES);
         let mut synth_ids = Vec::with_capacity(MAX_VOICES);
         let mut voice_lids = Vec::with_capacity(MAX_VOICES);
@@ -367,14 +309,14 @@ impl GraphController<'_> {
                 )
             };
 
-            let slot_id = track_idx * MAX_VOICES + v;
+            let slot_id = engine_id * MAX_VOICES + v;
             lisp_effect::set_dgen_instrument_fn(slot_id, lib.process_fn);
             let init_msg = lisp_effect::build_init_message_for_voice(slot_id, manifest, v);
             let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
             let state_size = (lisp_effect::HEADER_SLOTS + manifest.total_memory_slots)
                 * std::mem::size_of::<f32>();
 
-            let synth_name = CString::new(format!("{}_synth_{}", name, v)).unwrap();
+            let synth_name = CString::new(format!("{}_engine_synth_{}", name, v)).unwrap();
             let synth_id = unsafe {
                 crate::audiograph::add_node(
                     self.app.graph.lg.0,
@@ -399,7 +341,6 @@ impl GraphController<'_> {
                 if manifest.n_inputs > 3 {
                     crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 3, synth_id, 3);
                 }
-                crate::audiograph::graph_connect(self.app.graph.lg.0, synth_id, 0, voice_sum_id, 0);
             }
 
             gatepitch_ids.push(gp_id);
@@ -407,11 +348,151 @@ impl GraphController<'_> {
             voice_lids.push(gp_id as u64);
         }
 
-        CustomVoiceSetup {
+        self.app.graph.engine_node_ids[engine_id] = Some(EngineNodeIds {
             synth_ids,
             gatepitch_ids,
-            voice_lids,
+            route_gain_ids: (0..MAX_TRACKS).map(|_| Vec::new()).collect(),
+        });
+
+        for (v, &lid) in voice_lids.iter().enumerate() {
+            self.app.state.engine_voice_lids[engine_id][v].store(lid, Ordering::Release);
         }
+        self.app.state.engine_voice_counts[engine_id].store(MAX_VOICES as u32, Ordering::Release);
+        if let Some(engine) = &self.app.graph.engine_node_ids[engine_id] {
+            for (v, &sid) in engine.synth_ids.iter().enumerate() {
+                self.app.state.engine_synth_node_ids[engine_id][v]
+                    .store(sid as u32, Ordering::Release);
+            }
+        }
+    }
+
+    fn connect_engine_to_track(
+        &mut self,
+        engine_id: usize,
+        track_idx: usize,
+        track_name: &str,
+        voice_sum_id: i32,
+    ) {
+        self.ensure_engine_slot(engine_id);
+        let Some(engine) = self.app.graph.engine_node_ids[engine_id].as_mut() else {
+            return;
+        };
+        if engine.route_gain_ids[track_idx].len() == MAX_VOICES {
+            return;
+        }
+
+        let mut route_ids = Vec::with_capacity(MAX_VOICES);
+        for v in 0..MAX_VOICES {
+            let route_name = CString::new(format!("{}_eng{}_route_{}", track_name, engine_id, v))
+                .unwrap();
+            let route_id = unsafe {
+                crate::audiograph::live_add_gain(self.app.graph.lg.0, 0.0, route_name.as_ptr())
+            };
+            unsafe {
+                crate::audiograph::graph_connect(
+                    self.app.graph.lg.0,
+                    engine.synth_ids[v],
+                    0,
+                    route_id,
+                    0,
+                );
+                crate::audiograph::graph_connect(
+                    self.app.graph.lg.0,
+                    route_id,
+                    0,
+                    voice_sum_id,
+                    0,
+                );
+            }
+            self.app.state.engine_route_lids[engine_id][v][track_idx]
+                .store(route_id as u64, Ordering::Release);
+            route_ids.push(route_id);
+        }
+
+        engine.route_gain_ids[track_idx] = route_ids;
+    }
+
+    fn rebuild_custom_engine_runtime(
+        &mut self,
+        engine_id: usize,
+        manifest: &DGenManifest,
+        lib: &LoadedDGenLib,
+    ) -> Result<(), String> {
+        let Some(mut engine) = self.app.graph.engine_node_ids[engine_id].take() else {
+            return Err("Missing engine runtime".to_string());
+        };
+
+        let mut new_synth_ids = Vec::with_capacity(MAX_VOICES);
+        for v in 0..MAX_VOICES {
+            let old_synth = engine.synth_ids[v];
+            let gp_id = engine.gatepitch_ids[v];
+
+            unsafe {
+                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 0, old_synth, 0);
+                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 1, old_synth, 1);
+                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 2, old_synth, 2);
+                crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 3, old_synth, 3);
+                for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
+                    crate::audiograph::graph_disconnect(
+                        self.app.graph.lg.0,
+                        old_synth,
+                        0,
+                        route_id,
+                        0,
+                    );
+                }
+                crate::audiograph::delete_node(self.app.graph.lg.0, old_synth);
+            }
+
+            let slot_id = engine_id * MAX_VOICES + v;
+            lisp_effect::set_dgen_instrument_fn(slot_id, lib.process_fn);
+            let init_msg = lisp_effect::build_init_message_for_voice(slot_id, manifest, v);
+            let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
+            let state_size = (lisp_effect::HEADER_SLOTS + manifest.total_memory_slots)
+                * std::mem::size_of::<f32>();
+            let synth_name = CString::new(format!("engine_{}_synth_{}", engine_id, v)).unwrap();
+            let synth_id = unsafe {
+                crate::audiograph::add_node(
+                    self.app.graph.lg.0,
+                    lisp_effect::dgenlisp_instrument_vtable(),
+                    state_size,
+                    synth_name.as_ptr(),
+                    manifest.n_inputs as i32,
+                    1,
+                    init_msg.as_ptr() as *const c_void,
+                    init_msg_size,
+                )
+            };
+
+            unsafe {
+                crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 0, synth_id, 0);
+                if manifest.n_inputs > 1 {
+                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 1, synth_id, 1);
+                }
+                if manifest.n_inputs > 2 {
+                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 2, synth_id, 2);
+                }
+                if manifest.n_inputs > 3 {
+                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 3, synth_id, 3);
+                }
+                for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
+                    crate::audiograph::graph_connect(
+                        self.app.graph.lg.0,
+                        synth_id,
+                        0,
+                        route_id,
+                        0,
+                    );
+                }
+            }
+
+            new_synth_ids.push(synth_id);
+            self.app.state.engine_synth_node_ids[engine_id][v].store(synth_id as u32, Ordering::Release);
+        }
+
+        engine.synth_ids = new_synth_ids;
+        self.app.graph.engine_node_ids[engine_id] = Some(engine);
+        Ok(())
     }
 
     fn finish_track_registration(&mut self, registration: TrackRegistration<'_>) {
@@ -430,8 +511,12 @@ impl GraphController<'_> {
         for (v, &lid) in voice_lids.iter().enumerate() {
             self.app.state.voice_lids[idx][v].store(lid, Ordering::Release);
         }
-        self.app.state.voice_counts[idx].store(MAX_VOICES as u32, Ordering::Release);
-        self.app.state.sampler_lids[idx].store(voice_lids[0], Ordering::Release);
+        self.app
+            .state
+            .voice_counts[idx]
+            .store(voice_lids.len() as u32, Ordering::Release);
+        self.app.state.sampler_lids[idx]
+            .store(voice_lids.first().copied().unwrap_or(0), Ordering::Release);
         self.app.state.delay_lids[idx].store(shell.delay_id as u64, Ordering::Release);
         self.app.state.send_lids[idx].store(shell.send_id as u64, Ordering::Release);
         self.app.state.instrument_type_flags[idx].store(
@@ -459,6 +544,7 @@ impl GraphController<'_> {
                 buffer_id,
                 sampler_ids,
             } => {
+                self.app.state.track_engine_ids[idx].store(u32::MAX, Ordering::Release);
                 self.app.graph.track_buffer_ids.push(buffer_id);
                 self.app.graph.track_node_ids.push(TrackNodeIds {
                     sampler_ids,
@@ -475,28 +561,26 @@ impl GraphController<'_> {
                     .instrument_descriptors
                     .push(EffectDescriptor::empty_custom_slot());
             }
-            InstrumentRegistration::Custom {
-                engine_id,
-                synth_ids,
-                gatepitch_ids,
-                manifest,
-            } => {
-                for (v, &sid) in synth_ids.iter().enumerate() {
-                    self.app.state.synth_node_ids[idx][v].store(sid as u32, Ordering::Release);
-                }
+            InstrumentRegistration::Custom { engine_id, manifest } => {
+                self.app.state.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
                 self.app.graph.track_buffer_ids.push(-1);
                 self.app.graph.track_node_ids.push(TrackNodeIds {
-                    sampler_ids: gatepitch_ids.clone(),
+                    sampler_ids: Vec::new(),
                     voice_sum_id: shell.voice_sum_id,
                     filter_id: shell.filter_id,
                     delay_id: shell.delay_id,
                     send_id: shell.send_id,
                 });
-                self.app.graph.track_synth_node_ids.push(synth_ids);
-                self.app.graph.track_gatepitch_node_ids.push(gatepitch_ids);
+                let engine = self.app.graph.engine_node_ids[engine_id]
+                    .as_ref()
+                    .expect("engine runtime initialized");
+                self.app.graph.track_synth_node_ids.push(engine.synth_ids.clone());
+                self.app
+                    .graph
+                    .track_gatepitch_node_ids
+                    .push(engine.gatepitch_ids.clone());
                 self.app.graph.track_engine_ids.push(Some(engine_id));
                 self.initialize_instrument_slot(idx, &track_name, manifest);
-                self.push_instrument_defaults(idx, manifest);
             }
         }
 
@@ -529,24 +613,6 @@ impl GraphController<'_> {
             self.app.graph.instrument_descriptors[track] = inst_desc;
         } else {
             self.app.graph.instrument_descriptors.push(inst_desc);
-        }
-    }
-
-    fn push_instrument_defaults(&self, track: usize, manifest: &DGenManifest) {
-        for &synth_id in &self.app.graph.track_synth_node_ids[track] {
-            for p in manifest.params.iter() {
-                let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
-                unsafe {
-                    crate::audiograph::params_push_wrapper(
-                        self.app.graph.lg.0,
-                        crate::audiograph::ParamMsg {
-                            idx: node_idx as u64,
-                            logical_id: synth_id as u64,
-                            fvalue: p.default,
-                        },
-                    );
-                }
-            }
         }
     }
 }
