@@ -8,24 +8,31 @@ use crate::effects::{
     EffectDescriptor, EffectSlotState, ParamKind, SyncDivision, BUILTIN_SLOT_COUNT,
 };
 use crate::lisp_effect::{self, MAX_CUSTOM_FX};
-use crate::sequencer::InstrumentType;
 use crate::reverb;
+use crate::sequencer::InstrumentType;
 
 use super::params::draw_dropdown;
-use super::{App, InputMode, PendingCompile, Region, REVERB_TAB, SYNTH_TAB};
+use super::{
+    App, CompileTarget, InputMode, PendingCompile, PendingEditor, Region, REVERB_TAB, SYNTH_TAB,
+};
+
+const SYNTH_TWO_COLUMN_MIN_WIDTH: u16 = 88;
+const SYNTH_COLUMN_GAP: u16 = 2;
+
+fn fit_cell(text: &str, width: usize) -> String {
+    let clipped: String = text.chars().take(width).collect();
+    format!("{clipped:<width$}")
+}
 
 // ── App impl: effect methods ──
 
 impl App {
     fn instrument_base_note_offset(&self, track: usize) -> f32 {
-        f32::from_bits(
-            self.state.instrument_base_note_offsets[track].load(Ordering::Relaxed),
-        )
+        f32::from_bits(self.state.instrument_base_note_offsets[track].load(Ordering::Relaxed))
     }
 
     fn set_instrument_base_note_offset(&self, track: usize, value: f32) {
-        self.state.instrument_base_note_offsets[track]
-            .store(value.to_bits(), Ordering::Relaxed);
+        self.state.instrument_base_note_offsets[track].store(value.to_bits(), Ordering::Relaxed);
     }
 
     pub(super) fn synth_row_count(&self) -> usize {
@@ -34,14 +41,109 @@ impl App {
             .unwrap_or(1)
     }
 
+    pub(super) fn synth_column_count(&self, area: Rect) -> usize {
+        if area.height == 0 {
+            return 1;
+        }
+        if area.width >= SYNTH_TWO_COLUMN_MIN_WIDTH && self.synth_row_count() > area.height as usize
+        {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn synth_rows_per_column(&self, area: Rect) -> usize {
+        area.height as usize
+    }
+
+    pub(super) fn synth_visible_capacity(&self, area: Rect) -> usize {
+        self.synth_rows_per_column(area) * self.synth_column_count(area)
+    }
+
+    fn clamp_synth_scroll(&mut self, area: Rect) {
+        let visible = self.synth_visible_capacity(area);
+        if visible == 0 {
+            self.ui.synth_scroll_offset = 0;
+            return;
+        }
+        let max_scroll = self.synth_row_count().saturating_sub(visible);
+        self.ui.synth_scroll_offset = self.ui.synth_scroll_offset.min(max_scroll);
+    }
+
+    pub(super) fn ensure_synth_cursor_visible(&mut self) {
+        let area = self.ui.layout.effects_inner;
+        let visible = self.synth_visible_capacity(area);
+        if visible == 0 {
+            self.ui.synth_scroll_offset = 0;
+            return;
+        }
+
+        let max_cursor = self.synth_row_count().saturating_sub(1);
+        self.ui.instrument_param_cursor = self.ui.instrument_param_cursor.min(max_cursor);
+        self.clamp_synth_scroll(area);
+
+        if self.ui.instrument_param_cursor < self.ui.synth_scroll_offset {
+            self.ui.synth_scroll_offset = self.ui.instrument_param_cursor;
+        } else if self.ui.instrument_param_cursor >= self.ui.synth_scroll_offset + visible {
+            self.ui.synth_scroll_offset = self.ui.instrument_param_cursor + 1 - visible;
+        }
+
+        self.clamp_synth_scroll(area);
+    }
+
+    pub(super) fn synth_row_at_position(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
+        if area.height == 0
+            || col < area.x
+            || col >= area.x + area.width
+            || row < area.y
+            || row >= area.y + area.height
+        {
+            return None;
+        }
+
+        let columns = self.synth_column_count(area);
+        let rows_per_column = self.synth_rows_per_column(area);
+        if rows_per_column == 0 {
+            return None;
+        }
+
+        let column_width = if columns == 1 {
+            area.width
+        } else {
+            area.width.saturating_sub(SYNTH_COLUMN_GAP) / 2
+        };
+        if column_width == 0 {
+            return None;
+        }
+
+        let rel_x = col - area.x;
+        let column = if columns == 1 {
+            0
+        } else if rel_x < column_width {
+            0
+        } else if rel_x >= column_width + SYNTH_COLUMN_GAP
+            && rel_x < (column_width * 2) + SYNTH_COLUMN_GAP
+        {
+            1
+        } else {
+            return None;
+        };
+
+        let rel_y = (row - area.y) as usize;
+        let absolute = self.ui.synth_scroll_offset + column * rows_per_column + rel_y;
+        (absolute < self.synth_row_count()).then_some(absolute)
+    }
+
     /// Get the current slot's descriptor, if available.
     pub(super) fn current_slot_descriptor(&self) -> Option<&EffectDescriptor> {
         if self.tracks.is_empty() {
             return None;
         }
-        self.effect_descriptors
-            .get(self.cursor_track)
-            .and_then(|descs| descs.get(self.effect_slot_cursor))
+        self.graph
+            .effect_descriptors
+            .get(self.ui.cursor_track)
+            .and_then(|descs| descs.get(self.ui.effect_slot_cursor))
     }
 
     /// Get the current slot's runtime state, if available.
@@ -51,8 +153,8 @@ impl App {
         }
         self.state
             .effect_chains
-            .get(self.cursor_track)
-            .and_then(|chain| chain.get(self.effect_slot_cursor))
+            .get(self.ui.cursor_track)
+            .and_then(|chain| chain.get(self.ui.effect_slot_cursor))
     }
 
     /// Indices of visible (non-empty) effect slots for the current track.
@@ -60,8 +162,8 @@ impl App {
         if self.tracks.is_empty() {
             return Vec::new();
         }
-        let track = self.cursor_track;
-        let descs = &self.effect_descriptors[track];
+        let track = self.ui.cursor_track;
+        let descs = &self.graph.effect_descriptors[track];
         let mut visible = Vec::new();
         for i in 0..descs.len() {
             if i < BUILTIN_SLOT_COUNT {
@@ -78,7 +180,7 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
-        let chain = &self.state.effect_chains[self.cursor_track];
+        let chain = &self.state.effect_chains[self.ui.cursor_track];
         for offset in 0..MAX_CUSTOM_FX {
             let idx = BUILTIN_SLOT_COUNT + offset;
             if idx < chain.len() && chain[idx].node_id.load(Ordering::Relaxed) == 0 {
@@ -100,7 +202,7 @@ impl App {
                 }
             }
         }
-        self.track_node_ids[track].voice_sum_id
+        self.graph.track_node_ids[track].voice_sum_id
     }
 
     /// Find the audio graph successor for a custom slot at `offset` (0..MAX_CUSTOM_FX).
@@ -115,7 +217,7 @@ impl App {
                 }
             }
         }
-        self.track_node_ids[track].filter_id
+        self.graph.track_node_ids[track].filter_id
     }
 
     /// Whether there are fewer than MAX_CUSTOM_FX loaded custom effects (can add more).
@@ -155,7 +257,7 @@ impl App {
         params: &[lisp_effect::DGenParam],
     ) {
         let desc = EffectDescriptor::from_lisp_manifest(name, params);
-        self.effect_descriptors[track][slot_idx] = desc;
+        self.graph.effect_descriptors[track][slot_idx] = desc;
 
         let slot = &self.state.effect_chains[track][slot_idx];
         slot.node_id.store(node_id as u32, Ordering::Relaxed);
@@ -170,26 +272,23 @@ impl App {
         }
     }
 
-    /// Called from main loop after terminal is suspended.
-    pub fn run_lisp_editor_flow(&mut self) {
+    fn run_effect_editor(&mut self, slot_idx: usize, existing_name: Option<String>) {
         if self.tracks.is_empty() {
             return;
         }
-        let track = self.cursor_track;
-        let slot_idx = self.pending_lisp_slot;
+        let track = self.ui.cursor_track;
         let (slot_id, predecessor_id, successor_id, existing) =
             self.resolve_custom_slot_wiring(track, slot_idx);
 
         // Load source: from file (if editing existing) or empty for new
-        let last_source = match &self.pending_lisp_name {
+        let last_source = match &existing_name {
             Some(name) => lisp_effect::load_effect_source(name).unwrap_or_default(),
             None => String::new(),
         };
-        let existing_name = self.pending_lisp_name.clone();
         let track_name = self.tracks[track].clone();
 
         let result = lisp_effect::run_editor_flow(
-            self.lg.0,
+            self.graph.lg.0,
             slot_id,
             &track_name,
             predecessor_id,
@@ -197,20 +296,17 @@ impl App {
             existing,
             &last_source,
             existing_name.as_deref(),
-            self.sample_rate,
+            self.graph.sample_rate,
         );
 
         if let Some(r) = result {
             self.apply_effect_to_slot(track, slot_idx, r.node_id, &r.name, &r.params);
-            self.effect_slot_cursor = slot_idx;
-            self.effect_param_cursor = 0;
-            self.focused_region = Region::Params;
-            self.params_column = 1;
-            self.lisp_libs.push(r.lib);
+            self.ui.effect_slot_cursor = slot_idx;
+            self.ui.effect_param_cursor = 0;
+            self.ui.focused_region = Region::Params;
+            self.ui.params_column = 1;
+            self.editor.lisp_libs.push(r.lib);
         }
-
-        // Clear pending state
-        self.pending_lisp_name = None;
     }
 
     /// Spawn a background thread to compile an effect, storing a PendingCompile.
@@ -218,21 +314,23 @@ impl App {
         let source = match lisp_effect::load_effect_source(name) {
             Ok(s) => s,
             Err(e) => {
-                self.status_message = Some((format!("Error: {e}"), Instant::now()));
+                self.editor.status_message = Some((format!("Error: {e}"), Instant::now()));
                 return;
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let sample_rate = self.sample_rate;
+        let sample_rate = self.graph.sample_rate;
         std::thread::spawn(move || {
             let result = lisp_effect::compile_and_load(&source, sample_rate);
             let _ = tx.send(result);
         });
-        self.pending_compile = Some(PendingCompile {
+        self.editor.pending_compile = Some(PendingCompile {
             receiver: rx,
-            name: name.to_string(),
-            slot_idx,
-            cursor_track: self.cursor_track,
+            target: CompileTarget::Effect {
+                name: name.to_string(),
+                slot_idx,
+                track: self.ui.cursor_track,
+            },
             tick: 0,
         });
     }
@@ -249,7 +347,7 @@ impl App {
 
         match unsafe {
             lisp_effect::add_effect_to_chain_at(
-                self.lg.0,
+                self.graph.lg.0,
                 slot_id,
                 &result.manifest,
                 &result.lib,
@@ -260,15 +358,15 @@ impl App {
         } {
             Ok(node_id) => {
                 self.apply_effect_to_slot(track, slot_idx, node_id, name, &result.manifest.params);
-                self.lisp_libs.push(result.lib);
-                self.effect_slot_cursor = slot_idx;
-                self.effect_param_cursor = 0;
-                self.focused_region = Region::Params;
-                self.params_column = 1;
-                self.status_message = Some((format!("Loaded '{}'", name), Instant::now()));
+                self.editor.lisp_libs.push(result.lib);
+                self.ui.effect_slot_cursor = slot_idx;
+                self.ui.effect_param_cursor = 0;
+                self.ui.focused_region = Region::Params;
+                self.ui.params_column = 1;
+                self.editor.status_message = Some((format!("Loaded '{}'", name), Instant::now()));
             }
             Err(e) => {
-                self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                self.editor.status_message = Some((format!("Error: {}", e), Instant::now()));
             }
         }
     }
@@ -279,78 +377,100 @@ impl App {
         result: lisp_effect::CompileResult,
         name: &str,
     ) {
-        match self.add_custom_track(name, &result.manifest, &result.lib) {
+        match self
+            .graph_controller()
+            .add_custom_track(name, &result.manifest, &result.lib)
+        {
             Ok(idx) => {
-                self.cursor_track = idx;
-                self.instrument_libs.push(result.lib);
-                self.sidebar_mode = super::SidebarMode::Audition;
-                self.focused_region = super::Region::Cirklon;
-                self.status_message =
+                self.ui.cursor_track = idx;
+                self.editor.instrument_libs.push(result.lib);
+                self.ui.sidebar_mode = super::SidebarMode::Audition;
+                self.ui.focused_region = super::Region::Cirklon;
+                self.editor.status_message =
                     Some((format!("Added synth track '{}'", name), Instant::now()));
             }
             Err(e) => {
-                self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                self.editor.status_message = Some((format!("Error: {}", e), Instant::now()));
             }
         }
     }
 
-    /// Called from main loop after terminal is suspended — instrument editor flow.
-    pub fn run_instrument_editor_flow(&mut self) {
-        let last_source = match &self.pending_instrument_name {
+    fn run_instrument_editor(&mut self, existing_name: Option<String>) {
+        let last_source = match &existing_name {
             Some(name) => lisp_effect::load_instrument_source(name).unwrap_or_default(),
             None => String::new(),
         };
-        let existing_name = self.pending_instrument_name.clone();
 
         let result = lisp_effect::run_instrument_editor_flow(
             &last_source,
             existing_name.as_deref(),
-            self.sample_rate,
+            self.graph.sample_rate,
         );
 
         if let Some(r) = result {
             // Hot-reload if editing an existing custom track
-            let is_existing_custom = self.cursor_track < self.track_instrument_types.len()
-                && self.track_instrument_types[self.cursor_track] == InstrumentType::Custom;
+            let is_existing_custom = self.ui.cursor_track < self.graph.track_instrument_types.len()
+                && self.graph.track_instrument_types[self.ui.cursor_track]
+                    == InstrumentType::Custom;
 
             if is_existing_custom {
-                match self.hot_reload_instrument(self.cursor_track, &r.manifest, &r.lib) {
+                let track = self.ui.cursor_track;
+                match self
+                    .graph_controller()
+                    .hot_reload_instrument(track, &r.manifest, &r.lib)
+                {
                     Ok(()) => {
-                        self.tracks[self.cursor_track] = r.name.clone();
-                        self.instrument_libs.push(r.lib);
-                        self.status_message = Some((
-                            format!("Reloaded instrument '{}'", r.name),
-                            Instant::now(),
-                        ));
+                        self.tracks[self.ui.cursor_track] = r.name.clone();
+                        self.editor.instrument_libs.push(r.lib);
+                        self.editor.status_message =
+                            Some((format!("Reloaded instrument '{}'", r.name), Instant::now()));
                     }
                     Err(e) => {
-                        self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                        self.editor.status_message =
+                            Some((format!("Error: {}", e), Instant::now()));
                     }
                 }
             } else {
-                match self.add_custom_track(&r.name, &r.manifest, &r.lib) {
+                match self
+                    .graph_controller()
+                    .add_custom_track(&r.name, &r.manifest, &r.lib)
+                {
                     Ok(idx) => {
-                        self.cursor_track = idx;
-                        self.instrument_libs.push(r.lib);
-                        self.sidebar_mode = super::SidebarMode::Audition;
-                        self.focused_region = super::Region::Cirklon;
-                        self.status_message =
+                        self.ui.cursor_track = idx;
+                        self.editor.instrument_libs.push(r.lib);
+                        self.ui.sidebar_mode = super::SidebarMode::Audition;
+                        self.ui.focused_region = super::Region::Cirklon;
+                        self.editor.status_message =
                             Some((format!("Added synth track '{}'", r.name), Instant::now()));
                     }
                     Err(e) => {
-                        self.status_message = Some((format!("Error: {}", e), Instant::now()));
+                        self.editor.status_message =
+                            Some((format!("Error: {}", e), Instant::now()));
                     }
                 }
             }
         }
+    }
 
-        self.pending_instrument_name = None;
+    pub fn has_pending_editor(&self) -> bool {
+        self.editor.pending_editor.is_some()
+    }
+
+    pub fn run_pending_editor(&mut self) {
+        let Some(action) = self.editor.pending_editor.take() else {
+            return;
+        };
+
+        match action {
+            PendingEditor::Effect { slot_idx, name } => self.run_effect_editor(slot_idx, name),
+            PendingEditor::Instrument { name } => self.run_instrument_editor(name),
+        }
     }
 
     fn filtered_picker_items(&self) -> Vec<String> {
         let mut items = vec!["+ New effect".to_string()];
-        let filter_lower = self.picker_filter.to_lowercase();
-        for name in &self.picker_items {
+        let filter_lower = self.editor.picker_filter.to_lowercase();
+        for name in &self.editor.picker_items {
             if filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower) {
                 items.push(name.clone());
             }
@@ -361,34 +481,35 @@ impl App {
     pub(super) fn handle_effect_picker(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c) => {
-                self.picker_filter.push(c);
-                self.picker_cursor = 0;
+                self.editor.picker_filter.push(c);
+                self.editor.picker_cursor = 0;
             }
             KeyCode::Backspace => {
-                self.picker_filter.pop();
-                self.picker_cursor = 0;
+                self.editor.picker_filter.pop();
+                self.editor.picker_cursor = 0;
             }
             KeyCode::Up => {
-                if self.picker_cursor > 0 {
-                    self.picker_cursor -= 1;
+                if self.editor.picker_cursor > 0 {
+                    self.editor.picker_cursor -= 1;
                 }
             }
             KeyCode::Down => {
                 let max = self.filtered_picker_items().len();
-                if self.picker_cursor + 1 < max {
-                    self.picker_cursor += 1;
+                if self.editor.picker_cursor + 1 < max {
+                    self.editor.picker_cursor += 1;
                 }
             }
             KeyCode::Enter => {
                 let items = self.filtered_picker_items();
-                if self.picker_cursor < items.len() {
-                    let selected = &items[self.picker_cursor];
+                if self.editor.picker_cursor < items.len() {
+                    let selected = &items[self.editor.picker_cursor];
                     if selected == "+ New effect" {
                         // Open editor for new effect
                         if let Some(slot_idx) = self.next_free_custom_slot() {
-                            self.pending_lisp_slot = slot_idx;
-                            self.pending_lisp_name = None;
-                            self.pending_lisp_edit = true;
+                            self.editor.pending_editor = Some(PendingEditor::Effect {
+                                slot_idx,
+                                name: None,
+                            });
                         }
                     } else {
                         // Load saved effect from picker (async)
@@ -398,10 +519,10 @@ impl App {
                         }
                     }
                 }
-                self.input_mode = InputMode::Normal;
+                self.ui.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
-                self.input_mode = InputMode::Normal;
+                self.ui.input_mode = InputMode::Normal;
             }
             _ => {}
         }
@@ -411,44 +532,43 @@ impl App {
     pub(super) fn handle_instrument_picker_overlay(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c) => {
-                self.picker_filter.push(c);
-                self.picker_cursor = 0;
+                self.editor.picker_filter.push(c);
+                self.editor.picker_cursor = 0;
             }
             KeyCode::Backspace => {
-                self.picker_filter.pop();
-                self.picker_cursor = 0;
+                self.editor.picker_filter.pop();
+                self.editor.picker_cursor = 0;
             }
             KeyCode::Up => {
-                if self.picker_cursor > 0 {
-                    self.picker_cursor -= 1;
+                if self.editor.picker_cursor > 0 {
+                    self.editor.picker_cursor -= 1;
                 }
             }
             KeyCode::Down => {
                 let max = self.filtered_instrument_items().len();
-                if self.picker_cursor + 1 < max {
-                    self.picker_cursor += 1;
+                if self.editor.picker_cursor + 1 < max {
+                    self.editor.picker_cursor += 1;
                 }
             }
             KeyCode::Enter => {
                 let items = self.filtered_instrument_items();
-                if self.picker_cursor < items.len() {
-                    let selected = &items[self.picker_cursor];
+                if self.editor.picker_cursor < items.len() {
+                    let selected = &items[self.editor.picker_cursor];
                     if selected == "+ New instrument" {
-                        self.pending_instrument_name = None;
-                        self.pending_instrument_edit = true;
+                        self.editor.pending_editor = Some(PendingEditor::Instrument { name: None });
                     } else {
                         // Load saved instrument (compile in background, add track)
                         let name = selected.clone();
                         self.start_instrument_compile(&name);
                     }
                 }
-                self.input_mode = super::InputMode::Normal;
+                self.ui.input_mode = super::InputMode::Normal;
             }
             KeyCode::Esc => {
-                self.input_mode = super::InputMode::Normal;
+                self.ui.input_mode = super::InputMode::Normal;
                 if !self.tracks.is_empty() {
-                    self.sidebar_mode = super::SidebarMode::Audition;
-                    self.focused_region = super::Region::Cirklon;
+                    self.ui.sidebar_mode = super::SidebarMode::Audition;
+                    self.ui.focused_region = super::Region::Cirklon;
                 }
             }
             _ => {}
@@ -457,8 +577,8 @@ impl App {
 
     pub(super) fn filtered_instrument_items(&self) -> Vec<String> {
         let mut items = vec!["+ New instrument".to_string()];
-        let filter_lower = self.picker_filter.to_lowercase();
-        for name in &self.picker_items {
+        let filter_lower = self.editor.picker_filter.to_lowercase();
+        for name in &self.editor.picker_items {
             if filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower) {
                 items.push(name.clone());
             }
@@ -471,187 +591,190 @@ impl App {
         let source = match lisp_effect::load_instrument_source(name) {
             Ok(s) => s,
             Err(e) => {
-                self.status_message = Some((format!("Error: {e}"), Instant::now()));
+                self.editor.status_message = Some((format!("Error: {e}"), Instant::now()));
                 return;
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let sample_rate = self.sample_rate;
+        let sample_rate = self.graph.sample_rate;
         std::thread::spawn(move || {
             let result = lisp_effect::compile_and_load_instrument(&source, sample_rate);
             let _ = tx.send(result);
         });
-        self.pending_compile = Some(PendingCompile {
+        self.editor.pending_compile = Some(PendingCompile {
             receiver: rx,
-            name: name.to_string(),
-            slot_idx: usize::MAX, // sentinel: instrument, not effect
-            cursor_track: self.cursor_track,
+            target: CompileTarget::Instrument {
+                name: name.to_string(),
+            },
             tick: 0,
         });
     }
 
     pub(super) fn handle_effects_column(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         // Synth tab input handling
-        if self.effect_slot_cursor == SYNTH_TAB {
+        if self.ui.effect_slot_cursor == SYNTH_TAB {
             let shift = modifiers.contains(KeyModifiers::SHIFT);
             match code {
                 KeyCode::Left => {
-                    self.params_column = 0; // Go to track params column
+                    self.ui.params_column = 0; // Go to track params column
                 }
                 KeyCode::Right => {
                     let visible = self.visible_effect_indices();
                     if let Some(&first) = visible.first() {
-                        self.effect_slot_cursor = first;
-                        self.effect_param_cursor = 0;
+                        self.ui.effect_slot_cursor = first;
+                        self.ui.effect_param_cursor = 0;
                     } else {
-                        self.effect_slot_cursor = REVERB_TAB;
-                        self.reverb_param_cursor = 0;
+                        self.ui.effect_slot_cursor = REVERB_TAB;
+                        self.ui.reverb_param_cursor = 0;
                     }
                 }
                 KeyCode::Up => {
                     if shift {
-                        if self.instrument_param_cursor == 0 {
-                            let next =
-                                (self.instrument_base_note_offset(self.cursor_track) + 1.0)
-                                    .clamp(-48.0, 48.0);
-                            self.set_instrument_base_note_offset(self.cursor_track, next);
+                        if self.ui.instrument_param_cursor == 0 {
+                            let next = (self.instrument_base_note_offset(self.ui.cursor_track)
+                                + 1.0)
+                                .clamp(-48.0, 48.0);
+                            self.set_instrument_base_note_offset(self.ui.cursor_track, next);
                         } else {
                             self.adjust_instrument_param(1.0);
                         }
-                    } else if self.instrument_param_cursor > 0 {
-                        self.instrument_param_cursor -= 1;
+                    } else if self.ui.instrument_param_cursor > 0 {
+                        self.ui.instrument_param_cursor -= 1;
+                        self.ensure_synth_cursor_visible();
                     }
                 }
                 KeyCode::Down => {
                     if shift {
-                        if self.instrument_param_cursor == 0 {
-                            let next =
-                                (self.instrument_base_note_offset(self.cursor_track) - 1.0)
-                                    .clamp(-48.0, 48.0);
-                            self.set_instrument_base_note_offset(self.cursor_track, next);
+                        if self.ui.instrument_param_cursor == 0 {
+                            let next = (self.instrument_base_note_offset(self.ui.cursor_track)
+                                - 1.0)
+                                .clamp(-48.0, 48.0);
+                            self.set_instrument_base_note_offset(self.ui.cursor_track, next);
                         } else {
                             self.adjust_instrument_param(-1.0);
                         }
                     } else {
                         let max = self.synth_row_count().saturating_sub(1);
-                        if self.instrument_param_cursor < max {
-                            self.instrument_param_cursor += 1;
+                        if self.ui.instrument_param_cursor < max {
+                            self.ui.instrument_param_cursor += 1;
+                            self.ensure_synth_cursor_visible();
                         }
                     }
                 }
                 KeyCode::Enter => {
-                    if self.instrument_param_cursor == 0 {
-                        self.value_buffer.clear();
-                        self.input_mode = InputMode::ValueEntry;
+                    if self.ui.instrument_param_cursor == 0 {
+                        self.ui.value_buffer.clear();
+                        self.ui.input_mode = InputMode::ValueEntry;
                     } else if let Some(desc) = self.current_instrument_descriptor() {
-                        let param_idx = self.instrument_param_cursor - 1;
+                        let param_idx = self.ui.instrument_param_cursor - 1;
                         if param_idx < desc.params.len() {
                             let param = &desc.params[param_idx];
                             if param.is_boolean() {
                                 self.toggle_instrument_boolean();
                             } else if param.is_enum() {
-                                self.dropdown_open = true;
-                                self.dropdown_cursor = 0;
-                                self.input_mode = InputMode::Dropdown;
-                                let slot = &self.state.instrument_slots[self.cursor_track];
+                                self.ui.dropdown_open = true;
+                                self.ui.dropdown_cursor = 0;
+                                self.ui.input_mode = InputMode::Dropdown;
+                                let slot = &self.state.instrument_slots[self.ui.cursor_track];
                                 let val = slot.defaults.get(param_idx);
-                                self.dropdown_cursor = val.round() as usize;
+                                self.ui.dropdown_cursor = val.round() as usize;
                             }
                         }
                     }
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                    if self.instrument_param_cursor == 0 {
-                        self.value_buffer.clear();
-                        self.value_buffer.push(c);
-                        self.input_mode = InputMode::ValueEntry;
+                    if self.ui.instrument_param_cursor == 0 {
+                        self.ui.value_buffer.clear();
+                        self.ui.value_buffer.push(c);
+                        self.ui.input_mode = InputMode::ValueEntry;
                     } else if let Some(desc) = self.current_instrument_descriptor() {
-                        let param_idx = self.instrument_param_cursor - 1;
+                        let param_idx = self.ui.instrument_param_cursor - 1;
                         if param_idx < desc.params.len() {
                             let param = &desc.params[param_idx];
                             if !param.is_boolean() {
-                                self.value_buffer.clear();
-                                self.value_buffer.push(c);
-                                self.input_mode = InputMode::ValueEntry;
+                                self.ui.value_buffer.clear();
+                                self.ui.value_buffer.push(c);
+                                self.ui.input_mode = InputMode::ValueEntry;
                             }
                         }
                     }
                 }
                 KeyCode::Char('[') => {
                     let ns = self.num_steps();
-                    self.cursor_step = if self.cursor_step == 0 {
+                    self.ui.cursor_step = if self.ui.cursor_step == 0 {
                         ns - 1
                     } else {
-                        self.cursor_step - 1
+                        self.ui.cursor_step - 1
                     };
-                    self.selection_anchor = Some(self.cursor_step);
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
                 KeyCode::Char(']') => {
                     let ns = self.num_steps();
-                    self.cursor_step = if self.cursor_step + 1 >= ns {
+                    self.ui.cursor_step = if self.ui.cursor_step + 1 >= ns {
                         0
                     } else {
-                        self.cursor_step + 1
+                        self.ui.cursor_step + 1
                     };
-                    self.selection_anchor = Some(self.cursor_step);
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
                 _ => {}
             }
             return;
         }
 
-        if self.effect_slot_cursor == REVERB_TAB {
+        if self.ui.effect_slot_cursor == REVERB_TAB {
             let shift = modifiers.contains(KeyModifiers::SHIFT);
             match code {
                 KeyCode::Left => {
                     let visible = self.visible_effect_indices();
                     if let Some(&last) = visible.last() {
-                        self.effect_slot_cursor = last;
-                        self.effect_param_cursor = 0;
+                        self.ui.effect_slot_cursor = last;
+                        self.ui.effect_param_cursor = 0;
                     } else if self.is_current_custom_track() {
-                        self.effect_slot_cursor = SYNTH_TAB;
-                        self.instrument_param_cursor = 0;
+                        self.ui.effect_slot_cursor = SYNTH_TAB;
+                        self.ui.instrument_param_cursor = 0;
+                        self.ui.synth_scroll_offset = 0;
                     } else {
-                        self.params_column = 0;
+                        self.ui.params_column = 0;
                     }
                 }
                 KeyCode::Right => {} // Already at rightmost tab
                 KeyCode::Up => {
                     if shift {
                         self.adjust_reverb_param(0.05);
-                    } else if self.reverb_param_cursor > 0 {
-                        self.reverb_param_cursor -= 1;
+                    } else if self.ui.reverb_param_cursor > 0 {
+                        self.ui.reverb_param_cursor -= 1;
                     }
                 }
                 KeyCode::Down => {
                     if shift {
                         self.adjust_reverb_param(-0.05);
-                    } else if self.reverb_param_cursor < 2 {
-                        self.reverb_param_cursor += 1;
+                    } else if self.ui.reverb_param_cursor < 2 {
+                        self.ui.reverb_param_cursor += 1;
                     }
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                    self.value_buffer.clear();
-                    self.value_buffer.push(c);
-                    self.input_mode = InputMode::ValueEntry;
+                    self.ui.value_buffer.clear();
+                    self.ui.value_buffer.push(c);
+                    self.ui.input_mode = InputMode::ValueEntry;
                 }
                 KeyCode::Char('[') => {
                     let ns = self.num_steps();
-                    self.cursor_step = if self.cursor_step == 0 {
+                    self.ui.cursor_step = if self.ui.cursor_step == 0 {
                         ns - 1
                     } else {
-                        self.cursor_step - 1
+                        self.ui.cursor_step - 1
                     };
-                    self.selection_anchor = Some(self.cursor_step);
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
                 KeyCode::Char(']') => {
                     let ns = self.num_steps();
-                    self.cursor_step = if self.cursor_step + 1 >= ns {
+                    self.ui.cursor_step = if self.ui.cursor_step + 1 >= ns {
                         0
                     } else {
-                        self.cursor_step + 1
+                        self.ui.cursor_step + 1
                     };
-                    self.selection_anchor = Some(self.cursor_step);
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
                 _ => {}
             }
@@ -663,44 +786,52 @@ impl App {
 
         match code {
             KeyCode::Left => {
-                if let Some(pos) = visible.iter().position(|&i| i == self.effect_slot_cursor) {
+                if let Some(pos) = visible
+                    .iter()
+                    .position(|&i| i == self.ui.effect_slot_cursor)
+                {
                     if pos > 0 {
-                        self.effect_slot_cursor = visible[pos - 1];
-                        self.effect_param_cursor = 0;
+                        self.ui.effect_slot_cursor = visible[pos - 1];
+                        self.ui.effect_param_cursor = 0;
                     } else if self.is_current_custom_track() {
-                        self.effect_slot_cursor = SYNTH_TAB;
-                        self.instrument_param_cursor = 0;
+                        self.ui.effect_slot_cursor = SYNTH_TAB;
+                        self.ui.instrument_param_cursor = 0;
+                        self.ui.synth_scroll_offset = 0;
                     } else {
-                        self.params_column = 0;
+                        self.ui.params_column = 0;
                     }
                 } else if self.is_current_custom_track() {
-                    self.effect_slot_cursor = SYNTH_TAB;
-                    self.instrument_param_cursor = 0;
+                    self.ui.effect_slot_cursor = SYNTH_TAB;
+                    self.ui.instrument_param_cursor = 0;
+                    self.ui.synth_scroll_offset = 0;
                 } else {
-                    self.params_column = 0;
+                    self.ui.params_column = 0;
                 }
             }
             KeyCode::Right => {
-                if let Some(pos) = visible.iter().position(|&i| i == self.effect_slot_cursor) {
+                if let Some(pos) = visible
+                    .iter()
+                    .position(|&i| i == self.ui.effect_slot_cursor)
+                {
                     if pos + 1 < visible.len() {
-                        self.effect_slot_cursor = visible[pos + 1];
-                        self.effect_param_cursor = 0;
+                        self.ui.effect_slot_cursor = visible[pos + 1];
+                        self.ui.effect_param_cursor = 0;
                     } else {
                         // Move to reverb tab
-                        self.effect_slot_cursor = REVERB_TAB;
-                        self.reverb_param_cursor = 0;
+                        self.ui.effect_slot_cursor = REVERB_TAB;
+                        self.ui.reverb_param_cursor = 0;
                     }
                 } else {
                     // Move to reverb tab
-                    self.effect_slot_cursor = REVERB_TAB;
-                    self.reverb_param_cursor = 0;
+                    self.ui.effect_slot_cursor = REVERB_TAB;
+                    self.ui.reverb_param_cursor = 0;
                 }
             }
             KeyCode::Up => {
                 if shift {
                     self.adjust_slot_param(1.0);
-                } else if self.effect_param_cursor > 0 {
-                    self.effect_param_cursor -= 1;
+                } else if self.ui.effect_param_cursor > 0 {
+                    self.ui.effect_param_cursor -= 1;
                 }
             }
             KeyCode::Down => {
@@ -708,57 +839,57 @@ impl App {
                     self.adjust_slot_param(-1.0);
                 } else if let Some(desc) = self.current_slot_descriptor() {
                     let max = desc.params.len().saturating_sub(1);
-                    if self.effect_param_cursor < max {
-                        self.effect_param_cursor += 1;
+                    if self.ui.effect_param_cursor < max {
+                        self.ui.effect_param_cursor += 1;
                     }
                 }
             }
             KeyCode::Enter => {
                 if let Some(desc) = self.current_slot_descriptor() {
-                    if self.effect_param_cursor < desc.params.len() {
-                        let param = &desc.params[self.effect_param_cursor];
+                    if self.ui.effect_param_cursor < desc.params.len() {
+                        let param = &desc.params[self.ui.effect_param_cursor];
                         if param.is_boolean() {
                             self.toggle_slot_boolean();
                             self.update_delay_time_param_kind();
                         } else if param.is_enum() {
-                            self.dropdown_open = true;
-                            self.dropdown_cursor = 0;
-                            self.input_mode = InputMode::Dropdown;
+                            self.ui.dropdown_open = true;
+                            self.ui.dropdown_cursor = 0;
+                            self.ui.input_mode = InputMode::Dropdown;
                             let val = self.get_current_slot_value();
-                            self.dropdown_cursor = val.round() as usize;
+                            self.ui.dropdown_cursor = val.round() as usize;
                         }
                     }
                 }
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
                 if let Some(desc) = self.current_slot_descriptor() {
-                    if self.effect_param_cursor < desc.params.len() {
-                        let param = &desc.params[self.effect_param_cursor];
+                    if self.ui.effect_param_cursor < desc.params.len() {
+                        let param = &desc.params[self.ui.effect_param_cursor];
                         if !param.is_boolean() {
-                            self.value_buffer.clear();
-                            self.value_buffer.push(c);
-                            self.input_mode = InputMode::ValueEntry;
+                            self.ui.value_buffer.clear();
+                            self.ui.value_buffer.push(c);
+                            self.ui.input_mode = InputMode::ValueEntry;
                         }
                     }
                 }
             }
             KeyCode::Char('[') => {
                 let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step == 0 {
+                self.ui.cursor_step = if self.ui.cursor_step == 0 {
                     ns - 1
                 } else {
-                    self.cursor_step - 1
+                    self.ui.cursor_step - 1
                 };
-                self.selection_anchor = Some(self.cursor_step);
+                self.ui.selection_anchor = Some(self.ui.cursor_step);
             }
             KeyCode::Char(']') => {
                 let ns = self.num_steps();
-                self.cursor_step = if self.cursor_step + 1 >= ns {
+                self.ui.cursor_step = if self.ui.cursor_step + 1 >= ns {
                     0
                 } else {
-                    self.cursor_step + 1
+                    self.ui.cursor_step + 1
                 };
-                self.selection_anchor = Some(self.cursor_step);
+                self.ui.selection_anchor = Some(self.ui.cursor_step);
             }
             _ => {}
         }
@@ -768,25 +899,25 @@ impl App {
         let clamped = value.clamp(0.0, 1.0);
         let param_idx = match cursor {
             0 => {
-                self.reverb_size = clamped;
+                self.ui.reverb_size = clamped;
                 reverb::REVERB_PARAM_SIZE
             }
             1 => {
-                self.reverb_brightness = clamped;
+                self.ui.reverb_brightness = clamped;
                 reverb::REVERB_PARAM_BRIGHT
             }
             2 => {
-                self.reverb_replace = clamped;
+                self.ui.reverb_replace = clamped;
                 reverb::REVERB_PARAM_REPLACE
             }
             _ => return,
         };
         unsafe {
             crate::audiograph::params_push_wrapper(
-                self.lg.0,
+                self.graph.lg.0,
                 crate::audiograph::ParamMsg {
                     idx: param_idx,
-                    logical_id: self.reverb_node_id as u64,
+                    logical_id: self.graph.reverb_node_id as u64,
                     fvalue: clamped,
                 },
             );
@@ -794,21 +925,22 @@ impl App {
     }
 
     fn adjust_reverb_param(&mut self, delta: f32) {
-        let current = match self.reverb_param_cursor {
-            0 => self.reverb_size,
-            1 => self.reverb_brightness,
-            2 => self.reverb_replace,
+        let current = match self.ui.reverb_param_cursor {
+            0 => self.ui.reverb_size,
+            1 => self.ui.reverb_brightness,
+            2 => self.ui.reverb_replace,
             _ => return,
         };
-        self.set_reverb_param(self.reverb_param_cursor, current + delta);
+        self.set_reverb_param(self.ui.reverb_param_cursor, current + delta);
     }
 
     fn adjust_slot_param(&self, direction: f32) {
-        let track = self.cursor_track;
-        let slot_idx = self.effect_slot_cursor;
-        let param_idx = self.effect_param_cursor;
+        let track = self.ui.cursor_track;
+        let slot_idx = self.ui.effect_slot_cursor;
+        let param_idx = self.ui.effect_param_cursor;
 
         let desc = match self
+            .graph
             .effect_descriptors
             .get(track)
             .and_then(|d| d.get(slot_idx))
@@ -866,7 +998,7 @@ impl App {
         let idx = slot.resolve_node_idx(param_idx);
         unsafe {
             crate::audiograph::params_push_wrapper(
-                self.lg.0,
+                self.graph.lg.0,
                 crate::audiograph::ParamMsg {
                     idx,
                     logical_id: node_id as u64,
@@ -877,7 +1009,7 @@ impl App {
     }
 
     fn toggle_slot_boolean(&self) {
-        let param_idx = self.effect_param_cursor;
+        let param_idx = self.ui.effect_param_cursor;
 
         let slot = match self.current_slot() {
             Some(s) => s,
@@ -907,11 +1039,11 @@ impl App {
         const SYNCED_PARAM: usize = 1;
         const TIME_PARAM: usize = 2;
 
-        if self.effect_slot_cursor != DELAY_SLOT || self.effect_param_cursor != SYNCED_PARAM {
+        if self.ui.effect_slot_cursor != DELAY_SLOT || self.ui.effect_param_cursor != SYNCED_PARAM {
             return;
         }
 
-        let track = self.cursor_track;
+        let track = self.ui.cursor_track;
         let slot = match self
             .state
             .effect_chains
@@ -924,6 +1056,7 @@ impl App {
         let synced = slot.defaults.get(SYNCED_PARAM) > 0.5;
 
         let desc = match self
+            .graph
             .effect_descriptors
             .get_mut(track)
             .and_then(|d| d.get_mut(DELAY_SLOT))
@@ -957,14 +1090,14 @@ impl App {
 
     fn get_current_slot_value(&self) -> f32 {
         match self.current_slot() {
-            Some(slot) => slot.defaults.get(self.effect_param_cursor),
+            Some(slot) => slot.defaults.get(self.ui.effect_param_cursor),
             None => 0.0,
         }
     }
 
     /// Whether the current track is a custom instrument (has Synth tab).
     pub(super) fn is_current_custom_track(&self) -> bool {
-        !self.is_sampler_track(self.cursor_track)
+        !self.is_sampler_track(self.ui.cursor_track)
     }
 
     /// Get the instrument descriptor for the current track, if it's a custom instrument.
@@ -972,18 +1105,18 @@ impl App {
         if !self.is_current_custom_track() {
             return None;
         }
-        self.instrument_descriptors.get(self.cursor_track)
+        self.graph.instrument_descriptors.get(self.ui.cursor_track)
     }
 
     /// Adjust an instrument param (Synth tab) by direction (+1 or -1).
     fn adjust_instrument_param(&self, direction: f32) {
-        let track = self.cursor_track;
-        if self.instrument_param_cursor == 0 {
+        let track = self.ui.cursor_track;
+        if self.ui.instrument_param_cursor == 0 {
             return;
         }
-        let param_idx = self.instrument_param_cursor - 1;
+        let param_idx = self.ui.instrument_param_cursor - 1;
 
-        let desc = match self.instrument_descriptors.get(track) {
+        let desc = match self.graph.instrument_descriptors.get(track) {
             Some(d) => d,
             None => return,
         };
@@ -1016,11 +1149,11 @@ impl App {
     pub(super) fn send_instrument_param(&self, track: usize, param_idx: usize, value: f32) {
         let slot = &self.state.instrument_slots[track];
         let idx = slot.resolve_node_idx(param_idx);
-        if let Some(synth_ids) = self.track_synth_node_ids.get(track) {
+        if let Some(synth_ids) = self.graph.track_synth_node_ids.get(track) {
             for &synth_id in synth_ids {
                 unsafe {
                     crate::audiograph::params_push_wrapper(
-                        self.lg.0,
+                        self.graph.lg.0,
                         crate::audiograph::ParamMsg {
                             idx,
                             logical_id: synth_id as u64,
@@ -1032,13 +1165,30 @@ impl App {
         }
     }
 
+    pub(super) fn push_instrument_defaults_for_track(&self, track: usize) {
+        let slot = &self.state.instrument_slots[track];
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        for param_idx in 0..num_params {
+            self.send_instrument_param(track, param_idx, slot.defaults.get(param_idx));
+        }
+    }
+
+    pub(super) fn push_all_restored_instrument_defaults(&self) {
+        for track in 0..self.tracks.len() {
+            if self.is_sampler_track(track) {
+                continue;
+            }
+            self.push_instrument_defaults_for_track(track);
+        }
+    }
+
     /// Toggle a boolean instrument param (Synth tab).
     fn toggle_instrument_boolean(&self) {
-        let track = self.cursor_track;
-        if self.instrument_param_cursor == 0 {
+        let track = self.ui.cursor_track;
+        if self.ui.instrument_param_cursor == 0 {
             return;
         }
-        let param_idx = self.instrument_param_cursor - 1;
+        let param_idx = self.ui.instrument_param_cursor - 1;
         let slot = &self.state.instrument_slots[track];
 
         if self.has_selection() {
@@ -1067,7 +1217,7 @@ pub(super) fn draw_effects_column(
     area: Rect,
     region_focused: bool,
 ) {
-    let col_focused = region_focused && app.params_column == 1;
+    let col_focused = region_focused && app.ui.params_column == 1;
     let border_style = if col_focused {
         Style::default().fg(Color::White)
     } else {
@@ -1080,7 +1230,7 @@ pub(super) fn draw_effects_column(
 
     // Synth tab (only for custom instrument tracks, shown first)
     if app.is_current_custom_track() {
-        let synth_selected = app.effect_slot_cursor == SYNTH_TAB;
+        let synth_selected = app.ui.effect_slot_cursor == SYNTH_TAB;
         let synth_style = if synth_selected && col_focused {
             Style::default()
                 .fg(Color::Black)
@@ -1102,13 +1252,13 @@ pub(super) fn draw_effects_column(
         title_spans.push(Span::raw(" "));
     }
 
-    if let Some(descs) = app.effect_descriptors.get(app.cursor_track) {
+    if let Some(descs) = app.graph.effect_descriptors.get(app.ui.cursor_track) {
         for &i in &visible {
             if i >= descs.len() {
                 continue;
             }
             let desc = &descs[i];
-            let is_selected = i == app.effect_slot_cursor;
+            let is_selected = i == app.ui.effect_slot_cursor;
             let style = if is_selected && col_focused {
                 Style::default().fg(Color::Black).bg(Color::White).bold()
             } else if is_selected {
@@ -1137,7 +1287,7 @@ pub(super) fn draw_effects_column(
         }
 
         // Reverb tab (always visible)
-        let reverb_selected = app.effect_slot_cursor == REVERB_TAB;
+        let reverb_selected = app.ui.effect_slot_cursor == REVERB_TAB;
         let reverb_style = if reverb_selected && col_focused {
             Style::default()
                 .fg(Color::Black)
@@ -1166,27 +1316,43 @@ pub(super) fn draw_effects_column(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    app.layout.effects_block = area;
-    app.layout.effects_inner = inner;
+    app.ui.layout.effects_block = area;
+    app.ui.layout.effects_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
         return;
     }
 
     // Synth tab rendering
-    if app.effect_slot_cursor == SYNTH_TAB {
-        let desc = match app.instrument_descriptors.get(app.cursor_track) {
+    if app.ui.effect_slot_cursor == SYNTH_TAB {
+        app.ensure_synth_cursor_visible();
+        let desc = match app.graph.instrument_descriptors.get(app.ui.cursor_track) {
             Some(d) if !d.params.is_empty() => d,
             _ => return,
         };
-        let slot = &app.state.instrument_slots[app.cursor_track];
-        let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+        let slot = &app.state.instrument_slots[app.ui.cursor_track];
+        let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
+        let total_rows = app.synth_row_count();
+        let columns = app.synth_column_count(inner);
+        let rows_per_column = app.synth_rows_per_column(inner);
+        let visible_capacity = app.synth_visible_capacity(inner);
+        let column_width = if columns == 1 {
+            inner.width
+        } else {
+            inner.width.saturating_sub(SYNTH_COLUMN_GAP) / 2
+        };
 
-        for row_idx in 0..app.synth_row_count() {
-            let row_y = inner.y + row_idx as u16;
-            if row_y >= inner.y + inner.height {
+        for visible_idx in 0..visible_capacity {
+            let row_idx = app.ui.synth_scroll_offset + visible_idx;
+            if row_idx >= total_rows {
                 break;
             }
+
+            let column = visible_idx / rows_per_column;
+            let local_row = visible_idx % rows_per_column;
+            let row_y = inner.y + local_row as u16;
+            let row_x = inner.x + column as u16 * (column_width + SYNTH_COLUMN_GAP);
+            let row_area = Rect::new(row_x, row_y, column_width, 1);
 
             let is_base_row = row_idx == 0;
             let param_idx = row_idx.saturating_sub(1);
@@ -1196,11 +1362,11 @@ pub(super) fn draw_effects_column(
                 Some(&desc.params[param_idx])
             };
             let default_val = if is_base_row {
-                app.instrument_base_note_offset(app.cursor_track)
+                app.instrument_base_note_offset(app.ui.cursor_track)
             } else {
                 slot.defaults.get(param_idx)
             };
-            let is_cursor_row = col_focused && app.instrument_param_cursor == row_idx;
+            let is_cursor_row = col_focused && app.ui.instrument_param_cursor == row_idx;
             let cursor = if is_cursor_row { "> " } else { "  " };
             let cursor_style = if is_cursor_row {
                 Style::default().fg(Color::Yellow)
@@ -1208,50 +1374,53 @@ pub(super) fn draw_effects_column(
                 Style::default().fg(Color::Rgb(100, 200, 140))
             };
 
-            let label_width = 12;
-            let value_width = 14;
+            let label_width = if column_width >= 44 { 14 } else { 11 };
+            let value_width = if column_width >= 40 { 12 } else { 9 };
+            let slider_width =
+                (column_width as usize).saturating_sub(label_width + value_width + 6);
+            let label = fit_cell(
+                if is_base_row {
+                    "base_note"
+                } else {
+                    &param_desc.unwrap().name
+                },
+                label_width,
+            );
 
             // Value entry mode
             if is_cursor_row && is_entering_value {
-                let target_label = if !app.visual_steps.is_empty() {
-                    format!("p-lock {} steps", app.visual_steps.len())
-                } else if app.selection_anchor.is_some() {
+                let target_label = if !app.ui.visual_steps.is_empty() {
+                    format!("{} steps", app.ui.visual_steps.len())
+                } else if app.ui.selection_anchor.is_some() {
                     let (lo, hi) = app.selected_range();
-                    format!("p-lock steps {}-{}", lo + 1, hi + 1)
+                    format!("steps {}-{}", lo + 1, hi + 1)
                 } else {
                     "default".to_string()
                 };
                 let spans = vec![
                     Span::styled(cursor, cursor_style),
+                    Span::styled(label.clone(), Style::default().fg(Color::Gray)),
                     Span::styled(
-                        format!(
-                            "{:<width$}",
-                            if is_base_row { "base_note" } else { &param_desc.unwrap().name },
-                            width = label_width
-                        ),
-                        Style::default().fg(Color::Gray),
-                    ),
-                    Span::styled(
-                        format!("{}\u{2588}", app.value_buffer),
+                        format!("{}\u{2588}", app.ui.value_buffer),
                         Style::default()
                             .fg(Color::Yellow)
                             .bg(Color::Rgb(60, 60, 20))
                             .bold(),
                     ),
                     Span::styled(
-                        format!("  ({})  Enter: set  Esc: cancel", target_label),
+                        format!("  ({target_label})"),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ];
                 let line = Line::from(spans);
-                let row_area = Rect::new(inner.x, row_y, inner.width, 1);
                 frame.render_widget(Paragraph::new(line), row_area);
                 continue;
             }
 
             // Determine display value and p-lock status
-            let (display_val, plock_label) = if !is_base_row && app.has_selection() && is_cursor_row {
-                let plock_val = slot.plocks.get(app.cursor_step, param_idx);
+            let (display_val, plock_label) = if !is_base_row && app.has_selection() && is_cursor_row
+            {
+                let plock_val = slot.plocks.get(app.ui.cursor_step, param_idx);
                 match plock_val {
                     Some(v) => (v, Some(" (p-lock)")),
                     None => (default_val, None),
@@ -1268,18 +1437,8 @@ pub(super) fn draw_effects_column(
 
             let mut spans = vec![
                 Span::styled(cursor, cursor_style),
-                Span::styled(
-                    format!(
-                        "{:<width$}",
-                        if is_base_row { "base_note" } else { &param_desc.unwrap().name },
-                        width = label_width
-                    ),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(
-                    format!("{:<width$}", formatted, width = value_width),
-                    cursor_style,
-                ),
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::styled(fit_cell(&formatted, value_width), cursor_style),
             ];
 
             if let Some(lbl) = plock_label {
@@ -1297,10 +1456,10 @@ pub(super) fn draw_effects_column(
                     let (slider_val, is_plock) = if is_base_row {
                         (default_val, false)
                     } else if app.has_selection() {
-                        let pv = slot.plocks.get(app.cursor_step, param_idx);
+                        let pv = slot.plocks.get(app.ui.cursor_step, param_idx);
                         (pv.unwrap_or(default_val), pv.is_some())
                     } else if app.state.is_playing() {
-                        let step = app.state.track_step(app.cursor_track);
+                        let step = app.state.track_step(app.ui.cursor_track);
                         let pv = slot.plocks.get(step, param_idx);
                         (pv.unwrap_or(default_val), pv.is_some())
                     } else {
@@ -1311,8 +1470,6 @@ pub(super) fn draw_effects_column(
                     } else {
                         param_desc.unwrap().normalize(slider_val)
                     };
-                    let slider_width =
-                        (inner.width as usize).saturating_sub(label_width + value_width + 6);
                     if slider_width > 2 {
                         let filled =
                             ((norm * slider_width as f32).round() as usize).min(slider_width);
@@ -1332,32 +1489,42 @@ pub(super) fn draw_effects_column(
             }
 
             let line = Line::from(spans);
-            let row_area = Rect::new(inner.x, row_y, inner.width, 1);
             frame.render_widget(Paragraph::new(line), row_area);
         }
 
+        if total_rows > visible_capacity && inner.width > 12 {
+            let end = (app.ui.synth_scroll_offset + visible_capacity).min(total_rows);
+            let summary = format!("{}-{}/{}", app.ui.synth_scroll_offset + 1, end, total_rows);
+            let summary_len = summary.len() as u16;
+            let x = inner.x + inner.width.saturating_sub(summary_len);
+            frame.render_widget(
+                Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+                Rect::new(x, inner.y, summary_len, 1),
+            );
+        }
+
         // Dropdown overlay for synth tab
-        if app.dropdown_open && col_focused {
+        if app.ui.dropdown_open && col_focused {
             draw_dropdown(frame, app, inner);
         }
         return;
     }
 
     // Reverb tab rendering
-    if app.effect_slot_cursor == REVERB_TAB {
+    if app.ui.effect_slot_cursor == REVERB_TAB {
         let reverb_params: [(&str, f32); 3] = [
-            ("size", app.reverb_size),
-            ("brightness", app.reverb_brightness),
-            ("replace", app.reverb_replace),
+            ("size", app.ui.reverb_size),
+            ("brightness", app.ui.reverb_brightness),
+            ("replace", app.ui.reverb_replace),
         ];
-        let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+        let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
 
         for (i, (name, val)) in reverb_params.iter().enumerate() {
             if i as u16 >= inner.height {
                 break;
             }
             let row_y = inner.y + i as u16;
-            let is_cursor_row = col_focused && app.reverb_param_cursor == i;
+            let is_cursor_row = col_focused && app.ui.reverb_param_cursor == i;
             let cursor = if is_cursor_row { "> " } else { "  " };
             let cursor_style = if is_cursor_row {
                 Style::default().fg(Color::Yellow)
@@ -1376,7 +1543,7 @@ pub(super) fn draw_effects_column(
                         Style::default().fg(Color::Gray),
                     ),
                     Span::styled(
-                        format!("{}\u{2588}", app.value_buffer),
+                        format!("{}\u{2588}", app.ui.value_buffer),
                         Style::default()
                             .fg(Color::Yellow)
                             .bg(Color::Rgb(60, 60, 20))
@@ -1424,8 +1591,8 @@ pub(super) fn draw_effects_column(
         return;
     }
 
-    let track = app.cursor_track;
-    let slot_idx = app.effect_slot_cursor;
+    let track = app.ui.cursor_track;
+    let slot_idx = app.ui.effect_slot_cursor;
 
     // Check if this is an empty custom slot with no effect loaded
     let is_custom_slot = slot_idx >= BUILTIN_SLOT_COUNT;
@@ -1449,6 +1616,7 @@ pub(super) fn draw_effects_column(
 
     // Render params for current slot
     let desc = match app
+        .graph
         .effect_descriptors
         .get(track)
         .and_then(|d| d.get(slot_idx))
@@ -1461,7 +1629,7 @@ pub(super) fn draw_effects_column(
         return;
     }
     let slot = &chain[slot_idx];
-    let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+    let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
 
     for (i, param_desc) in desc.params.iter().enumerate() {
         let row_y = inner.y + i as u16;
@@ -1470,7 +1638,7 @@ pub(super) fn draw_effects_column(
         }
 
         let default_val = slot.defaults.get(i);
-        let is_cursor_row = col_focused && app.effect_param_cursor == i;
+        let is_cursor_row = col_focused && app.ui.effect_param_cursor == i;
         let cursor = if is_cursor_row { "> " } else { "  " };
         let cursor_style = if is_cursor_row {
             Style::default().fg(Color::Yellow)
@@ -1483,9 +1651,9 @@ pub(super) fn draw_effects_column(
 
         // Value entry mode
         if is_cursor_row && is_entering_value {
-            let target_label = if !app.visual_steps.is_empty() {
-                format!("p-lock {} steps", app.visual_steps.len())
-            } else if app.selection_anchor.is_some() {
+            let target_label = if !app.ui.visual_steps.is_empty() {
+                format!("p-lock {} steps", app.ui.visual_steps.len())
+            } else if app.ui.selection_anchor.is_some() {
                 let (lo, hi) = app.selected_range();
                 format!("p-lock steps {}-{}", lo + 1, hi + 1)
             } else {
@@ -1498,7 +1666,7 @@ pub(super) fn draw_effects_column(
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(
-                    format!("{}\u{2588}", app.value_buffer),
+                    format!("{}\u{2588}", app.ui.value_buffer),
                     Style::default()
                         .fg(Color::Yellow)
                         .bg(Color::Rgb(60, 60, 20))
@@ -1517,7 +1685,7 @@ pub(super) fn draw_effects_column(
 
         // Determine display value and p-lock status
         let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
-            let plock_val = slot.plocks.get(app.cursor_step, i);
+            let plock_val = slot.plocks.get(app.ui.cursor_step, i);
             match plock_val {
                 Some(v) => (v, Some(" (p-lock)")),
                 None => (default_val, None),
@@ -1549,10 +1717,10 @@ pub(super) fn draw_effects_column(
             let range = param_desc.max - param_desc.min;
             if range > 0.0 {
                 let (slider_val, is_plock) = if app.has_selection() {
-                    let pv = slot.plocks.get(app.cursor_step, i);
+                    let pv = slot.plocks.get(app.ui.cursor_step, i);
                     (pv.unwrap_or(default_val), pv.is_some())
                 } else if app.state.is_playing() {
-                    let step = app.state.track_step(app.cursor_track);
+                    let step = app.state.track_step(app.ui.cursor_track);
                     let pv = slot.plocks.get(step, i);
                     (pv.unwrap_or(default_val), pv.is_some())
                 } else {
@@ -1565,11 +1733,7 @@ pub(super) fn draw_effects_column(
                     let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
                     let bar: String =
                         "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
-                    let slider_color = if is_plock {
-                        Color::Cyan
-                    } else {
-                        Color::White
-                    };
+                    let slider_color = if is_plock { Color::Cyan } else { Color::White };
                     spans.push(Span::styled(
                         format!("[{}]", bar),
                         Style::default().fg(slider_color),
@@ -1584,7 +1748,7 @@ pub(super) fn draw_effects_column(
     }
 
     // Dropdown overlay
-    if app.dropdown_open && col_focused {
+    if app.ui.dropdown_open && col_focused {
         draw_dropdown(frame, app, inner);
     }
 }
@@ -1618,7 +1782,7 @@ pub(super) fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Filter input line
-    let filter_text = format!(" > {}\u{2588}", app.picker_filter);
+    let filter_text = format!(" > {}\u{2588}", app.editor.picker_filter);
     let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
     let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(filter_line), filter_area);
@@ -1633,7 +1797,7 @@ pub(super) fn draw_effect_picker(frame: &mut Frame, app: &App, area: Rect) {
         if row_y >= inner.y + inner.height {
             break;
         }
-        let is_cursor = i == app.picker_cursor;
+        let is_cursor = i == app.editor.picker_cursor;
         let style = if is_cursor {
             Style::default().fg(Color::Black).bg(Color::White)
         } else if item == "+ New effect" {
@@ -1663,10 +1827,13 @@ pub(super) fn draw_compiling_overlay(frame: &mut Frame, pending: &PendingCompile
         '\u{28FE}',
     ];
     let spin = SPINNER[pending.tick / 2 % SPINNER.len()];
-    let name_display = if pending.name.len() > 14 {
-        format!("{}...", &pending.name[..11])
+    let name = match &pending.target {
+        CompileTarget::Effect { name, .. } | CompileTarget::Instrument { name } => name,
+    };
+    let name_display = if name.len() > 14 {
+        format!("{}...", &name[..11])
     } else {
-        pending.name.clone()
+        name.clone()
     };
 
     let w = 20u16;
@@ -1729,7 +1896,7 @@ pub(super) fn draw_instrument_picker(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let filter_text = format!(" > {}\u{2588}", app.picker_filter);
+    let filter_text = format!(" > {}\u{2588}", app.editor.picker_filter);
     let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
     let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(filter_line), filter_area);
@@ -1743,7 +1910,7 @@ pub(super) fn draw_instrument_picker(frame: &mut Frame, app: &App, area: Rect) {
         if row_y >= inner.y + inner.height {
             break;
         }
-        let is_cursor = i == app.picker_cursor;
+        let is_cursor = i == app.editor.picker_cursor;
         let style = if is_cursor {
             Style::default().fg(Color::Black).bg(Color::White)
         } else if item == "+ New instrument" {

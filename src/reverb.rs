@@ -11,17 +11,15 @@ const NDELAYS: usize = 13;
 
 /// Delay buffer sizes (stereo frames) — relatively prime to minimize periodic artifacts.
 const DELAY_BUF_SIZES: [usize; NDELAYS] = [
-    9700, 6000, 2320, 940,     // Bank 0 (indices 0-3)
-    15220, 8460, 4540, 3200,   // Bank 1 (indices 4-7)
-    6480, 3660, 1720, 680,     // Bank 2 (indices 8-11)
-    3111,                       // Chorus delay (index 12)
+    9700, 6000, 2320, 940, // Bank 0 (indices 0-3)
+    15220, 8460, 4540, 3200, // Bank 1 (indices 4-7)
+    6480, 3660, 1720, 680,  // Bank 2 (indices 8-11)
+    3111, // Chorus delay (index 12)
 ];
 
 /// Tank sizes for delay length calculation based on "bigness" knob.
 const TANK_SIZES: [usize; 12] = [
-    4801, 2909, 1153, 461,
-    7607, 4217, 2269, 1597,
-    3407, 1823, 859, 331,
+    4801, 2909, 1153, 461, 7607, 4217, 2269, 1597, 3407, 1823, 859, 331,
 ];
 
 // ── State layout indices (f32 slots) ──
@@ -38,14 +36,14 @@ const ST_VIBM: usize = 8;
 const ST_OLDFPD: usize = 9;
 const ST_CYCLE: usize = 10;
 const ST_SAMPLE_RATE: usize = 11;
-const ST_DELAY_META: usize = 12;  // 13 delays × 2 (count, length) = 26 floats
-const ST_FEEDBACK: usize = 38;    // 4 stereo frames = 8 floats
+const ST_DELAY_META: usize = 12; // 13 delays × 2 (count, length) = 26 floats
+const ST_FEEDBACK: usize = 38; // 4 stereo frames = 8 floats
 const ST_IIR_A_L: usize = 46;
 const ST_IIR_A_R: usize = 47;
 const ST_IIR_B_L: usize = 48;
 const ST_IIR_B_R: usize = 49;
-const ST_LASTREF: usize = 50;     // 5 stereo frames = 10 floats
-const ST_BUFS: usize = 60;        // Delay buffer data starts here
+const ST_LASTREF: usize = 50; // 5 stereo frames = 10 floats
+const ST_BUFS: usize = 60; // Delay buffer data starts here
 
 /// Total number of f32 slots for all delay buffers (stereo = 2 floats per frame).
 const fn total_buf_floats() -> usize {
@@ -83,16 +81,24 @@ const BUF_OFFSETS: [usize; NDELAYS] = buf_offsets();
 // ── Helper functions ──
 
 #[inline(always)]
-fn square(x: f32) -> f32 { x * x }
+fn square(x: f32) -> f32 {
+    x * x
+}
 
 #[inline(always)]
-fn cube(x: f32) -> f32 { x * x * x }
+fn cube(x: f32) -> f32 {
+    x * x * x
+}
 
 #[inline(always)]
-fn clamp4(x: f32) -> f32 { x.clamp(-4.0, 4.0) }
+fn clamp4(x: f32) -> f32 {
+    x.clamp(-4.0, 4.0)
+}
 
 #[inline(always)]
-fn clamp1(x: f32) -> f32 { x.clamp(-1.0, 1.0) }
+fn clamp1(x: f32) -> f32 {
+    x.clamp(-1.0, 1.0)
+}
 
 #[inline(always)]
 fn fast_sin(x: f32) -> f32 {
@@ -155,9 +161,9 @@ unsafe extern "C" fn reverb_process(
     let s = state as *mut f32;
     let nf = nframes as usize;
 
-    let in0 = *inp.add(0);   // Mono input (from reverb bus)
-    let out0 = *out.add(0);  // L output
-    let out1 = *out.add(1);  // R output
+    let in0 = *inp.add(0); // Mono input (from reverb bus)
+    let out0 = *out.add(0); // L output
+    let out1 = *out.add(1); // R output
 
     // Read sample rate
     let mut sample_rate = *s.add(ST_SAMPLE_RATE);
@@ -179,7 +185,9 @@ unsafe extern "C" fn reverb_process(
     let mut fpd0 = (*s.add(ST_FPD0)).to_bits();
     let _fpd1 = (*s.add(ST_FPD1)).to_bits();
 
-    if fpd0 == 0 { fpd0 = 2756923396; }
+    if fpd0 == 0 {
+        fpd0 = 2756923396;
+    }
 
     // IIR states
     let mut iir_a_l = *s.add(ST_IIR_A_L);
@@ -275,7 +283,9 @@ unsafe extern "C" fn reverb_process(
             *s.add(idx) = clamp4(dry_l * attenuate);
             *s.add(idx + 1) = clamp4(dry_r * attenuate);
             counts[12] += 1;
-            if counts[12] < 0 || counts[12] > lengths[12] { counts[12] = 0; }
+            if counts[12] < 0 || counts[12] > lengths[12] {
+                counts[12] = 0;
+            }
         }
 
         // Read from chorus delay with vibrato-modulated interpolation
@@ -334,7 +344,9 @@ unsafe extern "C" fn reverb_process(
                     *s.add(idx) = clamp4($val_l);
                     *s.add(idx + 1) = clamp4($val_r);
                     counts[$di] += 1;
-                    if counts[$di] < 0 || counts[$di] > lengths[$di] { counts[$di] = 0; }
+                    if counts[$di] < 0 || counts[$di] > lengths[$di] {
+                        counts[$di] = 0;
+                    }
                 }};
             }
 
@@ -357,8 +369,8 @@ unsafe extern "C" fn reverb_process(
             }
 
             // Write to bank 2 (delays 8-11) with cross-channel flipped feedback
-            write_head!(8,  sample_l + fb0_r * regen, sample_r + fb0_l * regen);
-            write_head!(9,  sample_l + fb1_r * regen, sample_r + fb1_l * regen);
+            write_head!(8, sample_l + fb0_r * regen, sample_r + fb0_l * regen);
+            write_head!(9, sample_l + fb1_r * regen, sample_r + fb1_l * regen);
             write_head!(10, sample_l + fb2_r * regen, sample_r + fb2_l * regen);
             write_head!(11, sample_l + fb3_r * regen, sample_r + fb3_l * regen);
 
@@ -416,27 +428,38 @@ unsafe extern "C" fn reverb_process(
             // Update lastRef interpolation (cycleEnd=4 for low quality at 44.1k)
             match cycle_end {
                 4 => {
-                    lr0_l = lr4_l; lr0_r = lr4_r;
-                    lr2_l = (lr0_l + sum_l) * 0.5; lr2_r = (lr0_r + sum_r) * 0.5;
-                    lr1_l = (lr0_l + lr2_l) * 0.5; lr1_r = (lr0_r + lr2_r) * 0.5;
-                    lr3_l = (lr2_l + sum_l) * 0.5; lr3_r = (lr2_r + sum_r) * 0.5;
-                    lr4_l = sum_l; lr4_r = sum_r;
+                    lr0_l = lr4_l;
+                    lr0_r = lr4_r;
+                    lr2_l = (lr0_l + sum_l) * 0.5;
+                    lr2_r = (lr0_r + sum_r) * 0.5;
+                    lr1_l = (lr0_l + lr2_l) * 0.5;
+                    lr1_r = (lr0_r + lr2_r) * 0.5;
+                    lr3_l = (lr2_l + sum_l) * 0.5;
+                    lr3_r = (lr2_r + sum_r) * 0.5;
+                    lr4_l = sum_l;
+                    lr4_r = sum_r;
                 }
                 3 => {
-                    lr0_l = lr3_l; lr0_r = lr3_r;
+                    lr0_l = lr3_l;
+                    lr0_r = lr3_r;
                     lr2_l = (lr0_l + lr0_l + sum_l) / 3.0;
                     lr2_r = (lr0_r + lr0_r + sum_r) / 3.0;
                     lr1_l = (lr0_l + sum_l + sum_l) / 3.0;
                     lr1_r = (lr0_r + sum_r + sum_r) / 3.0;
-                    lr3_l = sum_l; lr3_r = sum_r;
+                    lr3_l = sum_l;
+                    lr3_r = sum_r;
                 }
                 2 => {
-                    lr0_l = lr2_l; lr0_r = lr2_r;
-                    lr1_l = (lr0_l + sum_l) * 0.5; lr1_r = (lr0_r + sum_r) * 0.5;
-                    lr2_l = sum_l; lr2_r = sum_r;
+                    lr0_l = lr2_l;
+                    lr0_r = lr2_r;
+                    lr1_l = (lr0_l + sum_l) * 0.5;
+                    lr1_r = (lr0_r + sum_r) * 0.5;
+                    lr2_l = sum_l;
+                    lr2_r = sum_r;
                 }
                 _ => {
-                    lr0_l = sum_l; lr0_r = sum_r;
+                    lr0_l = sum_l;
+                    lr0_r = sum_r;
                 }
             }
 

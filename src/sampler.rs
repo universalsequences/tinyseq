@@ -14,12 +14,12 @@ const STATE_GATE_SAMPLES: usize = 6; // absolute gate length in samples (compute
 const STATE_TRANSPOSE: usize = 7;
 const STATE_ATTACK_SAMPLES: usize = 8;
 const STATE_RELEASE_SAMPLES: usize = 9;
-const STATE_GATE_MODE: usize = 10;   // 1.0=gate on, 0.0=gate off
-// Persistent envelope state (not settable via params)
-const STATE_ENV_PHASE: usize = 11;   // 0=idle, 1=attack, 2=sustain, 3=release
-const STATE_ENV_LEVEL: usize = 12;   // current envelope amplitude 0.0–1.0
+const STATE_GATE_MODE: usize = 10; // 1.0=gate on, 0.0=gate off
+                                   // Persistent envelope state (not settable via params)
+const STATE_ENV_PHASE: usize = 11; // 0=idle, 1=attack, 2=sustain, 3=release
+const STATE_ENV_LEVEL: usize = 12; // current envelope amplitude 0.0–1.0
 const STATE_RELEASE_LEVEL: usize = 13; // level when release began (for linear ramp)
-const STATE_GATE_COUNTER: usize = 14;  // real-time sample counter for gate duration (increments by 1/sample, not by playback rate)
+const STATE_GATE_COUNTER: usize = 14; // real-time sample counter for gate duration (increments by 1/sample, not by playback rate)
 const SAMPLER_STATE_SIZE: usize = 15;
 
 // Envelope phase constants
@@ -250,8 +250,16 @@ unsafe extern "C" fn sampler_process(
 
         let idx = playhead as usize;
         let frac = playhead - idx as f32;
-        let s0 = if idx < sample_len { *sample_data.add(idx) } else { 0.0 };
-        let s1 = if idx + 1 < sample_len { *sample_data.add(idx + 1) } else { 0.0 };
+        let s0 = if idx < sample_len {
+            *sample_data.add(idx)
+        } else {
+            0.0
+        };
+        let s1 = if idx + 1 < sample_len {
+            *sample_data.add(idx + 1)
+        } else {
+            0.0
+        };
         let sample = s0 + frac * (s1 - s0);
 
         *out0.add(i) = sample * amplitude * env_level;
@@ -375,10 +383,7 @@ pub fn create_sampler_node(
 }
 
 /// Load a WAV file, create an audiograph buffer and sampler node.
-pub fn create_sampler_track(
-    lg: *mut LiveGraph,
-    wav_path: &Path,
-) -> Result<SamplerTrack, String> {
+pub fn create_sampler_track(lg: *mut LiveGraph, wav_path: &Path) -> Result<SamplerTrack, String> {
     let (buffer_id, name) = load_wav_buffer(lg, wav_path)?;
     create_sampler_node(lg, buffer_id, &name)
 }

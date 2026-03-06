@@ -22,76 +22,86 @@ impl App {
         match code {
             // Option+Left/Right: beat jump (4 steps)
             KeyCode::Left if has_alt => {
-                self.cursor_step = self.cursor_step.saturating_sub(4);
+                self.ui.cursor_step = self.ui.cursor_step.saturating_sub(4);
             }
             KeyCode::Right if has_alt => {
-                self.cursor_step = (self.cursor_step + 4).min(ns - 1);
+                self.ui.cursor_step = (self.ui.cursor_step + 4).min(ns - 1);
             }
 
             // Shift+Left/Right: extend selection
             KeyCode::Left if has_shift => {
-                if self.selection_anchor.is_none() {
-                    self.selection_anchor = Some(self.cursor_step);
+                if self.ui.selection_anchor.is_none() {
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
-                if self.cursor_step > 0 {
-                    self.cursor_step -= 1;
+                if self.ui.cursor_step > 0 {
+                    self.ui.cursor_step -= 1;
                 }
             }
             KeyCode::Right if has_shift => {
-                if self.selection_anchor.is_none() {
-                    self.selection_anchor = Some(self.cursor_step);
+                if self.ui.selection_anchor.is_none() {
+                    self.ui.selection_anchor = Some(self.ui.cursor_step);
                 }
-                if self.cursor_step < ns - 1 {
-                    self.cursor_step += 1;
+                if self.ui.cursor_step < ns - 1 {
+                    self.ui.cursor_step += 1;
                 }
             }
 
             KeyCode::Left => {
-                if self.selection_anchor.is_some() {
+                if self.ui.selection_anchor.is_some() {
                     self.shift_selection(-1);
-                } else if self.cursor_step > 0 {
-                    self.cursor_step -= 1;
+                } else if self.ui.cursor_step > 0 {
+                    self.ui.cursor_step -= 1;
                 } else {
-                    self.cursor_step = ns - 1;
+                    self.ui.cursor_step = ns - 1;
                 }
             }
             KeyCode::Right => {
-                if self.selection_anchor.is_some() {
+                if self.ui.selection_anchor.is_some() {
                     self.shift_selection(1);
                 } else {
-                    self.cursor_step = (self.cursor_step + 1) % ns;
+                    self.ui.cursor_step = (self.ui.cursor_step + 1) % ns;
                 }
             }
 
             // Shift+Up/Down: adjust step param value
             KeyCode::Up if has_shift => {
-                self.adjust_selected(self.active_param.increment());
+                self.adjust_selected(self.ui.active_param.increment());
             }
             KeyCode::Down if has_shift => {
-                self.adjust_selected(-self.active_param.increment());
+                self.adjust_selected(-self.ui.active_param.increment());
             }
 
             // Up/Down: switch tracks
             KeyCode::Up => {
-                if self.cursor_track > 0 {
-                    self.cursor_track -= 1;
+                if self.ui.cursor_track > 0 {
+                    self.ui.cursor_track -= 1;
                 } else if !self.tracks.is_empty() {
-                    self.cursor_track = self.tracks.len() - 1;
+                    self.ui.cursor_track = self.tracks.len() - 1;
                 }
                 self.clamp_cursor_to_steps();
-                self.sync_sidebar_to_track();
+                self.browser.sync_to_track(
+                    &self.tracks,
+                    self.ui.cursor_track,
+                    self.is_sampler_track(self.ui.cursor_track),
+                    &self.ui,
+                );
             }
             KeyCode::Down => {
                 if !self.tracks.is_empty() {
-                    self.cursor_track = (self.cursor_track + 1) % self.tracks.len();
+                    self.ui.cursor_track = (self.ui.cursor_track + 1) % self.tracks.len();
                 }
                 self.clamp_cursor_to_steps();
-                self.sync_sidebar_to_track();
+                self.browser.sync_to_track(
+                    &self.tracks,
+                    self.ui.cursor_track,
+                    self.is_sampler_track(self.ui.cursor_track),
+                    &self.ui,
+                );
             }
 
             KeyCode::Enter => {
                 if !self.tracks.is_empty() {
-                    let track = self.cursor_track;
+                    let track = self.ui.cursor_track;
                     for step in self.selected_steps() {
                         self.state.toggle_step_and_clear_plocks(track, step);
                     }
@@ -100,28 +110,28 @@ impl App {
 
             KeyCode::Backspace | KeyCode::Delete => {
                 if !self.tracks.is_empty() {
-                    let track = self.cursor_track;
+                    let track = self.ui.cursor_track;
                     for step in self.selected_steps() {
                         if self.state.patterns[track].is_active(step) {
                             self.state.toggle_step_and_clear_plocks(track, step);
                         }
                     }
-                    self.selection_anchor = None;
-                    self.visual_steps.clear();
+                    self.ui.selection_anchor = None;
+                    self.ui.visual_steps.clear();
                 }
             }
 
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 if !self.tracks.is_empty() {
                     let old_len = self.num_steps();
-                    let new_len = self.state.duplicate_track_pattern(self.cursor_track);
+                    let new_len = self.state.duplicate_track_pattern(self.ui.cursor_track);
                     if new_len == old_len {
-                        self.status_message = Some((
+                        self.editor.status_message = Some((
                             format!("Already at max ({} steps)", new_len),
                             Instant::now(),
                         ));
                     } else {
-                        self.status_message = Some((
+                        self.editor.status_message = Some((
                             format!("Pattern doubled to {} steps", new_len),
                             Instant::now(),
                         ));
@@ -132,12 +142,12 @@ impl App {
             KeyCode::Char('-') => {
                 if !self.tracks.is_empty() {
                     let old_len = self.num_steps();
-                    let new_len = self.state.halve_track_pattern(self.cursor_track);
+                    let new_len = self.state.halve_track_pattern(self.ui.cursor_track);
                     if new_len == old_len {
-                        self.status_message =
+                        self.editor.status_message =
                             Some(("Already at minimum (1 step)".to_string(), Instant::now()));
                     } else {
-                        self.status_message = Some((
+                        self.editor.status_message = Some((
                             format!("Pattern halved to {} steps", new_len),
                             Instant::now(),
                         ));
@@ -146,44 +156,44 @@ impl App {
                 }
             }
             KeyCode::Char('.') => {
-                self.value_buffer.clear();
-                self.value_buffer.push_str("0.");
-                self.input_mode = InputMode::ValueEntry;
+                self.ui.value_buffer.clear();
+                self.ui.value_buffer.push_str("0.");
+                self.ui.input_mode = InputMode::ValueEntry;
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                self.value_buffer.clear();
-                self.value_buffer.push(c);
-                self.input_mode = InputMode::ValueEntry;
+                self.ui.value_buffer.clear();
+                self.ui.value_buffer.push(c);
+                self.ui.input_mode = InputMode::ValueEntry;
             }
             KeyCode::Char('b') => {
-                self.bpm_entry = true;
-                self.value_buffer.clear();
-                self.input_mode = InputMode::ValueEntry;
+                self.ui.bpm_entry = true;
+                self.ui.value_buffer.clear();
+                self.ui.input_mode = InputMode::ValueEntry;
             }
             KeyCode::Char('p') => {
-                self.input_mode = InputMode::PatternSelect;
-                self.value_buffer.clear();
-                self.pattern_clone_pending = false;
+                self.ui.input_mode = InputMode::PatternSelect;
+                self.ui.value_buffer.clear();
+                self.ui.pattern_clone_pending = false;
             }
             KeyCode::Char(']') => {
                 let total_pages = ns.div_ceil(STEPS_PER_PAGE);
                 if total_pages > 1 {
                     let current_page = self.current_page();
-                    self.cursor_step = ((current_page + 1) % total_pages) * STEPS_PER_PAGE;
+                    self.ui.cursor_step = ((current_page + 1) % total_pages) * STEPS_PER_PAGE;
                 }
             }
             KeyCode::Char('[') => {
                 let total_pages = ns.div_ceil(STEPS_PER_PAGE);
                 if total_pages > 1 {
                     let current_page = self.current_page();
-                    self.cursor_step =
+                    self.ui.cursor_step =
                         ((current_page + total_pages - 1) % total_pages) * STEPS_PER_PAGE;
                 }
             }
             KeyCode::Char(c) => {
                 if let Some(param) = StepParam::from_hotkey(c) {
                     if StepParam::VISIBLE.contains(&param) {
-                        self.active_param = param;
+                        self.ui.active_param = param;
                     }
                 }
             }
@@ -195,9 +205,9 @@ impl App {
 // ── Drawing ──
 
 pub(super) fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) {
-    app.layout.cirklon_area = area;
+    app.ui.layout.cirklon_area = area;
 
-    let mode_label = match app.input_mode {
+    let mode_label = match app.ui.input_mode {
         super::InputMode::StepInsert => Some(" INSERT "),
         super::InputMode::StepSelect => Some(" SELECT "),
         super::InputMode::StepArm => Some(" ARM "),
@@ -240,7 +250,7 @@ pub(super) fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) 
         ])
         .split(inner);
 
-    app.layout.track_list = h_chunks[0];
+    app.ui.layout.track_list = h_chunks[0];
 
     draw_track_list(frame, app, h_chunks[0]);
 
@@ -258,10 +268,10 @@ pub(super) fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) 
         ])
         .split(h_chunks[1]);
 
-    app.layout.param_tabs = seq_chunks[0];
-    app.layout.bars = seq_chunks[1];
-    app.layout.trigger_row = seq_chunks[2];
-    app.layout.page_blocks_area = seq_chunks[3];
+    app.ui.layout.param_tabs = seq_chunks[0];
+    app.ui.layout.bars = seq_chunks[1];
+    app.ui.layout.trigger_row = seq_chunks[2];
+    app.ui.layout.page_blocks_area = seq_chunks[3];
 
     draw_param_tabs(frame, app, seq_chunks[0]);
     draw_bars(frame, app, seq_chunks[1]);
@@ -286,16 +296,18 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
         let y = area.y + i as u16;
-        let is_selected = i == app.cursor_track;
+        let is_selected = i == app.ui.cursor_track;
         let sanitized: String = name
             .chars()
-            .filter(|c| !c.is_control() && unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0) > 0)
+            .filter(|c| {
+                !c.is_control() && unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0) > 0
+            })
             .collect();
         let trimmed = sanitized.trim_start();
         let truncated: String = trimmed.chars().take(2).collect();
 
         // Arm indicator: 2-char block for visibility, clickable
-        let armed = i < app.record_armed.len() && app.record_armed[i];
+        let armed = i < app.graph.record_armed.len() && app.graph.record_armed[i];
         let arm_sym = if armed {
             "\u{2588}\u{2588}"
         } else {
@@ -340,7 +352,7 @@ fn draw_param_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::raw("  ")];
     for param in StepParam::VISIBLE {
         let (prefix, hotkey, suffix) = param.tab_parts();
-        let is_active = param == app.active_param;
+        let is_active = param == app.ui.active_param;
         let color = param_color(param);
 
         let base_style = if is_active {
@@ -372,7 +384,7 @@ fn is_beat_group_odd(step: usize) -> bool {
 
 /// Background color for a step column. Alternates every 4 steps for beat grouping.
 fn step_bg(app: &App, step: usize, is_playing: bool, playhead: usize) -> Color {
-    let is_cursor = step == app.cursor_step;
+    let is_cursor = step == app.ui.cursor_step;
     let is_sel = app.has_selection() && is_in_selection(app, step);
     let is_ph = is_playing && step == playhead;
 
@@ -423,18 +435,18 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Branch to effect slot bars when effects column is focused
-    if app.focused_region == Region::Params && app.params_column == 1 {
+    if app.ui.focused_region == Region::Params && app.ui.params_column == 1 {
         draw_slot_bars(frame, app, area);
         return;
     }
 
     let ns = app.num_steps();
-    let track_ph = app.state.track_step(app.cursor_track);
+    let track_ph = app.state.track_step(app.ui.cursor_track);
     let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
-    let sd = &app.state.step_data[app.cursor_track];
-    let is_transpose = app.active_param == StepParam::Transpose;
-    let is_sync = app.active_param == StepParam::Sync;
+    let sd = &app.state.step_data[app.ui.cursor_track];
+    let is_transpose = app.ui.active_param == StepParam::Transpose;
+    let is_sync = app.ui.active_param == StepParam::Sync;
 
     let (page_start, page_end) = app.page_range();
 
@@ -446,9 +458,9 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
 
-        let raw = sd.get(step, app.active_param);
-        let normalized = app.active_param.normalize(raw);
-        let active = app.state.patterns[app.cursor_track].is_active(step);
+        let raw = sd.get(step, app.ui.active_param);
+        let normalized = app.ui.active_param.normalize(raw);
+        let active = app.state.patterns[app.ui.cursor_track].is_active(step);
         let playhead_on_page = playhead >= page_start && playhead < page_end;
         let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
 
@@ -591,11 +603,12 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Unified bar drawing for any effect slot.
 fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
-    let track = app.cursor_track;
-    let slot_idx = app.effect_slot_cursor;
-    let param_idx = app.effect_param_cursor;
+    let track = app.ui.cursor_track;
+    let slot_idx = app.ui.effect_slot_cursor;
+    let param_idx = app.ui.effect_param_cursor;
 
     let desc = match app
+        .graph
         .effect_descriptors
         .get(track)
         .and_then(|d| d.get(slot_idx))
@@ -688,7 +701,7 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let ns = app.num_steps();
-    let track_ph = app.state.track_step(app.cursor_track);
+    let track_ph = app.state.track_step(app.ui.cursor_track);
     let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
     let (page_start, page_end) = app.page_range();
@@ -700,9 +713,9 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
 
-        let active = app.state.patterns[app.cursor_track].is_active(step);
+        let active = app.state.patterns[app.ui.cursor_track].is_active(step);
         // Check all slots for p-locks
-        let has_plock = app.state.effect_chains[app.cursor_track]
+        let has_plock = app.state.effect_chains[app.ui.cursor_track]
             .iter()
             .any(|slot| {
                 let np = slot.num_params.load(Ordering::Relaxed) as usize;
@@ -737,7 +750,7 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
         let num = format!("{:>2} ", step + 1);
         let is_sel = app.has_selection() && is_in_selection(app, step);
         let beat_bg = step_bg(app, step, false, 0); // just for beat-group shading
-        let style = if step == app.cursor_step {
+        let style = if step == app.ui.cursor_step {
             Style::default().fg(Color::White).bg(Color::Rgb(80, 80, 80))
         } else if is_sel {
             Style::default().fg(Color::Rgb(160, 160, 160)).bg(beat_bg)
@@ -753,12 +766,12 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
     let ns = app.num_steps();
     let total_pages = ns.div_ceil(STEPS_PER_PAGE);
     if total_pages <= 1 || area.height < 2 {
-        app.page_btn_layout.clear();
+        app.ui.page_btn_layout.clear();
         return;
     }
 
     let display_page = app.display_page();
-    let playing_page = (app.state.track_step(app.cursor_track) % ns) / STEPS_PER_PAGE;
+    let playing_page = (app.state.track_step(app.ui.cursor_track) % ns) / STEPS_PER_PAGE;
 
     let mut btn_layout: Vec<(u16, u16, usize)> = Vec::new();
     let mut x = area.x + 2;
@@ -771,9 +784,7 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
         let style = if p == display_page {
             Style::default().fg(Color::Black).bg(Color::White).bold()
         } else {
-            Style::default()
-                .fg(Color::Gray)
-                .bg(Color::Rgb(50, 50, 50))
+            Style::default().fg(Color::Gray).bg(Color::Rgb(50, 50, 50))
         };
 
         if x + w <= area.x + area.width {
@@ -792,17 +803,14 @@ fn draw_page_blocks(frame: &mut Frame, app: &mut App, area: Rect) {
             let block_w = bw - bx;
             let dot_x = bx + block_w / 2;
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "\u{2022}",
-                    Style::default().fg(Color::White),
-                )),
+                Paragraph::new(Span::styled("\u{2022}", Style::default().fg(Color::White))),
                 Rect::new(dot_x, area.y + 1, 1, 1),
             );
             break;
         }
     }
 
-    app.page_btn_layout = btn_layout;
+    app.ui.page_btn_layout = btn_layout;
 }
 
 fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -810,17 +818,17 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let is_pattern_select = app.input_mode == InputMode::PatternSelect;
-    let is_bpm_entry = app.input_mode == InputMode::ValueEntry && app.bpm_entry;
-    let is_cirklon_entry = app.input_mode == InputMode::ValueEntry
-        && !app.bpm_entry
-        && app.focused_region == Region::Cirklon;
+    let is_pattern_select = app.ui.input_mode == InputMode::PatternSelect;
+    let is_bpm_entry = app.ui.input_mode == InputMode::ValueEntry && app.ui.bpm_entry;
+    let is_cirklon_entry = app.ui.input_mode == InputMode::ValueEntry
+        && !app.ui.bpm_entry
+        && app.ui.focused_region == Region::Cirklon;
 
     let line = if is_bpm_entry {
         Line::from(vec![
             Span::styled("  BPM: ", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{}\u{2588}", app.value_buffer),
+                format!("{}\u{2588}", app.ui.value_buffer),
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Rgb(60, 60, 60))
@@ -832,7 +840,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ])
     } else if is_pattern_select {
-        if app.pattern_clone_pending {
+        if app.ui.pattern_clone_pending {
             Line::from(vec![
                 Span::styled(
                     "  Clone pattern \u{2192} new  ",
@@ -847,7 +855,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled("  Pattern: ", Style::default().fg(Color::White)),
                 Span::styled(
-                    format!("{}\u{2588}", app.value_buffer),
+                    format!("{}\u{2588}", app.ui.value_buffer),
                     Style::default()
                         .fg(Color::White)
                         .bg(Color::Rgb(60, 60, 60))
@@ -864,15 +872,15 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             let (lo, hi) = app.selected_range();
             format!("Steps {}-{}", lo + 1, hi + 1)
         } else {
-            format!("Step {}", app.cursor_step + 1)
+            format!("Step {}", app.ui.cursor_step + 1)
         };
         Line::from(vec![
             Span::styled(
-                format!("  {}: {} = ", step_label, app.active_param.label()),
+                format!("  {}: {} = ", step_label, app.ui.active_param.label()),
                 Style::default().fg(Color::White),
             ),
             Span::styled(
-                format!("{}\u{2588}", app.value_buffer),
+                format!("{}\u{2588}", app.ui.value_buffer),
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Rgb(60, 60, 60))
@@ -884,8 +892,8 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ])
     } else if app.has_selection() {
-        let sel_text = if !app.visual_steps.is_empty() {
-            let count = app.visual_steps.len();
+        let sel_text = if !app.ui.visual_steps.is_empty() {
+            let count = app.ui.visual_steps.len();
             format!("  {} steps selected", count)
         } else {
             let (lo, hi) = app.selected_range();
@@ -896,19 +904,19 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             format!(
                 "{}  {} = \u{2191}\u{2193}",
                 sel_text,
-                app.active_param.label(),
+                app.ui.active_param.label(),
             ),
             Style::default().fg(Color::Rgb(160, 160, 160)),
         ))
     } else {
-        let sd = &app.state.step_data[app.cursor_track];
-        let val = sd.get(app.cursor_step, app.active_param);
+        let sd = &app.state.step_data[app.ui.cursor_track];
+        let val = sd.get(app.ui.cursor_step, app.ui.active_param);
         Line::from(Span::styled(
             format!(
                 "  Step {}: {} = {}",
-                app.cursor_step + 1,
-                app.active_param.label(),
-                app.active_param.format_value(val),
+                app.ui.cursor_step + 1,
+                app.ui.active_param.label(),
+                app.ui.active_param.format_value(val),
             ),
             Style::default().fg(Color::White),
         ))
@@ -922,23 +930,23 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let track = app.cursor_track;
+    let track = app.ui.cursor_track;
     let now = Instant::now();
 
     // Reset note state on track change
-    if track != app.piano_last_track {
-        app.piano_notes.clear();
-        app.piano_last_step = usize::MAX;
-        app.piano_last_track = track;
+    if track != app.ui.piano_last_track {
+        app.ui.piano_notes.clear();
+        app.ui.piano_last_step = usize::MAX;
+        app.ui.piano_last_track = track;
     }
 
     // Detect new step triggers and add notes with duration-based expiry
     if app.state.is_playing() {
         let ns = app.num_steps();
-        let step = app.state.track_step(app.cursor_track) % ns;
+        let step = app.state.track_step(app.ui.cursor_track) % ns;
 
-        if step != app.piano_last_step {
-            app.piano_last_step = step;
+        if step != app.ui.piano_last_step {
+            app.ui.piano_last_step = step;
 
             if app.state.patterns[track].is_active(step) {
                 // Calculate note duration in wall-clock seconds
@@ -953,27 +961,27 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
                 if cc > 0 {
                     for n in 0..cc {
                         let t = app.state.chord_data[track].get(step, n).round() as i32;
-                        app.piano_notes.push((t, expires));
+                        app.ui.piano_notes.push((t, expires));
                     }
                 } else {
                     let t = app.state.step_data[track]
                         .get(step, StepParam::Transpose)
                         .round() as i32;
-                    app.piano_notes.push((t, expires));
+                    app.ui.piano_notes.push((t, expires));
                 }
             }
         }
     } else {
         // Sequencer stopped — let notes expire naturally but don't add new ones
-        app.piano_last_step = usize::MAX;
+        app.ui.piano_last_step = usize::MAX;
     }
 
     // Prune expired notes
-    app.piano_notes.retain(|(_, exp)| *exp > now);
+    app.ui.piano_notes.retain(|(_, exp)| *exp > now);
 
     // Build active note set: ringing sequencer notes + held keyboard notes
-    let mut active: Vec<i32> = app.piano_notes.iter().map(|(s, _)| *s).collect();
-    for &(_, t, _, _) in &app.held_notes {
+    let mut active: Vec<i32> = app.ui.piano_notes.iter().map(|(s, _)| *s).collect();
+    for &(_, t, _, _) in &app.ui.held_notes {
         active.push(t.round() as i32);
     }
 

@@ -22,6 +22,36 @@ mod voice;
 use std::ffi::CString;
 use std::sync::Arc;
 
+fn suspend_terminal(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> std::io::Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn resume_terminal(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure samples/, effects/, and instruments/ directories exist
     std::fs::create_dir_all("samples").ok();
@@ -140,74 +170,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
         app.handle_input()?;
-        if app.should_quit {
+        if app.ui.should_quit {
             break;
         }
-        if app.pending_lisp_edit {
-            app.pending_lisp_edit = false;
-
-            // Suspend terminal for editor
-            crossterm::terminal::disable_raw_mode()?;
-            crossterm::execute!(
-                terminal.backend_mut(),
-                crossterm::event::PopKeyboardEnhancementFlags,
-                crossterm::terminal::LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture
-            )?;
-            terminal.show_cursor()?;
-
-            app.run_lisp_editor_flow();
-
-            // Resume terminal
-            crossterm::terminal::enable_raw_mode()?;
-            crossterm::execute!(
-                terminal.backend_mut(),
-                crossterm::terminal::EnterAlternateScreen,
-                crossterm::event::EnableMouseCapture,
-                crossterm::event::PushKeyboardEnhancementFlags(
-                    crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
-            )?;
-            terminal.clear()?;
-        }
-        if app.pending_instrument_edit {
-            app.pending_instrument_edit = false;
-
-            // Suspend terminal for editor
-            crossterm::terminal::disable_raw_mode()?;
-            crossterm::execute!(
-                terminal.backend_mut(),
-                crossterm::event::PopKeyboardEnhancementFlags,
-                crossterm::terminal::LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture
-            )?;
-            terminal.show_cursor()?;
-
-            app.run_instrument_editor_flow();
-
-            // Resume terminal
-            crossterm::terminal::enable_raw_mode()?;
-            crossterm::execute!(
-                terminal.backend_mut(),
-                crossterm::terminal::EnterAlternateScreen,
-                crossterm::event::EnableMouseCapture,
-                crossterm::event::PushKeyboardEnhancementFlags(
-                    crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
-            )?;
-            terminal.clear()?;
+        if app.has_pending_editor() {
+            suspend_terminal(&mut terminal)?;
+            app.run_pending_editor();
+            resume_terminal(&mut terminal)?;
         }
     }
 
     // Cleanup
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    suspend_terminal(&mut terminal)?;
 
     unsafe {
         audiograph::engine_stop_workers();

@@ -108,9 +108,7 @@ impl VoicePool {
     }
 
     pub fn all_logical_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.voices[..self.num_voices]
-            .iter()
-            .map(|v| v.logical_id)
+        self.voices[..self.num_voices].iter().map(|v| v.logical_id)
     }
 }
 

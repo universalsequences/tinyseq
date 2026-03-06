@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::sequencer::MAX_STEPS;
 
 /// Maximum number of parameters per effect slot.
-pub const MAX_SLOT_PARAMS: usize = 16;
+/// Custom instruments can easily exceed 16 params, and sequenced p-lock dispatch
+/// iterates over every declared param. Keep this comfortably above current
+/// instrument sizes so defaults/plocks/node indices stay aligned.
+pub const MAX_SLOT_PARAMS: usize = 64;
 
 /// Number of built-in effect slots (Filter, Delay). Slots at this index or higher are custom/lisp.
 pub const BUILTIN_SLOT_COUNT: usize = 2;
@@ -109,11 +112,18 @@ impl ParamDescriptor {
     pub fn format_value(&self, val: f32) -> String {
         match &self.kind {
             ParamKind::Boolean => {
-                if val > 0.5 { "ON".to_string() } else { "OFF".to_string() }
+                if val > 0.5 {
+                    "ON".to_string()
+                } else {
+                    "OFF".to_string()
+                }
             }
             ParamKind::Enum { labels } => {
                 let idx = val.round() as usize;
-                labels.get(idx).cloned().unwrap_or_else(|| format!("{}", idx))
+                labels
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}", idx))
             }
             ParamKind::Continuous { unit } => {
                 let display_val = if self.is_percent() { val * 100.0 } else { val };
@@ -172,7 +182,9 @@ impl EffectDescriptor {
                     min: 20.0,
                     max: 20000.0,
                     default: 1000.0,
-                    kind: ParamKind::Continuous { unit: Some("Hz".to_string()) },
+                    kind: ParamKind::Continuous {
+                        unit: Some("Hz".to_string()),
+                    },
                     scaling: ParamScaling::Exponential,
                     node_param_idx: 2,
                 },
@@ -199,7 +211,9 @@ impl EffectDescriptor {
                     min: 0.0,
                     max: 1.0,
                     default: 0.0,
-                    kind: ParamKind::Continuous { unit: Some("%".to_string()) },
+                    kind: ParamKind::Continuous {
+                        unit: Some("%".to_string()),
+                    },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 0,
                 },
@@ -217,7 +231,9 @@ impl EffectDescriptor {
                     min: 1.0,
                     max: 2000.0,
                     default: 250.0,
-                    kind: ParamKind::Continuous { unit: Some("ms".to_string()) },
+                    kind: ParamKind::Continuous {
+                        unit: Some("ms".to_string()),
+                    },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 2,
                 },
@@ -283,7 +299,9 @@ impl EffectDescriptor {
                 min: p.min,
                 max: p.max,
                 default: p.default,
-                kind: ParamKind::Continuous { unit: p.unit.clone() },
+                kind: ParamKind::Continuous {
+                    unit: p.unit.clone(),
+                },
                 scaling: ParamScaling::Linear,
                 node_param_idx: p.cell_id as u32,
             })
@@ -308,9 +326,7 @@ pub struct SlotPLockData {
 impl SlotPLockData {
     pub fn new(max_params: usize) -> Self {
         let size = MAX_STEPS * max_params;
-        let data: Vec<AtomicU32> = (0..size)
-            .map(|_| AtomicU32::new(NAN_BITS))
-            .collect();
+        let data: Vec<AtomicU32> = (0..size).map(|_| AtomicU32::new(NAN_BITS)).collect();
         Self { data, max_params }
     }
 
@@ -325,7 +341,11 @@ impl SlotPLockData {
         }
         let bits = self.data[idx].load(Ordering::Relaxed);
         let val = f32::from_bits(bits);
-        if val.is_nan() { None } else { Some(val) }
+        if val.is_nan() {
+            None
+        } else {
+            Some(val)
+        }
     }
 
     pub fn set(&self, step: usize, param_idx: usize, val: f32) {
@@ -410,7 +430,7 @@ impl SlotParamDefaults {
 // ── EffectSlotState (runtime state for one effect in a track's chain) ──
 
 pub struct EffectSlotState {
-    pub node_id: AtomicU32,                // audio graph node (0 = empty)
+    pub node_id: AtomicU32, // audio graph node (0 = empty)
     pub plocks: SlotPLockData,
     pub defaults: SlotParamDefaults,
     pub num_params: AtomicU32,
@@ -450,16 +470,15 @@ impl EffectSlotState {
             plocks: SlotPLockData::new(MAX_SLOT_PARAMS),
             defaults: SlotParamDefaults::new_zeroed(MAX_SLOT_PARAMS),
             num_params: AtomicU32::new(0),
-            param_node_indices: (0..MAX_SLOT_PARAMS)
-                .map(|_| AtomicU32::new(0))
-                .collect(),
+            param_node_indices: (0..MAX_SLOT_PARAMS).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 
     /// Overwrite this pre-allocated slot in-place from a descriptor and node ID.
     pub fn apply_descriptor(&self, desc: &EffectDescriptor, node_id: u32) {
         self.node_id.store(node_id, Ordering::Relaxed);
-        self.num_params.store(desc.params.len() as u32, Ordering::Relaxed);
+        self.num_params
+            .store(desc.params.len() as u32, Ordering::Relaxed);
         for (i, p) in desc.params.iter().enumerate() {
             self.defaults.set(i, p.default);
             if i < self.param_node_indices.len() {
@@ -552,9 +571,7 @@ impl EffectSlotSnapshot {
     pub fn new_default(desc: &EffectDescriptor, node_id: u32) -> Self {
         let np = desc.params.len();
         let defaults: Vec<f32> = desc.params.iter().map(|p| p.default).collect();
-        let plocks: Vec<Vec<Option<f32>>> = (0..MAX_STEPS)
-            .map(|_| vec![None; np])
-            .collect();
+        let plocks: Vec<Vec<Option<f32>>> = (0..MAX_STEPS).map(|_| vec![None; np]).collect();
         let param_node_indices: Vec<u32> = desc.params.iter().map(|p| p.node_param_idx).collect();
 
         Self {

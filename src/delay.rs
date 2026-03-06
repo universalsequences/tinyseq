@@ -7,7 +7,7 @@ const MAX_DELAY_SAMPLES: usize = 96000;
 // State layout indices (f32 slots)
 const STATE_WET: usize = 0;
 const STATE_SYNCED: usize = 1;
-const STATE_DELAY_TIME: usize = 2;     // ms (or sync division index when synced)
+const STATE_DELAY_TIME: usize = 2; // ms (or sync division index when synced)
 const STATE_FEEDBACK: usize = 3;
 const STATE_DAMPENING: usize = 4;
 const STATE_STEREO_WIDTH: usize = 5;
@@ -117,17 +117,17 @@ unsafe extern "C" fn delay_process(
     let delay_ms = if synced > 0.5 {
         // target_time is sync division index — convert to beats then to ms
         const SYNC_BEATS: [f32; 11] = [
-            0.125,       // 1/32
-            0.25,        // 1/16
-            1.0 / 6.0,   // 1/16t
-            0.5,         // 1/8
-            1.0 / 3.0,   // 1/8t
-            0.75,        // 1/8.
-            1.0,         // 1/4
-            2.0 / 3.0,   // 1/4t
-            1.5,         // 1/4.
-            2.0,         // 1/2
-            4.0,         // 1
+            0.125,     // 1/32
+            0.25,      // 1/16
+            1.0 / 6.0, // 1/16t
+            0.5,       // 1/8
+            1.0 / 3.0, // 1/8t
+            0.75,      // 1/8.
+            1.0,       // 1/4
+            2.0 / 3.0, // 1/4t
+            1.5,       // 1/4.
+            2.0,       // 1/2
+            4.0,       // 1
         ];
         let idx = (target_time.round() as usize).min(SYNC_BEATS.len() - 1);
         let beats = SYNC_BEATS[idx];
@@ -150,7 +150,8 @@ unsafe extern "C" fn delay_process(
         let delay_r = (smooth_time * smooth_width).clamp(1.0, (MAX_DELAY_SAMPLES - 1) as f32);
 
         // Read from circular buffer with linear interpolation — L
-        let read_pos_l = (write_pos_l as f32 - delay_l + MAX_DELAY_SAMPLES as f32) % MAX_DELAY_SAMPLES as f32;
+        let read_pos_l =
+            (write_pos_l as f32 - delay_l + MAX_DELAY_SAMPLES as f32) % MAX_DELAY_SAMPLES as f32;
         let idx_l = read_pos_l as usize;
         let frac_l = read_pos_l - idx_l as f32;
         let s0_l = *buf_l.add(idx_l % MAX_DELAY_SAMPLES);
@@ -158,7 +159,8 @@ unsafe extern "C" fn delay_process(
         let delayed_l = s0_l + frac_l * (s1_l - s0_l);
 
         // Read from circular buffer — R
-        let read_pos_r = (write_pos_r as f32 - delay_r + MAX_DELAY_SAMPLES as f32) % MAX_DELAY_SAMPLES as f32;
+        let read_pos_r =
+            (write_pos_r as f32 - delay_r + MAX_DELAY_SAMPLES as f32) % MAX_DELAY_SAMPLES as f32;
         let idx_r = read_pos_r as usize;
         let frac_r = read_pos_r - idx_r as f32;
         let s0_r = *buf_r.add(idx_r % MAX_DELAY_SAMPLES);

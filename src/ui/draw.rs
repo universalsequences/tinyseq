@@ -20,10 +20,10 @@ pub(super) fn param_color(_param: StepParam) -> Color {
 }
 
 pub(super) fn is_in_selection(app: &App, step: usize) -> bool {
-    if app.visual_steps.contains(&step) {
+    if app.ui.visual_steps.contains(&step) {
         return true;
     }
-    if app.selection_anchor.is_some() {
+    if app.ui.selection_anchor.is_some() {
         let (lo, hi) = app.selected_range();
         return step >= lo && step <= hi;
     }
@@ -31,7 +31,7 @@ pub(super) fn is_in_selection(app: &App, step: usize) -> bool {
 }
 
 pub(super) fn region_border_style(app: &App, region: Region) -> Style {
-    if app.focused_region == region {
+    if app.ui.focused_region == region {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::Rgb(60, 60, 60))
@@ -46,7 +46,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),  // Global info bar + meter
-            Constraint::Min(13),   // Cirklon + Sidebar row
+            Constraint::Min(13),    // Cirklon + Sidebar row
             Constraint::Length(10), // Params region
             Constraint::Length(2),  // Help bar
         ])
@@ -56,12 +56,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(40),     // Cirklon
-            Constraint::Length(30),  // Sidebar
+            Constraint::Min(40),    // Cirklon
+            Constraint::Length(30), // Sidebar
         ])
         .split(chunks[1]);
 
-    app.layout.info_bar = chunks[0];
+    app.ui.layout.info_bar = chunks[0];
     draw_global_info(frame, app, chunks[0]);
     draw_cirklon_region(frame, app, mid_chunks[0]);
     draw_sidebar(frame, app, mid_chunks[1]);
@@ -70,15 +70,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_stereo_meter(frame, app, area);
 
     // Draw picker overlay on top of everything
-    if app.input_mode == InputMode::EffectPicker {
+    if app.ui.input_mode == InputMode::EffectPicker {
         draw_effect_picker(frame, app, area);
     }
-    if app.input_mode == InputMode::InstrumentPicker {
+    if app.ui.input_mode == InputMode::InstrumentPicker {
         draw_instrument_picker(frame, app, area);
     }
 
     // Draw compiling overlay
-    if let Some(ref pending) = app.pending_compile {
+    if let Some(ref pending) = app.editor.pending_compile {
         draw_compiling_overlay(frame, pending, area);
     }
 }
@@ -101,14 +101,14 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
             .bold()
     };
     let play_rect = Rect::new(area.x, area.y, 3, 1);
-    app.layout.info_bar = play_rect; // play button rect
+    app.ui.layout.info_bar = play_rect; // play button rect
     frame.render_widget(
         Paragraph::new(Span::styled(play_label, play_style)),
         play_rect,
     );
 
     // ── REC button (5 chars) ──
-    let rec_style = if app.recording {
+    let rec_style = if app.ui.recording {
         Style::default().fg(Color::White).bg(Color::Red).bold()
     } else {
         Style::default()
@@ -117,7 +117,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
             .bold()
     };
     let rec_rect = Rect::new(area.x + 3, area.y, 5, 1);
-    app.layout.rec_button = rec_rect;
+    app.ui.layout.rec_button = rec_rect;
     frame.render_widget(Paragraph::new(Span::styled(" REC ", rec_style)), rec_rect);
 
     // ── Info text (rest of row 0, without [pat X/Y]) ──
@@ -129,7 +129,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     )];
 
     if !app.tracks.is_empty() {
-        let track = app.cursor_track;
+        let track = app.ui.cursor_track;
         let tp = &app.state.track_params[track];
         let default_tb = tp.get_timebase();
         let current_step = app.state.track_step(track);
@@ -139,7 +139,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
 
-        let sample_name = &app.tracks[app.cursor_track];
+        let sample_name = &app.tracks[app.ui.cursor_track];
         spans.push(Span::styled(
             format!("  {}", sample_name),
             Style::default().fg(Color::White),
@@ -148,7 +148,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if app.any_track_armed() {
         spans.push(Span::styled(
-            format!("  Oct:{}", app.keyboard_octave / 12),
+            format!("  Oct:{}", app.ui.keyboard_octave / 12),
             Style::default().fg(Color::Cyan),
         ));
         let thresh = f32::from_bits(app.state.record_quantize_thresh.load(Ordering::Relaxed));
@@ -158,7 +158,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
 
-    if let Some((ref msg, ref when)) = app.status_message {
+    if let Some((ref msg, ref when)) = app.editor.status_message {
         if when.elapsed() < Duration::from_secs(3) {
             spans.push(Span::styled(
                 format!("  {}", msg),
@@ -181,9 +181,9 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     let row1_y = area.y + 1;
     let row1_w = area.width.saturating_sub(22); // leave room for stereo meter
     let row1_area = Rect::new(area.x, row1_y, row1_w, 1);
-    app.layout.pattern_buttons_area = row1_area;
+    app.ui.layout.pattern_buttons_area = row1_area;
 
-    let page_start = app.pattern_page * 10;
+    let page_start = app.ui.pattern_page * 10;
     let page_end = (page_start + 10).min(num_pats);
 
     let mut btn_layout: Vec<(u16, u16, PatternBtn)> = Vec::new();
@@ -199,9 +199,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Pattern number buttons
     let active_style = Style::default().fg(Color::Black).bg(Color::Yellow).bold();
-    let inactive_style = Style::default()
-        .fg(Color::White)
-        .bg(Color::Rgb(60, 60, 60));
+    let inactive_style = Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60));
 
     for i in page_start..page_end {
         let label = format!(" {} ", i + 1); // 1-indexed display
@@ -228,9 +226,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Clone button [+]
-    let clone_style = Style::default()
-        .fg(Color::Green)
-        .bg(Color::Rgb(40, 40, 40));
+    let clone_style = Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 40));
     frame.render_widget(
         Paragraph::new(Span::styled(" + ", clone_style)),
         Rect::new(x, row1_y, 3, 1),
@@ -239,16 +235,14 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     x += 4;
 
     // Delete button [-]
-    let delete_style = Style::default()
-        .fg(Color::Red)
-        .bg(Color::Rgb(40, 40, 40));
+    let delete_style = Style::default().fg(Color::Red).bg(Color::Rgb(40, 40, 40));
     frame.render_widget(
         Paragraph::new(Span::styled(" - ", delete_style)),
         Rect::new(x, row1_y, 3, 1),
     );
     btn_layout.push((x, x + 3, PatternBtn::Delete));
 
-    app.pattern_btn_layout = btn_layout;
+    app.ui.pattern_btn_layout = btn_layout;
 }
 
 fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
@@ -316,28 +310,28 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if app.input_mode == InputMode::StepArm {
+    let lines = if app.ui.input_mode == InputMode::StepArm {
         vec![Line::from(Span::styled(
             "  [ARM] 1-8: toggle tracks 1-8  q-u: tracks 9-15  ,: rec  r/Esc/Enter: exit",
             Style::default().fg(Color::Rgb(255, 100, 100)),
         ))]
-    } else if app.input_mode == InputMode::StepInsert {
+    } else if app.ui.input_mode == InputMode::StepInsert {
         vec![Line::from(Span::styled(
             "  [INSERT] 1-8: steps 1-8  q-i: steps 9-16  Shift: accent (vel=1)  [/]: page  Esc/Enter: exit",
             Style::default().fg(Color::Rgb(100, 220, 100)),
         ))]
-    } else if app.input_mode == InputMode::StepSelect {
+    } else if app.ui.input_mode == InputMode::StepSelect {
         vec![Line::from(Span::styled(
             "  [SELECT] 1-8: select 1-8  q-i: select 9-16  x: delete  [/]: page  Esc/Enter: exit",
             Style::default().fg(Color::Rgb(220, 180, 100)),
         ))]
-    } else if app.focused_region == Region::Sidebar {
-        let hint_text = match app.sidebar_mode {
+    } else if app.ui.focused_region == Region::Sidebar {
+        let hint_text = match app.ui.sidebar_mode {
             SidebarMode::InstrumentPicker => {
                 "  \u{2191}\u{2193}: navigate  Enter: select instrument  Esc: back".to_string()
             }
             _ => {
-                let action = match app.sidebar_mode {
+                let action = match app.ui.sidebar_mode {
                     SidebarMode::AddTrack => "Enter: add track",
                     SidebarMode::Audition => "Enter: swap sample",
                     _ => unreachable!(),
@@ -349,20 +343,20 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             hint_text,
             Style::default().fg(Color::Yellow),
         ))]
-    } else if app.input_mode == InputMode::EffectPicker {
+    } else if app.ui.input_mode == InputMode::EffectPicker {
         vec![Line::from(Span::styled(
             "  Type to filter  \u{2191}\u{2193}: navigate  Enter: select  Esc: cancel",
             Style::default().fg(Color::Yellow),
         ))]
-    } else if app.input_mode == InputMode::PatternSelect {
+    } else if app.ui.input_mode == InputMode::PatternSelect {
         vec![Line::from(Span::styled(
             "  0-9: pattern number  c: clone  x: delete  Enter: confirm  Esc: cancel",
             Style::default().fg(Color::Yellow),
         ))]
     } else {
-        match app.focused_region {
+        match app.ui.focused_region {
             Region::Cirklon => {
-                if app.input_mode == InputMode::ValueEntry {
+                if app.ui.input_mode == InputMode::ValueEntry {
                     vec![Line::from(Span::styled(
                         "  0-9: digits  .: decimal  -: negate  Enter: set  Esc: cancel",
                         Style::default().fg(Color::DarkGray),
@@ -380,12 +374,12 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
             Region::Params => {
-                if app.dropdown_open {
+                if app.ui.dropdown_open {
                     vec![Line::from(Span::styled(
                         "  \u{2191}\u{2193}: select  Enter: confirm  Esc: cancel",
                         Style::default().fg(Color::Yellow),
                     ))]
-                } else if app.params_column == 1 {
+                } else if app.ui.params_column == 1 {
                     vec![Line::from(Span::styled(
                     "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  [/]: step  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),

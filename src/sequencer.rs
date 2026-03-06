@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::effects::{EffectDescriptor, EffectSlotSnapshot, EffectSlotState};
+use crate::effects::{EffectDescriptor, EffectSlotSnapshot, EffectSlotState, MAX_SLOT_PARAMS};
 use crate::voice::MAX_VOICES;
 
 pub const MAX_TRACKS: usize = 64;
@@ -33,20 +33,20 @@ impl InstrumentType {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Timebase {
-    Whole = 0,              // 1  — each step = whole note
-    Half = 1,               // 2  — each step = half note
-    Quarter = 2,            // 4  — each step = quarter note
-    Eighth = 3,             // 8  — each step = eighth note
-    Sixteenth = 4,          // 16 — each step = sixteenth note (default)
-    ThirtySecond = 5,       // 32
-    SixtyFourth = 6,        // 64
-    HalfTriplet = 7,        // 2T
-    QuarterTriplet = 8,     // 4T
-    EighthTriplet = 9,      // 8T
-    SixteenthTriplet = 10,  // 16T
+    Whole = 0,                // 1  — each step = whole note
+    Half = 1,                 // 2  — each step = half note
+    Quarter = 2,              // 4  — each step = quarter note
+    Eighth = 3,               // 8  — each step = eighth note
+    Sixteenth = 4,            // 16 — each step = sixteenth note (default)
+    ThirtySecond = 5,         // 32
+    SixtyFourth = 6,          // 64
+    HalfTriplet = 7,          // 2T
+    QuarterTriplet = 8,       // 4T
+    EighthTriplet = 9,        // 8T
+    SixteenthTriplet = 10,    // 16T
     ThirtySecondTriplet = 11, // 32T
     SixtyFourthTriplet = 12,  // 64T
-    Polyrhythm = 13,        // Prh — bar ÷ num_steps
+    Polyrhythm = 13,          // Prh — bar ÷ num_steps
 }
 
 impl Timebase {
@@ -70,12 +70,14 @@ impl Timebase {
     ];
 
     pub const LABELS: [&'static str; Self::COUNT] = [
-        "1", "2", "4", "8", "16", "32", "64",
-        "2T", "4T", "8T", "16T", "32T", "64T", "Prh",
+        "1", "2", "4", "8", "16", "32", "64", "2T", "4T", "8T", "16T", "32T", "64T", "Prh",
     ];
 
     pub fn from_index(i: u32) -> Self {
-        Self::ALL.get(i as usize).copied().unwrap_or(Timebase::Sixteenth)
+        Self::ALL
+            .get(i as usize)
+            .copied()
+            .unwrap_or(Timebase::Sixteenth)
     }
 
     pub fn label(&self) -> &'static str {
@@ -128,14 +130,14 @@ impl Timebase {
 /// Sync resolution options: (beats, label).
 /// Index 0 = Off. Indices 1..SYNC_COUNT map to beat values.
 pub const SYNC_RESOLUTIONS: [(f64, &str); 8] = [
-    (0.0, "Off"),       // 0 = off
-    (0.25, "1/16"),     // 16th note
-    (0.5, "1/8"),       // 8th note
-    (1.0, "1/4"),       // quarter note
-    (2.0, "1/2 bar"),   // half bar
-    (4.0, "1 bar"),     // 1 bar
-    (8.0, "2 bars"),    // 2 bars
-    (16.0, "4 bars"),   // 4 bars
+    (0.0, "Off"),     // 0 = off
+    (0.25, "1/16"),   // 16th note
+    (0.5, "1/8"),     // 8th note
+    (1.0, "1/4"),     // quarter note
+    (2.0, "1/2 bar"), // half bar
+    (4.0, "1 bar"),   // 1 bar
+    (8.0, "2 bars"),  // 2 bars
+    (16.0, "4 bars"), // 4 bars
 ];
 pub const SYNC_COUNT: usize = SYNC_RESOLUTIONS.len();
 
@@ -526,7 +528,11 @@ impl TrackParams {
     /// Cycle to previous timebase value.
     pub fn prev_timebase(&self) {
         let cur = self.timebase.load(Ordering::Relaxed);
-        let next = if cur == 0 { Timebase::COUNT as u32 - 1 } else { cur - 1 };
+        let next = if cur == 0 {
+            Timebase::COUNT as u32 - 1
+        } else {
+            cur - 1
+        };
         self.timebase.store(next, Ordering::Relaxed);
     }
 }
@@ -566,6 +572,8 @@ pub struct PatternSnapshot {
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<TrackParamsSnapshot>,
     pub effect_slots: Vec<Vec<EffectSlotSnapshot>>,
+    pub instrument_slots: Vec<EffectSlotSnapshot>,
+    pub instrument_base_note_offsets: Vec<f32>,
     /// Per-track (buffer_id, sample_name). -1 means no sample assigned.
     pub sample_ids: Vec<(i32, String)>,
     /// Per-track chord data snapshots.
@@ -588,6 +596,8 @@ impl PatternSnapshot {
         let mut step_data = Vec::with_capacity(num_tracks);
         let mut track_params = Vec::with_capacity(num_tracks);
         let mut effect_slots = Vec::with_capacity(num_tracks);
+        let mut instrument_slots = Vec::with_capacity(num_tracks);
+        let mut instrument_base_note_offsets = Vec::with_capacity(num_tracks);
         let mut sample_ids = Vec::with_capacity(num_tracks);
         let mut chord_snapshots = Vec::with_capacity(num_tracks);
         let mut timebase_plock_snapshots = Vec::with_capacity(num_tracks);
@@ -624,6 +634,10 @@ impl PatternSnapshot {
                 .map(|slot| EffectSlotSnapshot::capture(slot))
                 .collect();
             effect_slots.push(chain);
+            instrument_slots.push(EffectSlotSnapshot::capture(&state.instrument_slots[t]));
+            instrument_base_note_offsets.push(f32::from_bits(
+                state.instrument_base_note_offsets[t].load(Ordering::Relaxed),
+            ));
 
             // Capture sample assignment
             let buf_id = if t < track_buffer_ids.len() {
@@ -645,13 +659,11 @@ impl PatternSnapshot {
             timebase_plock_snapshots.push(state.timebase_plocks[t].snapshot());
 
             // Capture instrument type
-            inst_types.push(
-                if t < instrument_types.len() {
-                    instrument_types[t]
-                } else {
-                    InstrumentType::Sampler
-                },
-            );
+            inst_types.push(if t < instrument_types.len() {
+                instrument_types[t]
+            } else {
+                InstrumentType::Sampler
+            });
         }
 
         Self {
@@ -659,6 +671,8 @@ impl PatternSnapshot {
             step_data,
             track_params,
             effect_slots,
+            instrument_slots,
+            instrument_base_note_offsets,
             sample_ids,
             chord_snapshots,
             timebase_plock_snapshots,
@@ -693,6 +707,16 @@ impl PatternSnapshot {
                 if slot_idx < state.effect_chains[t].len() {
                     slot_snap.restore(&state.effect_chains[t][slot_idx]);
                 }
+            }
+
+            if t < self.instrument_slots.len() {
+                self.instrument_slots[t].restore(&state.instrument_slots[t]);
+            }
+            if t < self.instrument_base_note_offsets.len() {
+                state.instrument_base_note_offsets[t].store(
+                    self.instrument_base_note_offsets[t].to_bits(),
+                    Ordering::Relaxed,
+                );
             }
 
             // Restore chord data
@@ -733,6 +757,10 @@ impl PatternSnapshot {
         }
     }
 
+    fn default_instrument_slot() -> EffectSlotSnapshot {
+        EffectSlotSnapshot::new_empty()
+    }
+
     /// Push a single default track onto this snapshot.
     fn push_default_track(&mut self, t: usize, slot_descriptors: &[Vec<EffectDescriptor>]) {
         self.track_bits.push(0u64);
@@ -740,6 +768,8 @@ impl PatternSnapshot {
         self.track_params.push(TrackParamsSnapshot::default());
         self.effect_slots
             .push(Self::default_effect_slots(t, slot_descriptors));
+        self.instrument_slots.push(Self::default_instrument_slot());
+        self.instrument_base_note_offsets.push(0.0);
         self.sample_ids.push((-1, String::new()));
         self.chord_snapshots.push(ChordSnapshot::new_default());
         self.timebase_plock_snapshots.push([None; MAX_STEPS]);
@@ -752,6 +782,8 @@ impl PatternSnapshot {
             step_data: Vec::with_capacity(num_tracks),
             track_params: Vec::with_capacity(num_tracks),
             effect_slots: Vec::with_capacity(num_tracks),
+            instrument_slots: Vec::with_capacity(num_tracks),
+            instrument_base_note_offsets: Vec::with_capacity(num_tracks),
             sample_ids: Vec::with_capacity(num_tracks),
             chord_snapshots: Vec::with_capacity(num_tracks),
             timebase_plock_snapshots: Vec::with_capacity(num_tracks),
@@ -843,6 +875,21 @@ pub struct SequencerState {
     pub instrument_slots: Vec<EffectSlotState>,
     /// Per-track host-side semitone offset for custom instrument pitch interpretation.
     pub instrument_base_note_offsets: Vec<AtomicU32>,
+}
+
+#[derive(Clone)]
+struct StepSlotPlocks {
+    params: Vec<Option<f32>>,
+}
+
+#[derive(Clone)]
+struct StepSnapshot {
+    active: bool,
+    params: [f32; NUM_PARAMS],
+    chord: Vec<f32>,
+    timebase: Option<Timebase>,
+    effect_plocks: Vec<StepSlotPlocks>,
+    instrument_plocks: StepSlotPlocks,
 }
 
 impl SequencerState {
@@ -1003,6 +1050,139 @@ impl SequencerState {
                 slot.plocks.clear_step(step);
             }
             self.chord_data[track].clear_step(step);
+        }
+    }
+
+    fn capture_step_snapshot(&self, track: usize, step: usize) -> StepSnapshot {
+        let mut params = [0.0; NUM_PARAMS];
+        for param in StepParam::ALL {
+            params[param.index()] = self.step_data[track].get(step, param);
+        }
+
+        let chord_count = self.chord_data[track].count(step);
+        let mut chord = Vec::with_capacity(chord_count);
+        for note_idx in 0..chord_count {
+            chord.push(self.chord_data[track].get(step, note_idx));
+        }
+
+        let mut effect_plocks = Vec::with_capacity(self.effect_chains[track].len());
+        for slot in &self.effect_chains[track] {
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            let mut params = Vec::with_capacity(num_params);
+            for param_idx in 0..num_params {
+                params.push(slot.plocks.get(step, param_idx));
+            }
+            effect_plocks.push(StepSlotPlocks { params });
+        }
+
+        let instrument_slot = &self.instrument_slots[track];
+        let instrument_param_count = instrument_slot.num_params.load(Ordering::Relaxed) as usize;
+        let mut instrument_plocks = Vec::with_capacity(instrument_param_count);
+        for param_idx in 0..instrument_param_count {
+            instrument_plocks.push(instrument_slot.plocks.get(step, param_idx));
+        }
+
+        StepSnapshot {
+            active: self.patterns[track].is_active(step),
+            params,
+            chord,
+            timebase: self.timebase_plocks[track].get(step),
+            effect_plocks,
+            instrument_plocks: StepSlotPlocks {
+                params: instrument_plocks,
+            },
+        }
+    }
+
+    fn clear_step_payload(&self, track: usize, step: usize) {
+        for param in StepParam::ALL {
+            self.step_data[track].set(step, param, param.default_value());
+        }
+
+        let mut bits = self.patterns[track].load_bits();
+        bits &= !(1u64 << step);
+        self.patterns[track].store_bits(bits);
+
+        self.chord_data[track].clear_step(step);
+        self.timebase_plocks[track].clear(step);
+
+        for slot in &self.effect_chains[track] {
+            slot.plocks.clear_step(step);
+        }
+
+        for param_idx in 0..MAX_SLOT_PARAMS {
+            self.instrument_slots[track].plocks.clear_param(step, param_idx);
+        }
+    }
+
+    fn restore_step_snapshot(&self, track: usize, step: usize, snapshot: &StepSnapshot) {
+        for param in StepParam::ALL {
+            self.step_data[track].set(step, param, snapshot.params[param.index()]);
+        }
+
+        let mut bits = self.patterns[track].load_bits();
+        if snapshot.active {
+            bits |= 1u64 << step;
+        } else {
+            bits &= !(1u64 << step);
+        }
+        self.patterns[track].store_bits(bits);
+
+        self.chord_data[track].clear_step(step);
+        for &transpose in &snapshot.chord {
+            self.chord_data[track].add_note(step, transpose);
+        }
+
+        match snapshot.timebase {
+            Some(tb) => self.timebase_plocks[track].set(step, tb),
+            None => self.timebase_plocks[track].clear(step),
+        }
+
+        for (slot_idx, slot) in self.effect_chains[track].iter().enumerate() {
+            let saved = snapshot.effect_plocks.get(slot_idx);
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            for param_idx in 0..num_params {
+                let val = saved.and_then(|plocks| plocks.params.get(param_idx)).copied().flatten();
+                match val {
+                    Some(val) => slot.plocks.set(step, param_idx, val),
+                    None => slot.plocks.clear_param(step, param_idx),
+                }
+            }
+        }
+
+        let instrument_slot = &self.instrument_slots[track];
+        let instrument_param_count = instrument_slot.num_params.load(Ordering::Relaxed) as usize;
+        for param_idx in 0..instrument_param_count {
+            match snapshot.instrument_plocks.params.get(param_idx).copied().flatten() {
+                Some(val) => instrument_slot.plocks.set(step, param_idx, val),
+                None => instrument_slot.plocks.clear_param(step, param_idx),
+            }
+        }
+    }
+
+    pub fn move_step_range(&self, track: usize, lo: usize, hi: usize, new_lo: usize) {
+        if lo > hi || hi >= MAX_STEPS {
+            return;
+        }
+
+        let count = hi - lo + 1;
+        let new_hi = new_lo + count - 1;
+        if new_lo == lo || new_hi >= MAX_STEPS {
+            return;
+        }
+
+        let snapshots: Vec<_> = (lo..=hi)
+            .map(|step| self.capture_step_snapshot(track, step))
+            .collect();
+
+        for step in lo..=hi {
+            if step < new_lo || step > new_hi {
+                self.clear_step_payload(track, step);
+            }
+        }
+
+        for (offset, step) in (new_lo..=new_hi).enumerate() {
+            self.restore_step_snapshot(track, step, &snapshots[offset]);
         }
     }
 
@@ -1242,7 +1422,11 @@ impl TimebasePLockData {
     pub fn snapshot(&self) -> [Option<u32>; MAX_STEPS] {
         std::array::from_fn(|i| {
             let v = self.overrides[i].load(Ordering::Relaxed);
-            if v == u32::MAX { None } else { Some(v) }
+            if v == u32::MAX {
+                None
+            } else {
+                Some(v)
+            }
         })
     }
 
@@ -1359,7 +1543,11 @@ impl SequencerClock {
 
     /// Derive the local step index from the current beat position within a track's cycle.
     /// Returns None if we're in dead space (past all steps, waiting for next bar boundary).
-    fn derive_local_step(tc: &TrackClockState, pos_in_cycle: f64, num_steps: usize) -> Option<usize> {
+    fn derive_local_step(
+        tc: &TrackClockState,
+        pos_in_cycle: f64,
+        num_steps: usize,
+    ) -> Option<usize> {
         // Past the end of the last step? Dead space until next cycle.
         if pos_in_cycle >= tc.boundaries[num_steps] {
             return None;
@@ -1377,11 +1565,7 @@ impl SequencerClock {
         }
     }
 
-    pub fn process_block(
-        &mut self,
-        nframes: usize,
-        state: &SequencerState,
-    ) -> Vec<Trigger> {
+    pub fn process_block(&mut self, nframes: usize, state: &SequencerState) -> Vec<Trigger> {
         if !state.is_playing() {
             self.was_playing = false;
             return Vec::new();
@@ -1463,8 +1647,77 @@ impl SequencerClock {
 
         // Publish fractional phase for recording quantize
         let phase_16th = (self.total_beats / 0.25).fract() as f32;
-        state.playhead_phase.store(phase_16th.to_bits(), Ordering::Relaxed);
+        state
+            .playhead_phase
+            .store(phase_16th.to_bits(), Ordering::Relaxed);
 
         triggers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_step_range_preserves_chords_and_step_plocks() {
+        let state = SequencerState::new(
+            1,
+            vec![vec![EffectSlotState::new(
+                &EffectDescriptor::builtin_filter(),
+                1,
+            )]],
+        );
+        state.track_params[0].set_num_steps(8);
+        state.instrument_slots[0].apply_descriptor(&EffectDescriptor::builtin_delay(), 2);
+
+        state.patterns[0].toggle_step(1);
+        state.step_data[0].set(1, StepParam::Velocity, 0.6);
+        state.chord_data[0].add_note(1, 0.0);
+        state.chord_data[0].add_note(1, 4.0);
+        state.chord_data[0].add_note(1, 7.0);
+        state.timebase_plocks[0].set(1, Timebase::Eighth);
+        state.effect_chains[0][0].plocks.set(1, 2, 440.0);
+        state.instrument_slots[0].plocks.set(1, 0, 0.75);
+
+        state.patterns[0].toggle_step(2);
+        state.step_data[0].set(2, StepParam::Velocity, 0.3);
+        state.chord_data[0].add_note(2, 12.0);
+        state.timebase_plocks[0].set(2, Timebase::QuarterTriplet);
+        state.effect_chains[0][0].plocks.set(2, 2, 880.0);
+        state.instrument_slots[0].plocks.set(2, 0, 0.25);
+
+        state.move_step_range(0, 1, 2, 2);
+
+        assert!(!state.patterns[0].is_active(1));
+        assert_eq!(state.chord_data[0].count(1), 0);
+        assert_eq!(
+            state.step_data[0].get(1, StepParam::Velocity),
+            StepParam::Velocity.default_value()
+        );
+        assert_eq!(state.timebase_plocks[0].get(1), None);
+        assert_eq!(state.effect_chains[0][0].plocks.get(1, 2), None);
+        assert_eq!(state.instrument_slots[0].plocks.get(1, 0), None);
+
+        assert!(state.patterns[0].is_active(2));
+        assert_eq!(state.step_data[0].get(2, StepParam::Velocity), 0.6);
+        assert_eq!(state.chord_data[0].count(2), 3);
+        assert_eq!(state.chord_data[0].get(2, 0), 0.0);
+        assert_eq!(state.chord_data[0].get(2, 1), 4.0);
+        assert_eq!(state.chord_data[0].get(2, 2), 7.0);
+        assert_eq!(state.timebase_plocks[0].get(2), Some(Timebase::Eighth));
+        assert_eq!(state.effect_chains[0][0].plocks.get(2, 2), Some(440.0));
+        assert_eq!(state.instrument_slots[0].plocks.get(2, 0), Some(0.75));
+
+        assert!(state.patterns[0].is_active(3));
+        assert_eq!(state.step_data[0].get(3, StepParam::Velocity), 0.3);
+        assert_eq!(state.chord_data[0].count(3), 1);
+        assert_eq!(state.chord_data[0].get(3, 0), 12.0);
+        assert_eq!(
+            state.timebase_plocks[0].get(3),
+            Some(Timebase::QuarterTriplet)
+        );
+        assert_eq!(state.effect_chains[0][0].plocks.get(3, 2), Some(880.0));
+        assert_eq!(state.instrument_slots[0].plocks.get(3, 0), Some(0.25));
     }
 }

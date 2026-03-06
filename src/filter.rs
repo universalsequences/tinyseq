@@ -3,10 +3,10 @@ use std::os::raw::{c_int, c_void};
 
 // State layout indices (f32 slots)
 const STATE_ENABLED: usize = 0;
-const STATE_MODE: usize = 1;      // 0=LP, 1=HP, 2=BP
-const STATE_CUTOFF: usize = 2;    // Hz
+const STATE_MODE: usize = 1; // 0=LP, 1=HP, 2=BP
+const STATE_CUTOFF: usize = 2; // Hz
 const STATE_RESONANCE: usize = 3;
-const STATE_IC1EQ: usize = 4;     // SVF integrator state
+const STATE_IC1EQ: usize = 4; // SVF integrator state
 const STATE_IC2EQ: usize = 5;
 const STATE_SMOOTH_CUTOFF: usize = 6;
 const STATE_SMOOTH_RESO: usize = 7;
@@ -96,9 +96,9 @@ unsafe extern "C" fn filter_process(
         ic2eq = 2.0 * v2 - ic2eq;
 
         let output = match mode {
-            0 => v2,                    // lowpass
-            1 => v0 - k * v1 - v2,     // highpass
-            2 => v1,                    // bandpass
+            0 => v2,               // lowpass
+            1 => v0 - k * v1 - v2, // highpass
+            2 => v1,               // bandpass
             _ => v2,
         };
 

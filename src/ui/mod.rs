@@ -3,17 +3,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::audiograph::LiveGraphPtr;
-use crate::effects::{EffectDescriptor, BUILTIN_SLOT_COUNT};
+use crate::effects::EffectDescriptor;
 use crate::lisp_effect::LoadedDGenLib;
-use crate::sequencer::{InstrumentType, KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE};
+use crate::sequencer::{
+    InstrumentType, KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE,
+};
 
 mod browser;
 mod cirklon;
 mod draw;
 mod effects;
+mod graph;
 mod input;
 mod params;
-mod tracks;
 
 pub use browser::BrowserNode;
 pub use draw::draw;
@@ -46,12 +48,68 @@ const TP_SEND: usize = 6;
 const TP_POLY: usize = 7;
 const TP_LAST: usize = TP_POLY;
 
+enum PendingEditor {
+    Effect {
+        slot_idx: usize,
+        name: Option<String>,
+    },
+    Instrument {
+        name: Option<String>,
+    },
+}
+
+enum CompileTarget {
+    Effect {
+        name: String,
+        slot_idx: usize,
+        track: usize,
+    },
+    Instrument {
+        name: String,
+    },
+}
+
 struct PendingCompile {
     receiver: std::sync::mpsc::Receiver<Result<crate::lisp_effect::CompileResult, String>>,
-    name: String,
-    slot_idx: usize,
-    cursor_track: usize,
+    target: CompileTarget,
     tick: usize,
+}
+
+pub struct EditorState {
+    pending_editor: Option<PendingEditor>,
+    pending_compile: Option<PendingCompile>,
+    lisp_libs: Vec<LoadedDGenLib>,
+    pub instrument_libs: Vec<LoadedDGenLib>,
+    pub picker_cursor: usize,
+    pub picker_filter: String,
+    pub picker_items: Vec<String>,
+    pub status_message: Option<(String, Instant)>,
+}
+
+pub struct BrowserState {
+    pub tree: Vec<BrowserNode>,
+    pub cursor: usize,
+    pub filter: String,
+    pub scroll_offset: usize,
+}
+
+pub struct GraphState {
+    pub lg: LiveGraphPtr,
+    pub track_node_ids: Vec<TrackNodeIds>,
+    pub sample_rate: u32,
+    pub bus_l_id: i32,
+    pub bus_r_id: i32,
+    pub reverb_bus_id: i32,
+    pub reverb_node_id: i32,
+    pub track_buffer_ids: Vec<i32>,
+    pub track_voice_lids: Vec<Vec<u64>>,
+    pub track_instrument_types: Vec<InstrumentType>,
+    pub track_synth_node_ids: Vec<Vec<i32>>,
+    pub track_gatepitch_node_ids: Vec<Vec<i32>>,
+    pub effect_descriptors: Vec<Vec<EffectDescriptor>>,
+    pub instrument_descriptors: Vec<EffectDescriptor>,
+    pub record_armed: Vec<bool>,
+    pub keyboard_tx: std::sync::mpsc::Sender<KeyboardTrigger>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -135,9 +193,7 @@ pub struct AudioBuses {
     pub reverb_node_id: i32,
 }
 
-pub struct App {
-    pub state: Arc<SequencerState>,
-    pub tracks: Vec<String>,
+pub struct UiState {
     pub cursor_step: usize,
     pub cursor_track: usize,
     pub active_param: StepParam,
@@ -146,108 +202,46 @@ pub struct App {
     pub selection_anchor: Option<usize>,
     pub visual_steps: HashSet<usize>,
     pub should_quit: bool,
-
-    // Region/focus system
     pub focused_region: Region,
     pub sidebar_mode: SidebarMode,
-    pub params_column: usize, // 0 = track params (left), 1 = effects (right)
-    pub track_param_cursor: usize, // 0=gate, 1=attack, 2=release, 3=swing, 4=steps
-    pub effect_slot_cursor: usize, // index into effect_descriptors[track]
-    pub effect_param_cursor: usize, // param index within focused slot
+    pub params_column: usize,
+    pub track_param_cursor: usize,
+    pub effect_slot_cursor: usize,
+    pub effect_param_cursor: usize,
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
-    /// True when the dropdown is for a track param (e.g. timebase), false for effect params.
     pub track_param_dropdown: bool,
     pub layout: LayoutRects,
-    last_step_click: Option<(usize, Instant)>, // (step, time) for double-click detection
-    last_x_press: Option<Instant>,              // for xx (clear pattern) detection
+    pub last_step_click: Option<(usize, Instant)>,
+    pub last_x_press: Option<Instant>,
     pub pattern_clone_pending: bool,
     pub pattern_page: usize,
     pub pattern_btn_layout: Vec<(u16, u16, PatternBtn)>,
     pub page_btn_layout: Vec<(u16, u16, usize)>,
-
-    // Per-track effect descriptors (metadata for UI rendering)
-    pub effect_descriptors: Vec<Vec<EffectDescriptor>>,
-
-    // DGenLisp integration
-    pub lg: LiveGraphPtr,
-    pub track_node_ids: Vec<TrackNodeIds>,
-    pub sample_rate: u32,
-    pub pending_lisp_edit: bool,
-    pub pending_lisp_slot: usize, // chain index being edited/added
-    pub pending_lisp_name: Option<String>, // effect name if editing existing
-    lisp_libs: Vec<LoadedDGenLib>, // keep loaded dylibs alive
-
-    // Effect picker
-    pub picker_cursor: usize,
-    pub picker_filter: String,
-    pub picker_items: Vec<String>, // cached list from effects/ folder
-
-    // Status message (shown briefly in help bar)
-    pub status_message: Option<(String, Instant)>,
-
-    // BPM entry mode
     pub bpm_entry: bool,
-
-    // Bus node IDs for wiring new tracks
-    pub bus_l_id: i32,
-    pub bus_r_id: i32,
-    pub reverb_bus_id: i32,
-    pub reverb_node_id: i32,
-
-    // Reverb tab state
     pub reverb_param_cursor: usize,
     pub reverb_size: f32,
     pub reverb_brightness: f32,
     pub reverb_replace: f32,
-
-    // Async effect compilation
-    pending_compile: Option<PendingCompile>,
-
-    // Sample browser
-    pub browser_tree: Vec<BrowserNode>,
-    pub browser_cursor: usize,
-    pub browser_filter: String,
-    pub browser_scroll_offset: usize,
-
-    // Per-track buffer IDs
-    pub track_buffer_ids: Vec<i32>,
-
-    // Keyboard playing & recording
-    pub record_armed: Vec<bool>,
-    pub recording: bool, // true = record into pattern on key-up
+    pub recording: bool,
     pub keyboard_octave: i32,
-    pub keyboard_tx: std::sync::mpsc::Sender<KeyboardTrigger>,
-
-    // Held notes for key-up duration tracking: (key_char, transpose, step_at_press, press_instant)
     pub held_notes: Vec<(char, f32, usize, Instant)>,
-
-    // Per-track voice logical IDs (UI-side tracking)
-    pub track_voice_lids: Vec<Vec<u64>>,
-
-    // Piano keyboard visualization: notes ringing with expiry times
-    pub piano_notes: Vec<(i32, Instant)>, // (semitone, expires_at)
+    pub piano_notes: Vec<(i32, Instant)>,
     pub piano_last_step: usize,
     pub piano_last_track: usize,
-
-    // Page-follow: page tracks playhead unless user interacts
     pub follow_override_until: Option<Instant>,
-
-    // Per-track instrument type
-    pub track_instrument_types: Vec<InstrumentType>,
-    // Instrument picker cursor (0=Sampler, 1=Custom)
     pub instrument_picker_cursor: usize,
-
-    // Custom instrument support
-    pub pending_instrument_edit: bool,
-    pub pending_instrument_name: Option<String>,
-    pub instrument_libs: Vec<LoadedDGenLib>,
-    pub track_synth_node_ids: Vec<Vec<i32>>,
-    pub track_gatepitch_node_ids: Vec<Vec<i32>>,
-
-    // Per-track instrument param descriptors (for Synth tab)
-    pub instrument_descriptors: Vec<EffectDescriptor>,
     pub instrument_param_cursor: usize,
+    pub synth_scroll_offset: usize,
+}
+
+pub struct App {
+    pub state: Arc<SequencerState>,
+    pub tracks: Vec<String>,
+    pub ui: UiState,
+    pub editor: EditorState,
+    pub browser: BrowserState,
+    pub graph: GraphState,
 }
 
 impl App {
@@ -275,98 +269,103 @@ impl App {
         Self {
             state,
             tracks: Vec::new(),
-            cursor_step: 0,
-            cursor_track: 0,
-            active_param: StepParam::Velocity,
-            input_mode: InputMode::Normal,
-            value_buffer: String::new(),
-            selection_anchor: None,
-            visual_steps: HashSet::new(),
-            should_quit: false,
-            focused_region,
-            sidebar_mode,
-            params_column: 0,
-            track_param_cursor: 0,
-            effect_slot_cursor: 0,
-            effect_param_cursor: 0,
-            dropdown_open: false,
-            dropdown_cursor: 0,
-            track_param_dropdown: false,
-            layout: LayoutRects::default(),
-            last_step_click: None,
-            last_x_press: None,
-            pattern_clone_pending: false,
-            pattern_page: 0,
-            pattern_btn_layout: Vec::new(),
-            page_btn_layout: Vec::new(),
-            effect_descriptors: Vec::new(),
-            lg,
-            track_node_ids: Vec::new(),
-            sample_rate,
-            pending_lisp_edit: false,
-            pending_lisp_slot: BUILTIN_SLOT_COUNT,
-            pending_lisp_name: None,
-            lisp_libs: Vec::new(),
-            picker_cursor: 0,
-            picker_filter: String::new(),
-            picker_items: Vec::new(),
-            status_message: None,
-            bpm_entry: false,
-            bus_l_id: buses.bus_l_id,
-            bus_r_id: buses.bus_r_id,
-            reverb_bus_id: buses.reverb_bus_id,
-            reverb_node_id: buses.reverb_node_id,
-            reverb_param_cursor: 0,
-            reverb_size: 0.2,
-            reverb_brightness: 0.8,
-            reverb_replace: 0.3,
-            browser_tree,
-            browser_cursor: 0,
-            browser_filter: String::new(),
-            browser_scroll_offset: 0,
-            pending_compile: None,
-            track_buffer_ids: Vec::new(),
-            record_armed: Vec::new(),
-            recording: false,
-            keyboard_octave: 0,
-            keyboard_tx,
-            held_notes: Vec::new(),
-            track_voice_lids: Vec::new(),
-            piano_notes: Vec::new(),
-            piano_last_step: usize::MAX,
-            piano_last_track: usize::MAX,
-            follow_override_until: None,
-            track_instrument_types: Vec::new(),
-            instrument_picker_cursor: 0,
-            pending_instrument_edit: false,
-            pending_instrument_name: None,
-            instrument_libs: Vec::new(),
-            track_synth_node_ids: Vec::new(),
-            track_gatepitch_node_ids: Vec::new(),
-            instrument_descriptors: Vec::new(),
-            instrument_param_cursor: 0,
+            ui: UiState {
+                cursor_step: 0,
+                cursor_track: 0,
+                active_param: StepParam::Velocity,
+                input_mode: InputMode::Normal,
+                value_buffer: String::new(),
+                selection_anchor: None,
+                visual_steps: HashSet::new(),
+                should_quit: false,
+                focused_region,
+                sidebar_mode,
+                params_column: 0,
+                track_param_cursor: 0,
+                effect_slot_cursor: 0,
+                effect_param_cursor: 0,
+                dropdown_open: false,
+                dropdown_cursor: 0,
+                track_param_dropdown: false,
+                layout: LayoutRects::default(),
+                last_step_click: None,
+                last_x_press: None,
+                pattern_clone_pending: false,
+                pattern_page: 0,
+                pattern_btn_layout: Vec::new(),
+                page_btn_layout: Vec::new(),
+                bpm_entry: false,
+                reverb_param_cursor: 0,
+                reverb_size: 0.2,
+                reverb_brightness: 0.8,
+                reverb_replace: 0.3,
+                recording: false,
+                keyboard_octave: 0,
+                held_notes: Vec::new(),
+                piano_notes: Vec::new(),
+                piano_last_step: usize::MAX,
+                piano_last_track: usize::MAX,
+                follow_override_until: None,
+                instrument_picker_cursor: 0,
+                instrument_param_cursor: 0,
+                synth_scroll_offset: 0,
+            },
+            editor: EditorState {
+                pending_editor: None,
+                pending_compile: None,
+                lisp_libs: Vec::new(),
+                instrument_libs: Vec::new(),
+                picker_cursor: 0,
+                picker_filter: String::new(),
+                picker_items: Vec::new(),
+                status_message: None,
+            },
+            browser: BrowserState {
+                tree: browser_tree,
+                cursor: 0,
+                filter: String::new(),
+                scroll_offset: 0,
+            },
+            graph: GraphState {
+                lg,
+                track_node_ids: Vec::new(),
+                sample_rate,
+                bus_l_id: buses.bus_l_id,
+                bus_r_id: buses.bus_r_id,
+                reverb_bus_id: buses.reverb_bus_id,
+                reverb_node_id: buses.reverb_node_id,
+                track_buffer_ids: Vec::new(),
+                track_voice_lids: Vec::new(),
+                track_instrument_types: Vec::new(),
+                track_synth_node_ids: Vec::new(),
+                track_gatepitch_node_ids: Vec::new(),
+                effect_descriptors: Vec::new(),
+                instrument_descriptors: Vec::new(),
+                record_armed: Vec::new(),
+                keyboard_tx,
+            },
         }
     }
 
     fn selected_range(&self) -> (usize, usize) {
-        match self.selection_anchor {
+        match self.ui.selection_anchor {
             Some(anchor) => {
-                let lo = anchor.min(self.cursor_step);
-                let hi = anchor.max(self.cursor_step);
+                let lo = anchor.min(self.ui.cursor_step);
+                let hi = anchor.max(self.ui.cursor_step);
                 (lo, hi)
             }
-            None => (self.cursor_step, self.cursor_step),
+            None => (self.ui.cursor_step, self.ui.cursor_step),
         }
     }
 
     fn has_selection(&self) -> bool {
-        self.selection_anchor.is_some() || !self.visual_steps.is_empty()
+        self.ui.selection_anchor.is_some() || !self.ui.visual_steps.is_empty()
     }
 
     /// Return all selected step indices (visual or contiguous range, falls back to cursor).
     fn selected_steps(&self) -> Vec<usize> {
-        if !self.visual_steps.is_empty() {
-            let mut steps: Vec<usize> = self.visual_steps.iter().copied().collect();
+        if !self.ui.visual_steps.is_empty() {
+            let mut steps: Vec<usize> = self.ui.visual_steps.iter().copied().collect();
             steps.sort();
             steps
         } else {
@@ -379,12 +378,12 @@ impl App {
         if self.tracks.is_empty() {
             STEPS_PER_PAGE
         } else {
-            self.state.track_params[self.cursor_track].get_num_steps()
+            self.state.track_params[self.ui.cursor_track].get_num_steps()
         }
     }
 
     fn current_page(&self) -> usize {
-        self.cursor_step / STEPS_PER_PAGE
+        self.ui.cursor_step / STEPS_PER_PAGE
     }
 
     /// Page to display: follows playhead when playing, unless the user recently
@@ -394,18 +393,18 @@ impl App {
             return self.current_page();
         }
         // Selection active → stay on cursor page
-        if self.selection_anchor.is_some() {
+        if self.ui.selection_anchor.is_some() {
             return self.current_page();
         }
         // User recently interacted → stay on cursor page
-        if let Some(until) = self.follow_override_until {
+        if let Some(until) = self.ui.follow_override_until {
             if Instant::now() < until {
                 return self.current_page();
             }
         }
         // Follow playhead
         let ns = self.num_steps();
-        let ph = self.state.track_step(self.cursor_track) % ns;
+        let ph = self.state.track_step(self.ui.cursor_track) % ns;
         ph / STEPS_PER_PAGE
     }
 
@@ -418,20 +417,20 @@ impl App {
 
     /// Pause page-follow for 5 seconds after user interaction.
     fn touch_follow_timer(&mut self) {
-        self.follow_override_until = Some(Instant::now() + std::time::Duration::from_secs(5));
+        self.ui.follow_override_until = Some(Instant::now() + std::time::Duration::from_secs(5));
     }
 
     /// Whether the given track is a Sampler instrument.
     pub fn is_sampler_track(&self, track: usize) -> bool {
-        track >= self.track_instrument_types.len()
-            || self.track_instrument_types[track] == InstrumentType::Sampler
+        track >= self.graph.track_instrument_types.len()
+            || self.graph.track_instrument_types[track] == InstrumentType::Sampler
     }
 
     /// Clamp cursor_step to the current track's num_steps.
     fn clamp_cursor_to_steps(&mut self) {
         let ns = self.num_steps();
-        if self.cursor_step >= ns {
-            self.cursor_step = ns - 1;
+        if self.ui.cursor_step >= ns {
+            self.ui.cursor_step = ns - 1;
         }
     }
 }

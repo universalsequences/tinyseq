@@ -22,7 +22,7 @@ impl App {
             return;
         }
 
-        match self.params_column {
+        match self.ui.params_column {
             0 => self.handle_track_params_column(code),
             1 => self.handle_effects_column(code, _modifiers),
             _ => {}
@@ -30,53 +30,57 @@ impl App {
     }
 
     pub(super) fn handle_track_params_column(&mut self, code: KeyCode) {
-        let tp = &self.state.track_params[self.cursor_track];
+        let tp = &self.state.track_params[self.ui.cursor_track];
 
         match code {
             KeyCode::Up => {
-                if self.track_param_cursor > 0 {
-                    self.track_param_cursor -= 1;
+                if self.ui.track_param_cursor > 0 {
+                    self.ui.track_param_cursor -= 1;
                 }
             }
             KeyCode::Down => {
-                if self.track_param_cursor < TP_LAST {
-                    self.track_param_cursor += 1;
+                if self.ui.track_param_cursor < TP_LAST {
+                    self.ui.track_param_cursor += 1;
                 }
             }
             KeyCode::Right => {
-                self.params_column = 1;
-                if self.is_current_custom_track() && self.effect_slot_cursor != super::SYNTH_TAB && self.effect_slot_cursor != super::REVERB_TAB {
+                self.ui.params_column = 1;
+                if self.is_current_custom_track()
+                    && self.ui.effect_slot_cursor != super::SYNTH_TAB
+                    && self.ui.effect_slot_cursor != super::REVERB_TAB
+                {
                     // Default to Synth tab for custom tracks
                     let visible = self.visible_effect_indices();
-                    if !visible.contains(&self.effect_slot_cursor) {
-                        self.effect_slot_cursor = super::SYNTH_TAB;
-                        self.instrument_param_cursor = 0;
+                    if !visible.contains(&self.ui.effect_slot_cursor) {
+                        self.ui.effect_slot_cursor = super::SYNTH_TAB;
+                        self.ui.instrument_param_cursor = 0;
+                        self.ui.synth_scroll_offset = 0;
                     }
                 }
             }
             KeyCode::Left => {} // Already at leftmost column
             KeyCode::Enter => {
-                if self.track_param_cursor == TP_GATE {
+                if self.ui.track_param_cursor == TP_GATE {
                     tp.toggle_gate();
-                } else if self.track_param_cursor == TP_POLY {
+                } else if self.ui.track_param_cursor == TP_POLY {
                     tp.toggle_polyphonic();
-                } else if self.track_param_cursor == TP_TIMEBASE {
-                    self.dropdown_open = true;
-                    self.track_param_dropdown = true;
+                } else if self.ui.track_param_cursor == TP_TIMEBASE {
+                    self.ui.dropdown_open = true;
+                    self.ui.track_param_dropdown = true;
                     // Show p-locked value for selected step, or track default
                     let current_tb = if self.has_selection() {
                         let step = self.selected_steps()[0];
-                        self.state.timebase_plocks[self.cursor_track]
+                        self.state.timebase_plocks[self.ui.cursor_track]
                             .get(step)
                             .unwrap_or(tp.get_timebase())
                     } else {
                         tp.get_timebase()
                     };
-                    self.dropdown_cursor = current_tb as u8 as usize;
-                    self.input_mode = InputMode::Dropdown;
+                    self.ui.dropdown_cursor = current_tb as u8 as usize;
+                    self.ui.input_mode = InputMode::Dropdown;
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => match self.track_param_cursor {
+            KeyCode::Char('+') | KeyCode::Char('=') => match self.ui.track_param_cursor {
                 TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() + 5.0),
                 TP_RELEASE => tp.set_release_ms(tp.get_release_ms() + 10.0),
                 TP_SWING => tp.set_swing(tp.get_swing() + 1.0),
@@ -88,7 +92,7 @@ impl App {
                 TP_SEND => self.adjust_track_send(0.05),
                 _ => {}
             },
-            KeyCode::Char('-') => match self.track_param_cursor {
+            KeyCode::Char('-') => match self.ui.track_param_cursor {
                 TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() - 5.0),
                 TP_RELEASE => tp.set_release_ms(tp.get_release_ms() - 10.0),
                 TP_SWING => tp.set_swing(tp.get_swing() - 1.0),
@@ -102,21 +106,20 @@ impl App {
             },
             KeyCode::Backspace | KeyCode::Delete => {
                 // Clear timebase p-locks on selected steps
-                if self.track_param_cursor == TP_TIMEBASE && self.has_selection() {
+                if self.ui.track_param_cursor == TP_TIMEBASE && self.has_selection() {
                     for step in self.selected_steps() {
-                        self.state.timebase_plocks[self.cursor_track].clear(step);
+                        self.state.timebase_plocks[self.ui.cursor_track].clear(step);
                     }
-
                 }
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                if self.track_param_cursor > TP_GATE
-                    && self.track_param_cursor != TP_POLY
-                    && self.track_param_cursor != TP_TIMEBASE
+                if self.ui.track_param_cursor > TP_GATE
+                    && self.ui.track_param_cursor != TP_POLY
+                    && self.ui.track_param_cursor != TP_TIMEBASE
                 {
-                    self.value_buffer.clear();
-                    self.value_buffer.push(c);
-                    self.input_mode = InputMode::ValueEntry;
+                    self.ui.value_buffer.clear();
+                    self.ui.value_buffer.push(c);
+                    self.ui.input_mode = InputMode::ValueEntry;
                 }
             }
             _ => {}
@@ -129,7 +132,7 @@ impl App {
             let tp = &self.state.track_params[track];
             unsafe {
                 crate::audiograph::params_push_wrapper(
-                    self.lg.0,
+                    self.graph.lg.0,
                     crate::audiograph::ParamMsg {
                         idx: 0,
                         logical_id: send_lid,
@@ -141,7 +144,7 @@ impl App {
     }
 
     fn adjust_track_send(&mut self, delta: f32) {
-        let track = self.cursor_track;
+        let track = self.ui.cursor_track;
         let tp = &self.state.track_params[track];
         tp.set_send(tp.get_send() + delta);
         self.push_send_gain(track);
@@ -150,41 +153,41 @@ impl App {
     pub(super) fn handle_dropdown(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up => {
-                if self.dropdown_cursor > 0 {
-                    self.dropdown_cursor -= 1;
+                if self.ui.dropdown_cursor > 0 {
+                    self.ui.dropdown_cursor -= 1;
                 }
             }
             KeyCode::Down => {
                 let max = self.dropdown_max_items();
-                if self.dropdown_cursor < max.saturating_sub(1) {
-                    self.dropdown_cursor += 1;
+                if self.ui.dropdown_cursor < max.saturating_sub(1) {
+                    self.ui.dropdown_cursor += 1;
                 }
             }
             KeyCode::Enter => {
                 self.apply_dropdown_selection();
-                self.dropdown_open = false;
-                self.track_param_dropdown = false;
-                self.input_mode = InputMode::Normal;
+                self.ui.dropdown_open = false;
+                self.ui.track_param_dropdown = false;
+                self.ui.input_mode = InputMode::Normal;
             }
             KeyCode::Esc => {
-                self.dropdown_open = false;
-                self.track_param_dropdown = false;
-                self.input_mode = InputMode::Normal;
+                self.ui.dropdown_open = false;
+                self.ui.track_param_dropdown = false;
+                self.ui.input_mode = InputMode::Normal;
             }
             _ => {}
         }
     }
 
     fn dropdown_max_items(&self) -> usize {
-        if self.track_param_dropdown {
+        if self.ui.track_param_dropdown {
             return Timebase::COUNT;
         }
         // Synth tab dropdown
-        if self.effect_slot_cursor == super::SYNTH_TAB {
+        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
             if let Some(desc) = self.current_instrument_descriptor() {
-                if self.instrument_param_cursor < desc.params.len() {
+                if self.ui.instrument_param_cursor < desc.params.len() {
                     if let crate::effects::ParamKind::Enum { ref labels } =
-                        desc.params[self.instrument_param_cursor].kind
+                        desc.params[self.ui.instrument_param_cursor].kind
                     {
                         return labels.len();
                     }
@@ -193,9 +196,9 @@ impl App {
             return 0;
         }
         if let Some(desc) = self.current_slot_descriptor() {
-            if self.effect_param_cursor < desc.params.len() {
+            if self.ui.effect_param_cursor < desc.params.len() {
                 if let crate::effects::ParamKind::Enum { ref labels } =
-                    desc.params[self.effect_param_cursor].kind
+                    desc.params[self.ui.effect_param_cursor].kind
                 {
                     return labels.len();
                 }
@@ -206,11 +209,11 @@ impl App {
 
     pub(super) fn dropdown_labels(&self) -> &[String] {
         // Synth tab dropdown
-        if self.effect_slot_cursor == super::SYNTH_TAB {
+        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
             if let Some(desc) = self.current_instrument_descriptor() {
-                if self.instrument_param_cursor < desc.params.len() {
+                if self.ui.instrument_param_cursor < desc.params.len() {
                     if let crate::effects::ParamKind::Enum { ref labels } =
-                        desc.params[self.instrument_param_cursor].kind
+                        desc.params[self.ui.instrument_param_cursor].kind
                     {
                         return labels;
                     }
@@ -219,9 +222,9 @@ impl App {
             return &[];
         }
         if let Some(desc) = self.current_slot_descriptor() {
-            if self.effect_param_cursor < desc.params.len() {
+            if self.ui.effect_param_cursor < desc.params.len() {
                 if let crate::effects::ParamKind::Enum { ref labels } =
-                    desc.params[self.effect_param_cursor].kind
+                    desc.params[self.ui.effect_param_cursor].kind
                 {
                     return labels;
                 }
@@ -231,38 +234,38 @@ impl App {
     }
 
     fn apply_dropdown_selection(&self) {
-        if self.track_param_dropdown {
-            let tb = Timebase::from_index(self.dropdown_cursor as u32);
+        if self.ui.track_param_dropdown {
+            let tb = Timebase::from_index(self.ui.dropdown_cursor as u32);
             if self.has_selection() {
                 // P-lock: set timebase override for selected steps
                 for step in self.selected_steps() {
-                    self.state.timebase_plocks[self.cursor_track].set(step, tb);
+                    self.state.timebase_plocks[self.ui.cursor_track].set(step, tb);
                 }
             } else {
                 // Track default
-                self.state.track_params[self.cursor_track].set_timebase(tb);
+                self.state.track_params[self.ui.cursor_track].set_timebase(tb);
             }
             return;
         }
 
         // Synth tab dropdown
-        if self.effect_slot_cursor == super::SYNTH_TAB {
-            let val = self.dropdown_cursor as f32;
-            let param_idx = self.instrument_param_cursor;
-            let slot = &self.state.instrument_slots[self.cursor_track];
+        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+            let val = self.ui.dropdown_cursor as f32;
+            let param_idx = self.ui.instrument_param_cursor;
+            let slot = &self.state.instrument_slots[self.ui.cursor_track];
             if self.has_selection() {
                 for step in self.selected_steps() {
                     slot.plocks.set(step, param_idx, val);
                 }
             } else {
                 slot.defaults.set(param_idx, val);
-                self.send_instrument_param(self.cursor_track, param_idx, val);
+                self.send_instrument_param(self.ui.cursor_track, param_idx, val);
             }
             return;
         }
 
-        let val = self.dropdown_cursor as f32;
-        let param_idx = self.effect_param_cursor;
+        let val = self.ui.dropdown_cursor as f32;
+        let param_idx = self.ui.effect_param_cursor;
 
         let slot = match self.current_slot() {
             Some(s) => s,
@@ -282,7 +285,7 @@ impl App {
 // ── Drawing ──
 
 pub(super) fn draw_params_region(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.focused_region == Region::Params;
+    let is_focused = app.ui.focused_region == Region::Params;
 
     // Horizontal split: track params | effects
     let h_chunks = Layout::default()
@@ -298,7 +301,7 @@ pub(super) fn draw_params_region(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region_focused: bool) {
-    let col_focused = region_focused && app.params_column == 0;
+    let col_focused = region_focused && app.ui.params_column == 0;
     let border_style = if col_focused {
         Style::default().fg(Color::White)
     } else {
@@ -312,13 +315,13 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    app.layout.track_params_inner = inner;
+    app.ui.layout.track_params_inner = inner;
 
     if app.tracks.is_empty() || inner.height < 1 {
         return;
     }
 
-    let tp = &app.state.track_params[app.cursor_track];
+    let tp = &app.state.track_params[app.ui.cursor_track];
     let attack = tp.get_attack_ms();
     let release = tp.get_release_ms();
     let swing = tp.get_swing();
@@ -327,7 +330,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     // Show p-locked timebase for selected step, or track default
     let timebase_display = if app.has_selection() {
         let step = app.selected_steps()[0]; // show first selected step's value
-        match app.state.timebase_plocks[app.cursor_track].get(step) {
+        match app.state.timebase_plocks[app.ui.cursor_track].get(step) {
             Some(tb) => format!("{} [P]", tb.label()),
             None => default_tb.label().to_string(),
         }
@@ -363,11 +366,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
             format!("{}", steps),
             Some(steps as f32 / MAX_STEPS as f32),
         ),
-        (
-            "timebase",
-            timebase_display,
-            None,
-        ),
+        ("timebase", timebase_display, None),
         ("send", format!("{:.2}", send), Some(send)),
         (
             "poly",
@@ -380,14 +379,14 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
         ),
     ];
 
-    let is_entering_value = col_focused && app.input_mode == InputMode::ValueEntry;
+    let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
 
     for (i, (name, value, slider)) in params.iter().enumerate() {
         if i as u16 >= inner.height {
             break;
         }
         let y = inner.y + i as u16;
-        let is_cursor_row = col_focused && app.track_param_cursor == i;
+        let is_cursor_row = col_focused && app.ui.track_param_cursor == i;
         let cursor = if is_cursor_row { "> " } else { "  " };
         let cursor_style = if is_cursor_row {
             Style::default().fg(Color::Yellow)
@@ -406,7 +405,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(
-                    format!("{}\u{2588}", app.value_buffer),
+                    format!("{}\u{2588}", app.ui.value_buffer),
                     Style::default()
                         .fg(Color::Yellow)
                         .bg(Color::Rgb(60, 60, 20))
@@ -453,7 +452,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     }
 
     // Track param dropdown overlay (e.g. timebase)
-    if app.dropdown_open && app.track_param_dropdown && col_focused {
+    if app.ui.dropdown_open && app.ui.track_param_dropdown && col_focused {
         draw_track_param_dropdown(frame, app, inner);
     }
 }
@@ -515,15 +514,21 @@ fn draw_dropdown_items(
 
 pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<&str> = app.dropdown_labels().iter().map(|s| s.as_str()).collect();
-    draw_dropdown_items(frame, &items, app.dropdown_cursor, area, app.effect_param_cursor as u16);
+    draw_dropdown_items(
+        frame,
+        &items,
+        app.ui.dropdown_cursor,
+        area,
+        app.ui.effect_param_cursor as u16,
+    );
 }
 
 pub(super) fn draw_track_param_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     draw_dropdown_items(
         frame,
         &TIMEBASE_LABELS,
-        app.dropdown_cursor,
+        app.ui.dropdown_cursor,
         area,
-        app.track_param_cursor as u16,
+        app.ui.track_param_cursor as u16,
     );
 }

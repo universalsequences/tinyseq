@@ -92,7 +92,7 @@ unsafe extern "C" fn dgenlisp_init(
     let dst = state as *mut f32;
 
     // Copy header
-    *dst = *src;                // slot_id
+    *dst = *src; // slot_id
     *dst.add(1) = *src.add(1); // total_memory_slots
 
     // Apply sparse index/value pairs into the memory region
