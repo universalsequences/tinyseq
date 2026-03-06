@@ -1,5 +1,5 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -75,6 +75,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.ui.input_mode == InputMode::InstrumentPicker {
         draw_instrument_picker(frame, app, area);
+    }
+    if app.ui.input_mode == InputMode::PresetNameEntry {
+        draw_preset_name_prompt(frame, app, area);
     }
 
     // Draw compiling overlay
@@ -326,9 +329,12 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Rgb(220, 180, 100)),
         ))]
     } else if app.ui.focused_region == Region::Sidebar {
-        let hint_text = match app.ui.sidebar_mode {
+        let hint_text = match app.effective_sidebar_mode() {
             SidebarMode::InstrumentPicker => {
                 "  \u{2191}\u{2193}: navigate  Enter: select instrument  Esc: back".to_string()
+            }
+            SidebarMode::Presets => {
+                "  Type to filter  \u{2191}\u{2193}: navigate  Enter: load  Ctrl+S: save new  Ctrl+O: overwrite  Ctrl+R: revert  Esc: back".to_string()
             }
             _ => {
                 let action = match app.ui.sidebar_mode {
@@ -405,4 +411,24 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::Rgb(60, 60, 60))),
     );
     frame.render_widget(help, area);
+}
+
+fn draw_preset_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 40.min(area.width.saturating_sub(4));
+    let height = 3;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" Save Preset ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let text = format!("{}█", app.ui.value_buffer);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
+        inner,
+    );
 }

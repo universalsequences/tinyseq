@@ -12,9 +12,7 @@ use crate::reverb;
 use crate::sequencer::InstrumentType;
 
 use super::params::draw_dropdown;
-use super::{
-    App, CompileTarget, InputMode, PendingCompile, PendingEditor, Region, REVERB_TAB, SYNTH_TAB,
-};
+use super::{App, CompileTarget, EffectTab, InputMode, PendingCompile, PendingEditor, Region};
 
 const SYNTH_TWO_COLUMN_MIN_WIDTH: u16 = 88;
 const SYNTH_COLUMN_GAP: u16 = 2;
@@ -33,6 +31,7 @@ impl App {
 
     fn set_instrument_base_note_offset(&self, track: usize, value: f32) {
         self.state.instrument_base_note_offsets[track].store(value.to_bits(), Ordering::Relaxed);
+        self.mark_track_sound_dirty(track);
     }
 
     pub(super) fn synth_row_count(&self) -> usize {
@@ -140,10 +139,11 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
+        let slot_idx = self.selected_effect_slot()?;
         self.graph
             .effect_descriptors
             .get(self.ui.cursor_track)
-            .and_then(|descs| descs.get(self.ui.effect_slot_cursor))
+            .and_then(|descs| descs.get(slot_idx))
     }
 
     /// Get the current slot's runtime state, if available.
@@ -151,10 +151,11 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
+        let slot_idx = self.selected_effect_slot()?;
         self.state
             .effect_chains
             .get(self.ui.cursor_track)
-            .and_then(|chain| chain.get(self.ui.effect_slot_cursor))
+            .and_then(|chain| chain.get(slot_idx))
     }
 
     /// Indices of visible (non-empty) effect slots for the current track.
@@ -301,7 +302,7 @@ impl App {
 
         if let Some(r) = result {
             self.apply_effect_to_slot(track, slot_idx, r.node_id, &r.name, &r.params);
-            self.ui.effect_slot_cursor = slot_idx;
+            self.ui.effect_tab = EffectTab::Slot(slot_idx);
             self.ui.effect_param_cursor = 0;
             self.ui.focused_region = Region::Params;
             self.ui.params_column = 1;
@@ -359,7 +360,7 @@ impl App {
             Ok(node_id) => {
                 self.apply_effect_to_slot(track, slot_idx, node_id, name, &result.manifest.params);
                 self.editor.lisp_libs.push(result.lib);
-                self.ui.effect_slot_cursor = slot_idx;
+                self.ui.effect_tab = EffectTab::Slot(slot_idx);
                 self.ui.effect_param_cursor = 0;
                 self.ui.focused_region = Region::Params;
                 self.ui.params_column = 1;
@@ -612,7 +613,7 @@ impl App {
 
     pub(super) fn handle_effects_column(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         // Synth tab input handling
-        if self.ui.effect_slot_cursor == SYNTH_TAB {
+        if self.ui.effect_tab == EffectTab::Synth {
             let shift = modifiers.contains(KeyModifiers::SHIFT);
             match code {
                 KeyCode::Left => {
@@ -621,10 +622,10 @@ impl App {
                 KeyCode::Right => {
                     let visible = self.visible_effect_indices();
                     if let Some(&first) = visible.first() {
-                        self.ui.effect_slot_cursor = first;
+                        self.ui.effect_tab = EffectTab::Slot(first);
                         self.ui.effect_param_cursor = 0;
                     } else {
-                        self.ui.effect_slot_cursor = REVERB_TAB;
+                        self.ui.effect_tab = EffectTab::Reverb;
                         self.ui.reverb_param_cursor = 0;
                     }
                 }
@@ -722,16 +723,16 @@ impl App {
             return;
         }
 
-        if self.ui.effect_slot_cursor == REVERB_TAB {
+        if self.ui.effect_tab == EffectTab::Reverb {
             let shift = modifiers.contains(KeyModifiers::SHIFT);
             match code {
                 KeyCode::Left => {
                     let visible = self.visible_effect_indices();
                     if let Some(&last) = visible.last() {
-                        self.ui.effect_slot_cursor = last;
+                        self.ui.effect_tab = EffectTab::Slot(last);
                         self.ui.effect_param_cursor = 0;
                     } else if self.is_current_custom_track() {
-                        self.ui.effect_slot_cursor = SYNTH_TAB;
+                        self.ui.effect_tab = EffectTab::Synth;
                         self.ui.instrument_param_cursor = 0;
                         self.ui.synth_scroll_offset = 0;
                     } else {
@@ -788,20 +789,20 @@ impl App {
             KeyCode::Left => {
                 if let Some(pos) = visible
                     .iter()
-                    .position(|&i| i == self.ui.effect_slot_cursor)
+                    .position(|&i| self.ui.effect_tab == EffectTab::Slot(i))
                 {
                     if pos > 0 {
-                        self.ui.effect_slot_cursor = visible[pos - 1];
+                        self.ui.effect_tab = EffectTab::Slot(visible[pos - 1]);
                         self.ui.effect_param_cursor = 0;
                     } else if self.is_current_custom_track() {
-                        self.ui.effect_slot_cursor = SYNTH_TAB;
+                        self.ui.effect_tab = EffectTab::Synth;
                         self.ui.instrument_param_cursor = 0;
                         self.ui.synth_scroll_offset = 0;
                     } else {
                         self.ui.params_column = 0;
                     }
                 } else if self.is_current_custom_track() {
-                    self.ui.effect_slot_cursor = SYNTH_TAB;
+                    self.ui.effect_tab = EffectTab::Synth;
                     self.ui.instrument_param_cursor = 0;
                     self.ui.synth_scroll_offset = 0;
                 } else {
@@ -811,19 +812,19 @@ impl App {
             KeyCode::Right => {
                 if let Some(pos) = visible
                     .iter()
-                    .position(|&i| i == self.ui.effect_slot_cursor)
+                    .position(|&i| self.ui.effect_tab == EffectTab::Slot(i))
                 {
                     if pos + 1 < visible.len() {
-                        self.ui.effect_slot_cursor = visible[pos + 1];
+                        self.ui.effect_tab = EffectTab::Slot(visible[pos + 1]);
                         self.ui.effect_param_cursor = 0;
                     } else {
                         // Move to reverb tab
-                        self.ui.effect_slot_cursor = REVERB_TAB;
+                        self.ui.effect_tab = EffectTab::Reverb;
                         self.ui.reverb_param_cursor = 0;
                     }
                 } else {
                     // Move to reverb tab
-                    self.ui.effect_slot_cursor = REVERB_TAB;
+                    self.ui.effect_tab = EffectTab::Reverb;
                     self.ui.reverb_param_cursor = 0;
                 }
             }
@@ -936,7 +937,9 @@ impl App {
 
     fn adjust_slot_param(&self, direction: f32) {
         let track = self.ui.cursor_track;
-        let slot_idx = self.ui.effect_slot_cursor;
+        let Some(slot_idx) = self.selected_effect_slot() else {
+            return;
+        };
         let param_idx = self.ui.effect_param_cursor;
 
         let desc = match self
@@ -1039,7 +1042,9 @@ impl App {
         const SYNCED_PARAM: usize = 1;
         const TIME_PARAM: usize = 2;
 
-        if self.ui.effect_slot_cursor != DELAY_SLOT || self.ui.effect_param_cursor != SYNCED_PARAM {
+        if self.ui.effect_tab != EffectTab::Slot(DELAY_SLOT)
+            || self.ui.effect_param_cursor != SYNCED_PARAM
+        {
             return;
         }
 
@@ -1142,6 +1147,7 @@ impl App {
             let new_val = param_desc.clamp(old + direction * inc);
             slot.defaults.set(param_idx, new_val);
             self.send_instrument_param(track, param_idx, new_val);
+            self.mark_track_sound_dirty(track);
         }
     }
 
@@ -1205,6 +1211,7 @@ impl App {
             let new_val = if current > 0.5 { 0.0 } else { 1.0 };
             slot.defaults.set(param_idx, new_val);
             self.send_instrument_param(track, param_idx, new_val);
+            self.mark_track_sound_dirty(track);
         }
     }
 }
@@ -1230,7 +1237,7 @@ pub(super) fn draw_effects_column(
 
     // Synth tab (only for custom instrument tracks, shown first)
     if app.is_current_custom_track() {
-        let synth_selected = app.ui.effect_slot_cursor == SYNTH_TAB;
+        let synth_selected = app.ui.effect_tab == EffectTab::Synth;
         let synth_style = if synth_selected && col_focused {
             Style::default()
                 .fg(Color::Black)
@@ -1258,7 +1265,7 @@ pub(super) fn draw_effects_column(
                 continue;
             }
             let desc = &descs[i];
-            let is_selected = i == app.ui.effect_slot_cursor;
+            let is_selected = app.ui.effect_tab == EffectTab::Slot(i);
             let style = if is_selected && col_focused {
                 Style::default().fg(Color::Black).bg(Color::White).bold()
             } else if is_selected {
@@ -1287,7 +1294,7 @@ pub(super) fn draw_effects_column(
         }
 
         // Reverb tab (always visible)
-        let reverb_selected = app.ui.effect_slot_cursor == REVERB_TAB;
+        let reverb_selected = app.ui.effect_tab == EffectTab::Reverb;
         let reverb_style = if reverb_selected && col_focused {
             Style::default()
                 .fg(Color::Black)
@@ -1324,7 +1331,7 @@ pub(super) fn draw_effects_column(
     }
 
     // Synth tab rendering
-    if app.ui.effect_slot_cursor == SYNTH_TAB {
+    if app.ui.effect_tab == EffectTab::Synth {
         app.ensure_synth_cursor_visible();
         let desc = match app.graph.instrument_descriptors.get(app.ui.cursor_track) {
             Some(d) if !d.params.is_empty() => d,
@@ -1511,7 +1518,7 @@ pub(super) fn draw_effects_column(
     }
 
     // Reverb tab rendering
-    if app.ui.effect_slot_cursor == REVERB_TAB {
+    if app.ui.effect_tab == EffectTab::Reverb {
         let reverb_params: [(&str, f32); 3] = [
             ("size", app.ui.reverb_size),
             ("brightness", app.ui.reverb_brightness),
@@ -1592,7 +1599,9 @@ pub(super) fn draw_effects_column(
     }
 
     let track = app.ui.cursor_track;
-    let slot_idx = app.ui.effect_slot_cursor;
+    let Some(slot_idx) = app.selected_effect_slot() else {
+        return;
+    };
 
     // Check if this is an empty custom slot with no effect loaded
     let is_custom_slot = slot_idx >= BUILTIN_SLOT_COUNT;

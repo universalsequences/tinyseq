@@ -604,7 +604,9 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
 /// Unified bar drawing for any effect slot.
 fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
     let track = app.ui.cursor_track;
-    let slot_idx = app.ui.effect_slot_cursor;
+    let Some(slot_idx) = app.selected_effect_slot() else {
+        return;
+    };
     let param_idx = app.ui.effect_param_cursor;
 
     let desc = match app

@@ -4,6 +4,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 use crate::audiograph::{self, LiveGraph, NodeVTable};
 
 /// Monotonic counter so each compile produces a unique dylib filename,
@@ -169,6 +171,7 @@ pub fn compile_and_load(source: &str, sample_rate: u32) -> Result<CompileResult,
 // ── Effect library storage ──
 
 const EFFECTS_DIR: &str = "effects";
+const INSTRUMENTS_DIR: &str = "instruments";
 
 pub fn save_effect(name: &str, source: &str) -> io::Result<()> {
     let dir = Path::new(EFFECTS_DIR);
@@ -640,7 +643,61 @@ fn sanitize_effect_name(name: &str) -> String {
 
 use crate::voice::MAX_VOICES;
 
-const INSTRUMENTS_DIR: &str = "instruments";
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InstrumentPreset {
+    pub id: String,
+    pub name: String,
+    pub base_note_offset: f32,
+    pub params: std::collections::BTreeMap<String, f32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InstrumentPresetBank {
+    version: u32,
+    engine_name: String,
+    source_file: String,
+    presets: Vec<InstrumentPreset>,
+}
+
+fn instrument_preset_path(name: &str) -> PathBuf {
+    Path::new(INSTRUMENTS_DIR).join(format!("{name}.presets"))
+}
+
+pub fn load_instrument_presets(name: &str) -> io::Result<Vec<InstrumentPreset>> {
+    let path = instrument_preset_path(name);
+    match std::fs::read_to_string(&path) {
+        Ok(src) => {
+            let bank: InstrumentPresetBank = serde_json::from_str(&src).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse preset bank '{}': {e}", path.display()),
+                )
+            })?;
+            Ok(bank.presets)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn save_instrument_presets(name: &str, presets: &[InstrumentPreset]) -> io::Result<()> {
+    let dir = Path::new(INSTRUMENTS_DIR);
+    std::fs::create_dir_all(dir)?;
+    let path = instrument_preset_path(name);
+    let bank = InstrumentPresetBank {
+        version: 1,
+        engine_name: name.to_string(),
+        source_file: format!("instruments/{name}.lisp"),
+        presets: presets.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&bank).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to serialize preset bank '{}': {e}", path.display()),
+        )
+    })?;
+    std::fs::write(path, json)
+}
 
 const INSTRUMENT_REGISTRY_SIZE: usize = MAX_TRACKS * MAX_VOICES;
 static DGEN_INSTRUMENT_FNS: [AtomicUsize; INSTRUMENT_REGISTRY_SIZE] = {

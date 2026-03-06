@@ -11,9 +11,14 @@ use crate::sequencer::{KeyboardTrigger, StepParam, STEPS_PER_PAGE};
 use super::browser::BrowserNode;
 use super::draw::rect_contains;
 use super::{
-    App, BrowserState, CompileTarget, InputMode, PendingEditor, Region, SidebarMode, COL_WIDTH,
-    REVERB_TAB,
+    App, BrowserState, CompileTarget, EffectTab, InputMode, PendingEditor, Region, SidebarMode,
+    COL_WIDTH,
 };
+
+enum EffectTabHit {
+    Tab(EffectTab),
+    PlusButton,
+}
 
 // ── App impl: input handling ──
 
@@ -123,6 +128,7 @@ impl App {
                         InputMode::ValueEntry => self.handle_value_entry(key.code),
                         InputMode::Dropdown => self.handle_dropdown(key.code),
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
+                        InputMode::PresetNameEntry => self.handle_preset_name_entry(key.code),
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
                         InputMode::InstrumentPicker => {
                             self.handle_instrument_picker_overlay(key.code)
@@ -171,7 +177,9 @@ impl App {
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.tracks.is_empty() {
                     // If focused on a loaded custom slot, edit it directly
-                    let slot_idx = self.ui.effect_slot_cursor;
+                    let Some(slot_idx) = self.selected_effect_slot() else {
+                        return;
+                    };
                     if slot_idx >= BUILTIN_SLOT_COUNT
                         && self.ui.focused_region == Region::Params
                         && self.ui.params_column == 1
@@ -212,7 +220,12 @@ impl App {
             KeyCode::Tab => {
                 let leaving_sidebar = self.ui.focused_region == Region::Sidebar;
                 self.ui.focused_region = self.ui.focused_region.next();
-                if leaving_sidebar && !self.tracks.is_empty() {
+                if !leaving_sidebar
+                    && self.ui.focused_region == Region::Sidebar
+                    && !self.tracks.is_empty()
+                {
+                    self.ui.sidebar_mode = self.effective_sidebar_mode();
+                } else if leaving_sidebar && !self.tracks.is_empty() {
                     self.ui.sidebar_mode = SidebarMode::Audition;
                 }
                 return;
@@ -220,7 +233,12 @@ impl App {
             KeyCode::BackTab => {
                 let leaving_sidebar = self.ui.focused_region == Region::Sidebar;
                 self.ui.focused_region = self.ui.focused_region.prev();
-                if leaving_sidebar && !self.tracks.is_empty() {
+                if !leaving_sidebar
+                    && self.ui.focused_region == Region::Sidebar
+                    && !self.tracks.is_empty()
+                {
+                    self.ui.sidebar_mode = self.effective_sidebar_mode();
+                } else if leaving_sidebar && !self.tracks.is_empty() {
                     self.ui.sidebar_mode = SidebarMode::Audition;
                 }
                 return;
@@ -236,7 +254,7 @@ impl App {
             KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.ui.focused_region == Region::Sidebar {
                     if !self.tracks.is_empty() {
-                        self.ui.sidebar_mode = SidebarMode::Audition;
+                        self.ui.sidebar_mode = self.effective_sidebar_mode();
                     }
                 } else if !self.tracks.is_empty() {
                     self.ui.visual_steps.clear();
@@ -253,6 +271,32 @@ impl App {
                 self.ui.instrument_picker_cursor = 0;
                 self.ui.sidebar_mode = SidebarMode::InstrumentPicker;
                 self.ui.focused_region = Region::Sidebar;
+                return;
+            }
+            KeyCode::Char('s')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui.focused_region == Region::Sidebar
+                    && self.effective_sidebar_mode() == SidebarMode::Presets =>
+            {
+                self.ui.value_buffer.clear();
+                self.ui.preset_prompt_kind = super::PresetPromptKind::SaveNew;
+                self.ui.input_mode = InputMode::PresetNameEntry;
+                return;
+            }
+            KeyCode::Char('o')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui.focused_region == Region::Sidebar
+                    && self.effective_sidebar_mode() == SidebarMode::Presets =>
+            {
+                self.overwrite_loaded_preset();
+                return;
+            }
+            KeyCode::Char('r')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui.focused_region == Region::Sidebar
+                    && self.effective_sidebar_mode() == SidebarMode::Presets =>
+            {
+                self.revert_loaded_preset();
                 return;
             }
             // , → toggle recording (when any track armed)
@@ -401,23 +445,36 @@ impl App {
         // Sidebar: click selects item and focuses sidebar
         if rect_contains(l.sidebar_inner, col, row) {
             if self.ui.focused_region != Region::Sidebar && !self.tracks.is_empty() {
-                self.ui.sidebar_mode = SidebarMode::Audition;
+                self.ui.sidebar_mode = self.effective_sidebar_mode();
             }
             self.ui.focused_region = Region::Sidebar;
-            // Filter line takes 1 row when focused
-            let list_start_y = l.sidebar_inner.y + 1;
-            if row >= list_start_y {
-                let vi = (row - list_start_y) as usize;
-                let idx = self.browser.scroll_offset + vi;
-                let items = self.browser.visible_items();
-                if idx < items.len() {
-                    self.browser.cursor = idx;
-                    let item = &items[idx];
-                    let path = item.path.clone();
-                    if item.is_dir {
-                        BrowserNode::toggle_expanded(&mut self.browser.tree, &path);
-                    } else {
-                        self.sidebar_select_file(&path);
+            if self.effective_sidebar_mode() == SidebarMode::Presets {
+                let list_start_y = l.sidebar_inner.y + 2;
+                if row >= list_start_y {
+                    let vi = (row - list_start_y) as usize;
+                    let idx = self.preset_browser.scroll_offset + vi;
+                    let items = self.visible_preset_items();
+                    if idx < items.len() {
+                        self.preset_browser.cursor = idx;
+                        self.load_selected_preset_into_track();
+                    }
+                }
+            } else {
+                // Filter line takes 1 row when focused
+                let list_start_y = l.sidebar_inner.y + 1;
+                if row >= list_start_y {
+                    let vi = (row - list_start_y) as usize;
+                    let idx = self.browser.scroll_offset + vi;
+                    let items = self.browser.visible_items();
+                    if idx < items.len() {
+                        self.browser.cursor = idx;
+                        let item = &items[idx];
+                        let path = item.path.clone();
+                        if item.is_dir {
+                            BrowserNode::toggle_expanded(&mut self.browser.tree, &path);
+                        } else {
+                            self.sidebar_select_file(&path);
+                        }
                     }
                 }
             }
@@ -571,8 +628,8 @@ impl App {
             && col >= l.effects_block.x
             && col < l.effects_block.x + l.effects_block.width
         {
-            if let Some(slot_idx) = self.effect_tab_from_click_x(col) {
-                if slot_idx == Self::PLUS_BUTTON {
+            if let Some(hit) = self.effect_tab_from_click_x(col) {
+                if matches!(hit, EffectTabHit::PlusButton) {
                     // Open effect picker (same as Ctrl+L)
                     if !self.tracks.is_empty() {
                         self.editor.picker_items = lisp_effect::list_saved_effects();
@@ -581,11 +638,14 @@ impl App {
                         self.ui.input_mode = InputMode::EffectPicker;
                     }
                 } else {
-                    self.ui.effect_slot_cursor = slot_idx;
-                    if slot_idx == super::SYNTH_TAB {
+                    let EffectTabHit::Tab(tab) = hit else {
+                        return;
+                    };
+                    self.ui.effect_tab = tab;
+                    if tab == EffectTab::Synth {
                         self.ui.instrument_param_cursor = 0;
                         self.ui.synth_scroll_offset = 0;
-                    } else if slot_idx == REVERB_TAB {
+                    } else if tab == EffectTab::Reverb {
                         self.ui.reverb_param_cursor = 0;
                     } else {
                         self.ui.effect_param_cursor = 0;
@@ -599,14 +659,14 @@ impl App {
 
         // Effects inner: click selects effect param row
         if rect_contains(l.effects_inner, col, row) {
-            if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+            if self.ui.effect_tab == EffectTab::Synth {
                 if let Some(row_idx) = self.synth_row_at_position(l.effects_inner, col, row) {
                     self.ui.focused_region = Region::Params;
                     self.ui.params_column = 1;
                     self.ui.instrument_param_cursor = row_idx;
                     self.ensure_synth_cursor_visible();
                 }
-            } else if self.ui.effect_slot_cursor == REVERB_TAB {
+            } else if self.ui.effect_tab == EffectTab::Reverb {
                 let row_idx = (row - l.effects_inner.y) as usize;
                 if row_idx < 3 {
                     self.ui.focused_region = Region::Params;
@@ -646,7 +706,22 @@ impl App {
     fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: isize) {
         let l = &self.ui.layout;
         if rect_contains(l.sidebar_inner, col, row) {
-            self.browser.scroll(delta, &self.ui);
+            if self.effective_sidebar_mode() == SidebarMode::Presets {
+                let items = self.visible_preset_items();
+                let max_visible = self.preset_max_visible();
+                let max_scroll = items.len().saturating_sub(max_visible);
+                if delta < 0 {
+                    self.preset_browser.scroll_offset = self
+                        .preset_browser
+                        .scroll_offset
+                        .saturating_sub((-delta) as usize);
+                } else {
+                    self.preset_browser.scroll_offset =
+                        (self.preset_browser.scroll_offset + delta as usize).min(max_scroll);
+                }
+            } else {
+                self.browser.scroll(delta, &self.ui);
+            }
         }
     }
 
@@ -691,9 +766,7 @@ impl App {
 
     /// Returns the slot index for a click on the effect tab bar, or None.
     /// Returns `Some(PLUS_BUTTON)` when the [+] button is clicked.
-    const PLUS_BUTTON: usize = usize::MAX - 2;
-
-    fn effect_tab_from_click_x(&self, col: u16) -> Option<usize> {
+    fn effect_tab_from_click_x(&self, col: u16) -> Option<EffectTabHit> {
         let visible = self.visible_effect_indices();
         let descs = self.graph.effect_descriptors.get(self.ui.cursor_track)?;
         let mut x = self.ui.layout.effects_block.x + 1;
@@ -702,7 +775,7 @@ impl App {
         if self.is_current_custom_track() {
             let synth_width: u16 = 11; // "[< Synth >]" or "[  Synth  ]"
             if col >= x && col < x + synth_width {
-                return Some(super::SYNTH_TAB);
+                return Some(EffectTabHit::Tab(EffectTab::Synth));
             }
             x += synth_width + 1; // matches the " " separator in rendering
         }
@@ -715,7 +788,7 @@ impl App {
             let label_len = desc.name.len() as u16;
             let tab_width = label_len + 6;
             if col >= x && col < x + tab_width {
-                return Some(i);
+                return Some(EffectTabHit::Tab(EffectTab::Slot(i)));
             }
             x += tab_width + 1; // matches the " " separator in rendering
         }
@@ -723,7 +796,7 @@ impl App {
         if self.can_add_custom_effect() {
             let plus_width: u16 = 3; // "[+]"
             if col >= x && col < x + plus_width {
-                return Some(Self::PLUS_BUTTON);
+                return Some(EffectTabHit::PlusButton);
             }
             x += plus_width;
         }
@@ -731,7 +804,7 @@ impl App {
         x += 1;
         let reverb_width: u16 = 12; // "[  Reverb  ]" or "[< Reverb >]"
         if col >= x && col < x + reverb_width {
-            return Some(REVERB_TAB);
+            return Some(EffectTabHit::Tab(EffectTab::Reverb));
         }
         None
     }
@@ -813,15 +886,16 @@ impl App {
                         }
                         _ => {}
                     }
-                } else if self.ui.effect_slot_cursor == REVERB_TAB {
+                } else if self.ui.effect_tab == EffectTab::Reverb {
                     self.set_reverb_param(self.ui.reverb_param_cursor, val);
-                } else if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+                } else if self.ui.effect_tab == EffectTab::Synth {
                     // Synth tab value entry
                     let track = self.ui.cursor_track;
                     if self.ui.instrument_param_cursor == 0 {
                         let store_val = val.clamp(-48.0, 48.0);
                         self.state.instrument_base_note_offsets[track]
                             .store(store_val.to_bits(), Ordering::Relaxed);
+                        self.mark_track_sound_dirty(track);
                     } else {
                         let param_idx = self.ui.instrument_param_cursor - 1;
                         let desc = match self.graph.instrument_descriptors.get(track) {
@@ -842,12 +916,15 @@ impl App {
                         } else {
                             slot.defaults.set(param_idx, store_val);
                             self.send_instrument_param(track, param_idx, store_val);
+                            self.mark_track_sound_dirty(track);
                         }
                     }
                 } else {
                     // Unified effect slot value entry
                     let track = self.ui.cursor_track;
-                    let slot_idx = self.ui.effect_slot_cursor;
+                    let Some(slot_idx) = self.selected_effect_slot() else {
+                        return;
+                    };
                     let param_idx = self.ui.effect_param_cursor;
 
                     let desc = match self

@@ -7,8 +7,8 @@ use crate::sequencer::{Timebase, MAX_STEPS};
 
 use super::effects::draw_effects_column;
 use super::{
-    App, InputMode, Region, TP_ATTACK, TP_GATE, TP_LAST, TP_POLY, TP_RELEASE, TP_SEND, TP_STEPS,
-    TP_SWING, TP_TIMEBASE,
+    App, EffectTab, InputMode, Region, TP_ATTACK, TP_GATE, TP_LAST, TP_POLY, TP_RELEASE, TP_SEND,
+    TP_STEPS, TP_SWING, TP_TIMEBASE,
 };
 
 /// Static labels for the timebase dropdown (derived from Timebase::LABELS).
@@ -46,13 +46,14 @@ impl App {
             KeyCode::Right => {
                 self.ui.params_column = 1;
                 if self.is_current_custom_track()
-                    && self.ui.effect_slot_cursor != super::SYNTH_TAB
-                    && self.ui.effect_slot_cursor != super::REVERB_TAB
+                    && self.ui.effect_tab != EffectTab::Synth
+                    && self.ui.effect_tab != EffectTab::Reverb
                 {
                     // Default to Synth tab for custom tracks
                     let visible = self.visible_effect_indices();
-                    if !visible.contains(&self.ui.effect_slot_cursor) {
-                        self.ui.effect_slot_cursor = super::SYNTH_TAB;
+                    if !matches!(self.ui.effect_tab, EffectTab::Slot(idx) if visible.contains(&idx))
+                    {
+                        self.ui.effect_tab = EffectTab::Synth;
                         self.ui.instrument_param_cursor = 0;
                         self.ui.synth_scroll_offset = 0;
                     }
@@ -183,7 +184,7 @@ impl App {
             return Timebase::COUNT;
         }
         // Synth tab dropdown
-        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+        if self.ui.effect_tab == EffectTab::Synth {
             if let Some(desc) = self.current_instrument_descriptor() {
                 if self.ui.instrument_param_cursor < desc.params.len() {
                     if let crate::effects::ParamKind::Enum { ref labels } =
@@ -209,7 +210,7 @@ impl App {
 
     pub(super) fn dropdown_labels(&self) -> &[String] {
         // Synth tab dropdown
-        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+        if self.ui.effect_tab == EffectTab::Synth {
             if let Some(desc) = self.current_instrument_descriptor() {
                 if self.ui.instrument_param_cursor < desc.params.len() {
                     if let crate::effects::ParamKind::Enum { ref labels } =
@@ -249,7 +250,7 @@ impl App {
         }
 
         // Synth tab dropdown
-        if self.ui.effect_slot_cursor == super::SYNTH_TAB {
+        if self.ui.effect_tab == EffectTab::Synth {
             let val = self.ui.dropdown_cursor as f32;
             let param_idx = self.ui.instrument_param_cursor;
             let slot = &self.state.instrument_slots[self.ui.cursor_track];
@@ -260,6 +261,7 @@ impl App {
             } else {
                 slot.defaults.set(param_idx, val);
                 self.send_instrument_param(self.ui.cursor_track, param_idx, val);
+                self.mark_track_sound_dirty(self.ui.cursor_track);
             }
             return;
         }

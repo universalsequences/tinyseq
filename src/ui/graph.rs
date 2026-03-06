@@ -28,6 +28,26 @@ struct CustomVoiceSetup {
     voice_lids: Vec<u64>,
 }
 
+enum InstrumentRegistration<'a> {
+    Sampler {
+        buffer_id: i32,
+        sampler_ids: Vec<i32>,
+    },
+    Custom {
+        synth_ids: Vec<i32>,
+        gatepitch_ids: Vec<i32>,
+        manifest: &'a DGenManifest,
+    },
+}
+
+struct TrackRegistration<'a> {
+    idx: usize,
+    track_name: String,
+    shell: TrackShell,
+    voice_lids: Vec<u64>,
+    instrument: InstrumentRegistration<'a>,
+}
+
 pub struct GraphController<'a> {
     app: &'a mut App,
 }
@@ -49,18 +69,16 @@ impl GraphController<'_> {
             crate::sampler::load_wav_buffer(self.app.graph.lg.0, wav_path)?;
         let shell = self.create_track_shell(&track_name);
         let voices = self.build_sampler_voices(&track_name, buffer_id, shell.voice_sum_id)?;
-        self.finish_track_registration(
+        self.finish_track_registration(TrackRegistration {
             idx,
             track_name,
-            InstrumentType::Sampler,
-            buffer_id,
             shell,
-            voices.sampler_ids,
-            Vec::new(),
-            Vec::new(),
-            voices.voice_lids,
-            None,
-        );
+            voice_lids: voices.voice_lids,
+            instrument: InstrumentRegistration::Sampler {
+                buffer_id,
+                sampler_ids: voices.sampler_ids,
+            },
+        });
         Ok(idx)
     }
 
@@ -77,19 +95,17 @@ impl GraphController<'_> {
 
         let shell = self.create_track_shell(name);
         let voices = self.build_custom_voices(idx, name, manifest, lib, shell.voice_sum_id);
-        let gatepitch_ids = voices.gatepitch_ids.clone();
-        self.finish_track_registration(
+        self.finish_track_registration(TrackRegistration {
             idx,
-            name.to_string(),
-            InstrumentType::Custom,
-            -1,
+            track_name: name.to_string(),
             shell,
-            voices.gatepitch_ids,
-            voices.synth_ids,
-            gatepitch_ids,
-            voices.voice_lids,
-            Some(manifest),
-        );
+            voice_lids: voices.voice_lids,
+            instrument: InstrumentRegistration::Custom {
+                synth_ids: voices.synth_ids,
+                gatepitch_ids: voices.gatepitch_ids,
+                manifest,
+            },
+        });
         Ok(idx)
     }
 
@@ -395,19 +411,19 @@ impl GraphController<'_> {
         }
     }
 
-    fn finish_track_registration(
-        &mut self,
-        idx: usize,
-        track_name: String,
-        instrument_type: InstrumentType,
-        buffer_id: i32,
-        shell: TrackShell,
-        sampler_ids: Vec<i32>,
-        synth_ids: Vec<i32>,
-        gatepitch_ids: Vec<i32>,
-        voice_lids: Vec<u64>,
-        instrument_manifest: Option<&DGenManifest>,
-    ) {
+    fn finish_track_registration(&mut self, registration: TrackRegistration<'_>) {
+        let TrackRegistration {
+            idx,
+            track_name,
+            shell,
+            voice_lids,
+            instrument,
+        } = registration;
+        let instrument_type = match instrument {
+            InstrumentRegistration::Sampler { .. } => InstrumentType::Sampler,
+            InstrumentRegistration::Custom { .. } => InstrumentType::Custom,
+        };
+
         for (v, &lid) in voice_lids.iter().enumerate() {
             self.app.state.voice_lids[idx][v].store(lid, Ordering::Release);
         }
@@ -420,12 +436,6 @@ impl GraphController<'_> {
             Ordering::Release,
         );
 
-        if instrument_type == InstrumentType::Custom {
-            for (v, &sid) in synth_ids.iter().enumerate() {
-                self.app.state.synth_node_ids[idx][v].store(sid as u32, Ordering::Release);
-            }
-        }
-
         let filter_desc = EffectDescriptor::builtin_filter();
         let delay_desc = EffectDescriptor::builtin_delay();
         let chain = &self.app.state.effect_chains[idx];
@@ -433,14 +443,6 @@ impl GraphController<'_> {
         chain[1].apply_descriptor(&delay_desc, shell.delay_id as u32);
 
         self.app.tracks.push(track_name.clone());
-        self.app.graph.track_buffer_ids.push(buffer_id);
-        self.app.graph.track_node_ids.push(TrackNodeIds {
-            sampler_ids,
-            voice_sum_id: shell.voice_sum_id,
-            filter_id: shell.filter_id,
-            delay_id: shell.delay_id,
-            send_id: shell.send_id,
-        });
         self.app
             .graph
             .effect_descriptors
@@ -448,17 +450,48 @@ impl GraphController<'_> {
         self.app.graph.record_armed.push(false);
         self.app.graph.track_voice_lids.push(voice_lids);
         self.app.graph.track_instrument_types.push(instrument_type);
-        self.app.graph.track_synth_node_ids.push(synth_ids);
-        self.app.graph.track_gatepitch_node_ids.push(gatepitch_ids);
 
-        if let Some(manifest) = instrument_manifest {
-            self.initialize_instrument_slot(idx, &track_name, manifest);
-            self.push_instrument_defaults(idx, manifest);
-        } else {
-            self.app
-                .graph
-                .instrument_descriptors
-                .push(EffectDescriptor::empty_custom_slot());
+        match instrument {
+            InstrumentRegistration::Sampler {
+                buffer_id,
+                sampler_ids,
+            } => {
+                self.app.graph.track_buffer_ids.push(buffer_id);
+                self.app.graph.track_node_ids.push(TrackNodeIds {
+                    sampler_ids,
+                    voice_sum_id: shell.voice_sum_id,
+                    filter_id: shell.filter_id,
+                    delay_id: shell.delay_id,
+                    send_id: shell.send_id,
+                });
+                self.app.graph.track_synth_node_ids.push(Vec::new());
+                self.app.graph.track_gatepitch_node_ids.push(Vec::new());
+                self.app
+                    .graph
+                    .instrument_descriptors
+                    .push(EffectDescriptor::empty_custom_slot());
+            }
+            InstrumentRegistration::Custom {
+                synth_ids,
+                gatepitch_ids,
+                manifest,
+            } => {
+                for (v, &sid) in synth_ids.iter().enumerate() {
+                    self.app.state.synth_node_ids[idx][v].store(sid as u32, Ordering::Release);
+                }
+                self.app.graph.track_buffer_ids.push(-1);
+                self.app.graph.track_node_ids.push(TrackNodeIds {
+                    sampler_ids: gatepitch_ids.clone(),
+                    voice_sum_id: shell.voice_sum_id,
+                    filter_id: shell.filter_id,
+                    delay_id: shell.delay_id,
+                    send_id: shell.send_id,
+                });
+                self.app.graph.track_synth_node_ids.push(synth_ids);
+                self.app.graph.track_gatepitch_node_ids.push(gatepitch_ids);
+                self.initialize_instrument_slot(idx, &track_name, manifest);
+                self.push_instrument_defaults(idx, manifest);
+            }
         }
 
         let mut bank = self.app.state.pattern_bank.lock().unwrap();

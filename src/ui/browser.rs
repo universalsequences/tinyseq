@@ -5,7 +5,8 @@ use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use super::draw::region_border_style;
-use super::{App, BrowserState, Region, SidebarMode, UiState};
+use super::{App, BrowserState, InputMode, PresetPromptKind, Region, SidebarMode, UiState};
+use crate::lisp_effect;
 
 // ── Sample Browser tree ──
 
@@ -256,8 +257,46 @@ impl BrowserState {
 
     pub(super) fn handle_sidebar_input(app: &mut App, code: KeyCode) {
         // Instrument picker mode: separate input handling
-        if app.ui.sidebar_mode == SidebarMode::InstrumentPicker {
+        if app.effective_sidebar_mode() == SidebarMode::InstrumentPicker {
             Self::handle_instrument_picker_input(app, code);
+            return;
+        }
+
+        if app.effective_sidebar_mode() == SidebarMode::Presets {
+            app.clamp_preset_browser();
+            match code {
+                KeyCode::Char(c) => {
+                    app.preset_browser.filter.push(c);
+                    app.preset_browser.cursor = 0;
+                    app.preset_browser.scroll_offset = 0;
+                }
+                KeyCode::Backspace => {
+                    app.preset_browser.filter.pop();
+                    app.preset_browser.cursor = 0;
+                    app.preset_browser.scroll_offset = 0;
+                }
+                KeyCode::Up => {
+                    if app.preset_browser.cursor > 0 {
+                        app.preset_browser.cursor -= 1;
+                    }
+                    app.clamp_preset_browser();
+                }
+                KeyCode::Down => {
+                    let items = app.visible_preset_items();
+                    if app.preset_browser.cursor + 1 < items.len() {
+                        app.preset_browser.cursor += 1;
+                    }
+                    app.clamp_preset_browser();
+                }
+                KeyCode::Enter => app.load_selected_preset_into_track(),
+                KeyCode::Esc => {
+                    app.preset_browser.filter.clear();
+                    app.preset_browser.cursor = 0;
+                    app.preset_browser.scroll_offset = 0;
+                    app.ui.focused_region = Region::Cirklon;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -388,9 +427,245 @@ impl BrowserState {
 }
 
 impl App {
+    fn current_custom_instrument_name(&self) -> Option<&str> {
+        if self.tracks.is_empty() || self.is_sampler_track(self.ui.cursor_track) {
+            None
+        } else {
+            self.tracks.get(self.ui.cursor_track).map(String::as_str)
+        }
+    }
+
+    pub(super) fn visible_preset_items(&self) -> Vec<String> {
+        let Some(name) = self.current_custom_instrument_name() else {
+            return Vec::new();
+        };
+        let mut items: Vec<String> = lisp_effect::load_instrument_presets(name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        items.sort();
+        if self.preset_browser.filter.is_empty() {
+            return items;
+        }
+        let filter = self.preset_browser.filter.to_lowercase();
+        items.retain(|item| item.to_lowercase().contains(&filter));
+        items
+    }
+
+    fn current_track_preset_meta(&self) -> crate::sequencer::TrackPresetMeta {
+        self.state
+            .track_preset_meta
+            .lock()
+            .unwrap()
+            .get(self.ui.cursor_track)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn set_track_preset_meta(
+        &self,
+        track: usize,
+        loaded_preset: Option<String>,
+        dirty: bool,
+    ) {
+        if let Some(meta) = self.state.track_preset_meta.lock().unwrap().get_mut(track) {
+            meta.loaded_preset = loaded_preset;
+            meta.dirty = dirty;
+        }
+    }
+
+    pub(super) fn mark_track_sound_dirty(&self, track: usize) {
+        if let Some(meta) = self.state.track_preset_meta.lock().unwrap().get_mut(track) {
+            meta.dirty = true;
+        }
+    }
+
+    pub(super) fn clamp_preset_browser(&mut self) {
+        let items = self.visible_preset_items();
+        if items.is_empty() {
+            self.preset_browser.cursor = 0;
+            self.preset_browser.scroll_offset = 0;
+            return;
+        }
+        self.preset_browser.cursor = self.preset_browser.cursor.min(items.len() - 1);
+        let max_visible = self.preset_max_visible();
+        let max_scroll = items.len().saturating_sub(max_visible);
+        self.preset_browser.scroll_offset = self.preset_browser.scroll_offset.min(max_scroll);
+        if self.preset_browser.cursor < self.preset_browser.scroll_offset {
+            self.preset_browser.scroll_offset = self.preset_browser.cursor;
+        } else if self.preset_browser.cursor >= self.preset_browser.scroll_offset + max_visible {
+            self.preset_browser.scroll_offset = self.preset_browser.cursor + 1 - max_visible;
+        }
+    }
+
+    pub(super) fn preset_max_visible(&self) -> usize {
+        let h = self.ui.layout.sidebar_inner.height as usize;
+        if h > 2 {
+            h - 2
+        } else {
+            1
+        }
+    }
+
+    fn selected_preset_name(&self) -> Option<String> {
+        let items = self.visible_preset_items();
+        items.get(self.preset_browser.cursor).cloned()
+    }
+
+    pub(super) fn load_selected_preset_into_track(&mut self) {
+        let Some(instrument_name) = self.current_custom_instrument_name() else {
+            return;
+        };
+        let Some(selected_name) = self.selected_preset_name() else {
+            return;
+        };
+        let presets = match lisp_effect::load_instrument_presets(instrument_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.editor.status_message = Some((format!("Error: {e}"), Instant::now()));
+                return;
+            }
+        };
+        let Some(preset) = presets.into_iter().find(|p| p.name == selected_name) else {
+            return;
+        };
+        let track = self.ui.cursor_track;
+        let Some(desc) = self.current_instrument_descriptor() else {
+            return;
+        };
+        let slot = &self.state.instrument_slots[track];
+        for (idx, param) in desc.params.iter().enumerate() {
+            let value = preset
+                .params
+                .get(&param.name)
+                .copied()
+                .unwrap_or(param.default);
+            let clamped = param.clamp(value);
+            slot.defaults.set(idx, clamped);
+            self.send_instrument_param(track, idx, clamped);
+        }
+        self.state.instrument_base_note_offsets[track].store(
+            preset.base_note_offset.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.set_track_preset_meta(track, Some(preset.name.clone()), false);
+        self.editor.status_message =
+            Some((format!("Loaded preset '{}'", preset.name), Instant::now()));
+    }
+
+    fn save_current_track_as_preset(&mut self, preset_name: &str, overwrite: bool) {
+        let Some(instrument_name) = self.current_custom_instrument_name() else {
+            return;
+        };
+        let track = self.ui.cursor_track;
+        let Some(desc) = self.current_instrument_descriptor() else {
+            return;
+        };
+        let slot = &self.state.instrument_slots[track];
+        let mut params = std::collections::BTreeMap::new();
+        for (idx, param) in desc.params.iter().enumerate() {
+            params.insert(param.name.clone(), slot.defaults.get(idx));
+        }
+        let preset = lisp_effect::InstrumentPreset {
+            id: preset_name.to_string(),
+            name: preset_name.to_string(),
+            base_note_offset: f32::from_bits(
+                self.state.instrument_base_note_offsets[track]
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            params,
+        };
+
+        let mut presets = match lisp_effect::load_instrument_presets(instrument_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.editor.status_message = Some((format!("Error: {e}"), Instant::now()));
+                return;
+            }
+        };
+
+        if let Some(existing_idx) = presets.iter().position(|p| p.name == preset_name) {
+            if overwrite {
+                presets[existing_idx] = preset;
+            } else {
+                self.editor.status_message = Some((
+                    format!("Preset '{}' already exists", preset_name),
+                    Instant::now(),
+                ));
+                return;
+            }
+        } else {
+            presets.push(preset);
+            presets.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
+        match lisp_effect::save_instrument_presets(instrument_name, &presets) {
+            Ok(()) => {
+                self.set_track_preset_meta(track, Some(preset_name.to_string()), false);
+                self.editor.status_message =
+                    Some((format!("Saved preset '{}'", preset_name), Instant::now()));
+                self.clamp_preset_browser();
+            }
+            Err(e) => {
+                self.editor.status_message = Some((format!("Error: {e}"), Instant::now()));
+            }
+        }
+    }
+
+    pub(super) fn overwrite_loaded_preset(&mut self) {
+        let meta = self.current_track_preset_meta();
+        let Some(name) = meta.loaded_preset else {
+            self.editor.status_message =
+                Some(("No loaded preset to overwrite".to_string(), Instant::now()));
+            return;
+        };
+        self.save_current_track_as_preset(&name, true);
+    }
+
+    pub(super) fn revert_loaded_preset(&mut self) {
+        let meta = self.current_track_preset_meta();
+        if let Some(name) = meta.loaded_preset {
+            let items = self.visible_preset_items();
+            if let Some(idx) = items.iter().position(|item| item == &name) {
+                self.preset_browser.cursor = idx;
+            }
+            self.load_selected_preset_into_track();
+        } else {
+            self.editor.status_message =
+                Some(("No loaded preset to revert".to_string(), Instant::now()));
+        }
+    }
+
+    pub(super) fn handle_preset_name_entry(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => self.ui.value_buffer.push(c),
+            KeyCode::Backspace => {
+                self.ui.value_buffer.pop();
+            }
+            KeyCode::Enter => {
+                let name = self.ui.value_buffer.trim().to_string();
+                if !name.is_empty() {
+                    match self.ui.preset_prompt_kind {
+                        PresetPromptKind::SaveNew => {
+                            self.save_current_track_as_preset(&name, false)
+                        }
+                    }
+                }
+                self.ui.value_buffer.clear();
+                self.ui.input_mode = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                self.ui.value_buffer.clear();
+                self.ui.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     /// Execute the sidebar action for a file selection (Enter or click).
     pub(super) fn sidebar_select_file(&mut self, path: &std::path::Path) {
-        match self.ui.sidebar_mode {
+        match self.effective_sidebar_mode() {
             SidebarMode::InstrumentPicker => return, // no file selection in picker
             SidebarMode::AddTrack => match self.graph_controller().add_track(path) {
                 Ok(idx) => {
@@ -422,6 +697,7 @@ impl App {
                     }
                 }
             }
+            SidebarMode::Presets => {}
         }
     }
 }
@@ -431,14 +707,11 @@ impl App {
 pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.ui.focused_region == Region::Sidebar;
 
-    let title = if !focused {
-        " Samples "
-    } else {
-        match app.ui.sidebar_mode {
-            SidebarMode::InstrumentPicker => " Instrument ",
-            SidebarMode::AddTrack => " + Add Track ",
-            SidebarMode::Audition => " \u{266b} Audition ",
-        }
+    let title = match app.effective_sidebar_mode() {
+        SidebarMode::InstrumentPicker => " Instrument ",
+        SidebarMode::AddTrack => " + Add Track ",
+        SidebarMode::Audition => " \u{266b} Audition ",
+        SidebarMode::Presets => " Presets ",
     };
 
     let block = Block::default()
@@ -463,7 +736,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Instrument picker mode: draw simple list instead of browser
-    if app.ui.sidebar_mode == SidebarMode::InstrumentPicker && focused {
+    if app.effective_sidebar_mode() == SidebarMode::InstrumentPicker && focused {
         for (i, inst) in crate::sequencer::InstrumentType::ALL.iter().enumerate() {
             let label = inst.label();
             if i as u16 >= inner.height {
@@ -484,6 +757,74 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 buf.set_string(
                     inner.x + text_width as u16,
                     inner.y + i as u16,
+                    &" ".repeat(remaining),
+                    style,
+                );
+            }
+        }
+        return;
+    }
+
+    if app.effective_sidebar_mode() == SidebarMode::Presets {
+        app.clamp_preset_browser();
+        let items = app.visible_preset_items();
+        let max_visible = (inner.height as usize).saturating_sub(2);
+        let meta = app.current_track_preset_meta();
+        let loaded = meta
+            .loaded_preset
+            .clone()
+            .unwrap_or_else(|| "None".to_string());
+        let header = format!(" preset: {}{}", loaded, if meta.dirty { " *" } else { "" });
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                header,
+                Style::default().fg(Color::White),
+            ))),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        if focused {
+            let filter_text = format!("> {}\u{2588}", app.preset_browser.filter);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    filter_text,
+                    Style::default().fg(Color::White),
+                ))),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+        }
+        let list_start_y = inner.y + 2;
+        let scroll = app.preset_browser.scroll_offset;
+        for (vi, i) in (scroll..items.len()).enumerate() {
+            if vi >= max_visible {
+                break;
+            }
+            let row_y = list_start_y + vi as u16;
+            if row_y >= inner.y + inner.height {
+                break;
+            }
+            let item = &items[i];
+            let is_cursor = focused && i == app.preset_browser.cursor;
+            let is_loaded = meta
+                .loaded_preset
+                .as_ref()
+                .map(|p| p == item)
+                .unwrap_or(false);
+            let style = if is_cursor {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else if is_loaded {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let text = format!("  {}", item);
+            let buf = frame.buffer_mut();
+            buf.set_string(inner.x, row_y, &text, style);
+            let text_width = UnicodeWidthStr::width(text.as_str());
+            let remaining = (inner.width as usize).saturating_sub(text_width);
+            if remaining > 0 {
+                buf.set_string(
+                    inner.x + text_width as u16,
+                    row_y,
                     &" ".repeat(remaining),
                     style,
                 );

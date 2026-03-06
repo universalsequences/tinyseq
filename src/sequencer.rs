@@ -566,6 +566,12 @@ impl Default for TrackParamsSnapshot {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct TrackPresetMeta {
+    pub loaded_preset: Option<String>,
+    pub dirty: bool,
+}
+
 #[derive(Clone)]
 pub struct PatternSnapshot {
     pub track_bits: Vec<u64>,
@@ -574,6 +580,7 @@ pub struct PatternSnapshot {
     pub effect_slots: Vec<Vec<EffectSlotSnapshot>>,
     pub instrument_slots: Vec<EffectSlotSnapshot>,
     pub instrument_base_note_offsets: Vec<f32>,
+    pub track_preset_meta: Vec<TrackPresetMeta>,
     /// Per-track (buffer_id, sample_name). -1 means no sample assigned.
     pub sample_ids: Vec<(i32, String)>,
     /// Per-track chord data snapshots.
@@ -598,6 +605,8 @@ impl PatternSnapshot {
         let mut effect_slots = Vec::with_capacity(num_tracks);
         let mut instrument_slots = Vec::with_capacity(num_tracks);
         let mut instrument_base_note_offsets = Vec::with_capacity(num_tracks);
+        let track_preset_meta = state.track_preset_meta.lock().unwrap();
+        let mut preset_meta = Vec::with_capacity(num_tracks);
         let mut sample_ids = Vec::with_capacity(num_tracks);
         let mut chord_snapshots = Vec::with_capacity(num_tracks);
         let mut timebase_plock_snapshots = Vec::with_capacity(num_tracks);
@@ -638,6 +647,7 @@ impl PatternSnapshot {
             instrument_base_note_offsets.push(f32::from_bits(
                 state.instrument_base_note_offsets[t].load(Ordering::Relaxed),
             ));
+            preset_meta.push(track_preset_meta.get(t).cloned().unwrap_or_default());
 
             // Capture sample assignment
             let buf_id = if t < track_buffer_ids.len() {
@@ -673,6 +683,7 @@ impl PatternSnapshot {
             effect_slots,
             instrument_slots,
             instrument_base_note_offsets,
+            track_preset_meta: preset_meta,
             sample_ids,
             chord_snapshots,
             timebase_plock_snapshots,
@@ -682,6 +693,7 @@ impl PatternSnapshot {
 
     pub fn restore(&self, state: &SequencerState) {
         let num_tracks = self.track_bits.len();
+        let mut track_preset_meta = state.track_preset_meta.lock().unwrap();
         for t in 0..num_tracks {
             state.patterns[t].store_bits(self.track_bits[t]);
 
@@ -717,6 +729,9 @@ impl PatternSnapshot {
                     self.instrument_base_note_offsets[t].to_bits(),
                     Ordering::Relaxed,
                 );
+            }
+            if t < self.track_preset_meta.len() && t < track_preset_meta.len() {
+                track_preset_meta[t] = self.track_preset_meta[t].clone();
             }
 
             // Restore chord data
@@ -770,6 +785,7 @@ impl PatternSnapshot {
             .push(Self::default_effect_slots(t, slot_descriptors));
         self.instrument_slots.push(Self::default_instrument_slot());
         self.instrument_base_note_offsets.push(0.0);
+        self.track_preset_meta.push(TrackPresetMeta::default());
         self.sample_ids.push((-1, String::new()));
         self.chord_snapshots.push(ChordSnapshot::new_default());
         self.timebase_plock_snapshots.push([None; MAX_STEPS]);
@@ -784,6 +800,7 @@ impl PatternSnapshot {
             effect_slots: Vec::with_capacity(num_tracks),
             instrument_slots: Vec::with_capacity(num_tracks),
             instrument_base_note_offsets: Vec::with_capacity(num_tracks),
+            track_preset_meta: Vec::with_capacity(num_tracks),
             sample_ids: Vec::with_capacity(num_tracks),
             chord_snapshots: Vec::with_capacity(num_tracks),
             timebase_plock_snapshots: Vec::with_capacity(num_tracks),
@@ -875,6 +892,8 @@ pub struct SequencerState {
     pub instrument_slots: Vec<EffectSlotState>,
     /// Per-track host-side semitone offset for custom instrument pitch interpretation.
     pub instrument_base_note_offsets: Vec<AtomicU32>,
+    /// Per-track loaded preset metadata for custom instruments.
+    pub track_preset_meta: Mutex<Vec<TrackPresetMeta>>,
 }
 
 #[derive(Clone)]
@@ -949,6 +968,11 @@ impl SequencerState {
             instrument_base_note_offsets: (0..MAX_TRACKS)
                 .map(|_| AtomicU32::new(0.0_f32.to_bits()))
                 .collect(),
+            track_preset_meta: Mutex::new(
+                (0..MAX_TRACKS)
+                    .map(|_| TrackPresetMeta::default())
+                    .collect(),
+            ),
         }
     }
 
@@ -1111,7 +1135,9 @@ impl SequencerState {
         }
 
         for param_idx in 0..MAX_SLOT_PARAMS {
-            self.instrument_slots[track].plocks.clear_param(step, param_idx);
+            self.instrument_slots[track]
+                .plocks
+                .clear_param(step, param_idx);
         }
     }
 
@@ -1142,7 +1168,10 @@ impl SequencerState {
             let saved = snapshot.effect_plocks.get(slot_idx);
             let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
             for param_idx in 0..num_params {
-                let val = saved.and_then(|plocks| plocks.params.get(param_idx)).copied().flatten();
+                let val = saved
+                    .and_then(|plocks| plocks.params.get(param_idx))
+                    .copied()
+                    .flatten();
                 match val {
                     Some(val) => slot.plocks.set(step, param_idx, val),
                     None => slot.plocks.clear_param(step, param_idx),
@@ -1153,7 +1182,13 @@ impl SequencerState {
         let instrument_slot = &self.instrument_slots[track];
         let instrument_param_count = instrument_slot.num_params.load(Ordering::Relaxed) as usize;
         for param_idx in 0..instrument_param_count {
-            match snapshot.instrument_plocks.params.get(param_idx).copied().flatten() {
+            match snapshot
+                .instrument_plocks
+                .params
+                .get(param_idx)
+                .copied()
+                .flatten()
+            {
                 Some(val) => instrument_slot.plocks.set(step, param_idx, val),
                 None => instrument_slot.plocks.clear_param(step, param_idx),
             }

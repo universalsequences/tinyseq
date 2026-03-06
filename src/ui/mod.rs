@@ -23,10 +23,12 @@ pub use draw::draw;
 const BAR_HEIGHT: usize = 8;
 const COL_WIDTH: u16 = 3;
 
-/// Sentinel value for `effect_slot_cursor` indicating the Reverb tab is selected.
-const REVERB_TAB: usize = usize::MAX;
-/// Sentinel value for `effect_slot_cursor` indicating the Synth tab is selected.
-const SYNTH_TAB: usize = usize::MAX - 1;
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum EffectTab {
+    Slot(usize),
+    Synth,
+    Reverb,
+}
 
 #[derive(Clone, Debug)]
 pub enum PatternBtn {
@@ -93,6 +95,12 @@ pub struct BrowserState {
     pub scroll_offset: usize,
 }
 
+pub struct PresetBrowserState {
+    pub cursor: usize,
+    pub filter: String,
+    pub scroll_offset: usize,
+}
+
 pub struct GraphState {
     pub lg: LiveGraphPtr,
     pub track_node_ids: Vec<TrackNodeIds>,
@@ -118,6 +126,7 @@ pub enum InputMode {
     ValueEntry,
     Dropdown,
     PatternSelect,
+    PresetNameEntry,
     EffectPicker,
     InstrumentPicker,
     StepInsert,
@@ -130,6 +139,12 @@ pub enum SidebarMode {
     InstrumentPicker,
     AddTrack,
     Audition,
+    Presets,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum PresetPromptKind {
+    SaveNew,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -206,7 +221,7 @@ pub struct UiState {
     pub sidebar_mode: SidebarMode,
     pub params_column: usize,
     pub track_param_cursor: usize,
-    pub effect_slot_cursor: usize,
+    pub effect_tab: EffectTab,
     pub effect_param_cursor: usize,
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
@@ -233,6 +248,7 @@ pub struct UiState {
     pub instrument_picker_cursor: usize,
     pub instrument_param_cursor: usize,
     pub synth_scroll_offset: usize,
+    pub preset_prompt_kind: PresetPromptKind,
 }
 
 pub struct App {
@@ -241,6 +257,7 @@ pub struct App {
     pub ui: UiState,
     pub editor: EditorState,
     pub browser: BrowserState,
+    pub preset_browser: PresetBrowserState,
     pub graph: GraphState,
 }
 
@@ -282,7 +299,7 @@ impl App {
                 sidebar_mode,
                 params_column: 0,
                 track_param_cursor: 0,
-                effect_slot_cursor: 0,
+                effect_tab: EffectTab::Slot(0),
                 effect_param_cursor: 0,
                 dropdown_open: false,
                 dropdown_cursor: 0,
@@ -309,6 +326,7 @@ impl App {
                 instrument_picker_cursor: 0,
                 instrument_param_cursor: 0,
                 synth_scroll_offset: 0,
+                preset_prompt_kind: PresetPromptKind::SaveNew,
             },
             editor: EditorState {
                 pending_editor: None,
@@ -322,6 +340,11 @@ impl App {
             },
             browser: BrowserState {
                 tree: browser_tree,
+                cursor: 0,
+                filter: String::new(),
+                scroll_offset: 0,
+            },
+            preset_browser: PresetBrowserState {
                 cursor: 0,
                 filter: String::new(),
                 scroll_offset: 0,
@@ -360,6 +383,19 @@ impl App {
 
     fn has_selection(&self) -> bool {
         self.ui.selection_anchor.is_some() || !self.ui.visual_steps.is_empty()
+    }
+
+    pub(super) fn effective_sidebar_mode(&self) -> SidebarMode {
+        match self.ui.sidebar_mode {
+            SidebarMode::InstrumentPicker | SidebarMode::AddTrack => self.ui.sidebar_mode,
+            _ => {
+                if !self.tracks.is_empty() && !self.is_sampler_track(self.ui.cursor_track) {
+                    SidebarMode::Presets
+                } else {
+                    SidebarMode::Audition
+                }
+            }
+        }
     }
 
     /// Return all selected step indices (visual or contiguous range, falls back to cursor).
@@ -424,6 +460,13 @@ impl App {
     pub fn is_sampler_track(&self, track: usize) -> bool {
         track >= self.graph.track_instrument_types.len()
             || self.graph.track_instrument_types[track] == InstrumentType::Sampler
+    }
+
+    fn selected_effect_slot(&self) -> Option<usize> {
+        match self.ui.effect_tab {
+            EffectTab::Slot(idx) => Some(idx),
+            EffectTab::Synth | EffectTab::Reverb => None,
+        }
     }
 
     /// Clamp cursor_step to the current track's num_steps.
