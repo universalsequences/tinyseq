@@ -49,9 +49,30 @@ fn set_dgen_process_fn(slot_id: usize, f: DGenProcessFn) {
 // ── Node state layout ──
 // state[0] = slot_id (f32), where slot_id = track_idx * MAX_CUSTOM_FX + offset
 // state[1] = total_memory_slots (f32)
-// state[2..2+N] = DGenLisp memory buffer
+// state[2] = canary
+// state[3] = declared input count (f32)
+// state[4..4+N] = DGenLisp read buffer
+// state[...]     = DGenLisp write buffer (separate to respect `restrict`)
 
-pub const HEADER_SLOTS: usize = 2;
+pub const HEADER_SLOTS: usize = 4;
+pub const DGEN_STATE_REDZONE_SLOTS: usize = 256;
+const HEADER_CANARY: f32 = f32::from_bits(0x4cd35a1d);
+
+pub fn dgen_buffer_span_slots(total_memory_slots: usize) -> usize {
+    total_memory_slots + DGEN_STATE_REDZONE_SLOTS
+}
+
+pub fn dgen_total_state_slots(total_memory_slots: usize) -> usize {
+    HEADER_SLOTS + dgen_buffer_span_slots(total_memory_slots) * 2
+}
+
+unsafe fn dgen_read_buffer_ptr(state: *mut f32) -> *mut f32 {
+    state.add(HEADER_SLOTS)
+}
+
+unsafe fn dgen_write_buffer_ptr(state: *mut f32, total_memory_slots: usize) -> *mut f32 {
+    state.add(HEADER_SLOTS + dgen_buffer_span_slots(total_memory_slots))
+}
 
 unsafe extern "C" fn dgenlisp_wrapper_process(
     inp: *const *mut f32,
@@ -60,13 +81,24 @@ unsafe extern "C" fn dgenlisp_wrapper_process(
     state: *mut c_void,
     _buffers: *mut c_void,
 ) {
+    if state.is_null() {
+        return;
+    }
     let s = state as *mut f32;
     let slot_id = (*s) as usize;
+    if (*s.add(2)).to_bits() != HEADER_CANARY.to_bits() {
+        return;
+    }
     let fn_ptr = DGEN_PROCESS_FNS[slot_id % REGISTRY_SIZE].load(Ordering::Acquire);
     if fn_ptr != 0 {
         let process_fn: DGenProcessFn = std::mem::transmute(fn_ptr);
-        let memory = s.add(HEADER_SLOTS) as *mut c_void;
-        process_fn(inp, out, nframes, memory, memory);
+        let _total_memory_slots = *s.add(1) as usize;
+        let memory_read = dgen_read_buffer_ptr(s) as *mut c_void;
+        let memory_write = dgen_write_buffer_ptr(s, _total_memory_slots) as *mut c_void;
+        if inp.is_null() || out.is_null() {
+            return;
+        }
+        process_fn(inp, out, nframes, memory_read, memory_write);
     } else {
         // Passthrough: copy input to output
         let nf = nframes as usize;
@@ -79,8 +111,10 @@ unsafe extern "C" fn dgenlisp_wrapper_process(
 /// Initial state message format (compact, not full-size):
 ///   [0] = slot_id
 ///   [1] = total_memory_slots
-///   [2] = num_entries (N)
-///   [3..3+2N] = pairs of (index, value)
+///   [2] = canary
+///   [3] = declared input count
+///   [4] = num_entries (N)
+///   [5..5+2N] = pairs of (index, value)
 unsafe extern "C" fn dgenlisp_init(
     state: *mut c_void,
     _sample_rate: c_int,
@@ -96,15 +130,20 @@ unsafe extern "C" fn dgenlisp_init(
     // Copy header
     *dst = *src; // slot_id
     *dst.add(1) = *src.add(1); // total_memory_slots
+    *dst.add(2) = *src.add(2); // canary
+    *dst.add(3) = *src.add(3); // declared input count
 
     // Apply sparse index/value pairs into the memory region
-    let num_entries = (*src.add(2)) as usize;
-    let mem = dst.add(HEADER_SLOTS);
+    let num_entries = (*src.add(4)) as usize;
+    let total_memory_slots = *dst.add(1) as usize;
+    let mem = dgen_read_buffer_ptr(dst);
     for i in 0..num_entries {
-        let idx = (*src.add(3 + i * 2)) as usize;
-        let val = *src.add(3 + i * 2 + 1);
+        let idx = (*src.add(5 + i * 2)) as usize;
+        let val = *src.add(5 + i * 2 + 1);
         *mem.add(idx) = val;
     }
+    let write_mem = dgen_write_buffer_ptr(dst, total_memory_slots);
+    std::ptr::copy_nonoverlapping(mem as *const f32, write_mem, total_memory_slots);
 }
 
 fn dgenlisp_vtable() -> NodeVTable {
@@ -361,7 +400,8 @@ pub fn load_dylib(path: &Path) -> Result<LoadedDGenLib, String> {
 
 // ── Build initial state message (compact) ──
 
-/// Build a compact init message: [slot_id, total_memory_slots, num_entries, idx0, val0, idx1, val1, ...]
+/// Build a compact init message:
+/// [slot_id, total_memory_slots, canary, declared_input_count, num_entries, idx0, val0, ...]
 /// The engine zeroes state; init only needs to set non-zero values.
 fn build_init_message(slot_id: usize, manifest: &DGenManifest) -> Vec<f32> {
     // Collect all non-zero index/value pairs
@@ -382,10 +422,12 @@ fn build_init_message(slot_id: usize, manifest: &DGenManifest) -> Vec<f32> {
         }
     }
 
-    // Header (3) + pairs (2 * N)
-    let mut msg = Vec::with_capacity(3 + entries.len() * 2);
+    // Header (5) + pairs (2 * N)
+    let mut msg = Vec::with_capacity(5 + entries.len() * 2);
     msg.push(slot_id as f32);
     msg.push(manifest.total_memory_slots as f32);
+    msg.push(HEADER_CANARY);
+    msg.push(manifest.n_inputs as f32);
     msg.push(entries.len() as f32);
     for (idx, val) in &entries {
         msg.push(*idx as f32);
@@ -428,8 +470,8 @@ pub unsafe fn add_effect_to_chain_at(
     // Register process function
     set_dgen_process_fn(slot_id, lib.process_fn);
 
-    // Full state allocation (header + memory buffer), zeroed by the engine
-    let state_size = (HEADER_SLOTS + manifest.total_memory_slots) * std::mem::size_of::<f32>();
+    // Full state allocation (header + distinct read/write buffers), zeroed by the engine
+    let state_size = dgen_total_state_slots(manifest.total_memory_slots) * std::mem::size_of::<f32>();
 
     // Compact init message: only header + non-zero index/value pairs
     let init_msg = build_init_message(slot_id, manifest);
@@ -719,15 +761,31 @@ unsafe extern "C" fn dgenlisp_instrument_wrapper_process(
     state: *mut c_void,
     _buffers: *mut c_void,
 ) {
+    if state.is_null() {
+        return;
+    }
     let s = state as *mut f32;
     let slot_id = (*s) as usize;
+    if slot_id >= INSTRUMENT_REGISTRY_SIZE {
+        return;
+    }
+    if (*s.add(2)).to_bits() != HEADER_CANARY.to_bits() {
+        return;
+    }
     let fn_ptr = DGEN_INSTRUMENT_FNS[slot_id % INSTRUMENT_REGISTRY_SIZE].load(Ordering::Acquire);
     if fn_ptr != 0 {
         let process_fn: DGenProcessFn = std::mem::transmute(fn_ptr);
-        let memory = s.add(HEADER_SLOTS) as *mut c_void;
-        process_fn(inp, out, nframes, memory, memory);
+        let total_memory_slots = *s.add(1) as usize;
+        let memory_read = dgen_read_buffer_ptr(s) as *mut c_void;
+        let memory_write = dgen_write_buffer_ptr(s, total_memory_slots) as *mut c_void;
+        if inp.is_null() || out.is_null() {
+            return;
+        }
+        if (*out.add(0)).is_null() {
+            return;
+        }
+        process_fn(inp, out, nframes, memory_read, memory_write);
     } else {
-        // Silence output
         let nf = nframes as usize;
         let out0 = *out.add(0);
         for i in 0..nf {
@@ -777,9 +835,11 @@ pub fn build_init_message_for_voice(
         }
     }
 
-    let mut msg = Vec::with_capacity(3 + entries.len() * 2);
+    let mut msg = Vec::with_capacity(5 + entries.len() * 2);
     msg.push(slot_id as f32);
     msg.push(manifest.total_memory_slots as f32);
+    msg.push(HEADER_CANARY);
+    msg.push(manifest.n_inputs as f32);
     msg.push(entries.len() as f32);
     for (idx, val) in &entries {
         msg.push(*idx as f32);

@@ -90,6 +90,8 @@ extern "C" {
         dst_node: c_int,
         dst_port: c_int,
     ) -> bool;
+    pub fn begin_graph_edit_batch(lg: *mut LiveGraph);
+    pub fn end_graph_edit_batch(lg: *mut LiveGraph);
 
     // Buffer management
     pub fn create_buffer(
@@ -120,6 +122,4 @@ extern "C" {
     // Delete
     pub fn delete_node(lg: *mut LiveGraph, node_id: c_int) -> bool;
 
-    // Debug
-    pub fn debug_dump_graph(lg: *mut LiveGraph);
 }

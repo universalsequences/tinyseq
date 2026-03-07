@@ -45,6 +45,23 @@ pub struct GraphController<'a> {
     app: &'a mut App,
 }
 
+struct GraphEditBatchGuard {
+    lg: *mut crate::audiograph::LiveGraph,
+}
+
+impl GraphEditBatchGuard {
+    fn new(lg: *mut crate::audiograph::LiveGraph) -> Self {
+        unsafe { crate::audiograph::begin_graph_edit_batch(lg) };
+        Self { lg }
+    }
+}
+
+impl Drop for GraphEditBatchGuard {
+    fn drop(&mut self) {
+        unsafe { crate::audiograph::end_graph_edit_batch(self.lg) };
+    }
+}
+
 impl App {
     pub(super) fn graph_controller(&mut self) -> GraphController<'_> {
         GraphController { app: self }
@@ -82,14 +99,15 @@ impl GraphController<'_> {
         manifest: &DGenManifest,
         lib: &LoadedDGenLib,
     ) -> Result<usize, String> {
+        let _batch = GraphEditBatchGuard::new(self.app.graph.lg.0);
         let idx = self.app.state.active_track_count();
         if idx >= MAX_TRACKS {
             return Err("Maximum number of tracks reached".to_string());
         }
 
         let shell = self.create_track_shell(name);
-        self.ensure_custom_engine_runtime(engine_id, name, manifest, lib);
-        self.connect_engine_to_track(engine_id, idx, name, shell.voice_sum_id);
+        self.ensure_custom_engine_runtime(engine_id, name, manifest, lib)?;
+        self.connect_engine_to_track(engine_id, idx, name, shell.voice_sum_id)?;
         self.finish_track_registration(TrackRegistration {
             idx,
             track_name: name.to_string(),
@@ -109,6 +127,7 @@ impl GraphController<'_> {
         manifest: &DGenManifest,
         lib: &LoadedDGenLib,
     ) -> Result<(), String> {
+        let _batch = GraphEditBatchGuard::new(self.app.graph.lg.0);
         if track >= self.app.tracks.len() {
             return Err("Invalid track index".to_string());
         }
@@ -278,16 +297,43 @@ impl GraphController<'_> {
         }
     }
 
+    fn graph_connect_checked(
+        &self,
+        src_node: i32,
+        src_port: i32,
+        dst_node: i32,
+        dst_port: i32,
+        context: &str,
+    ) -> Result<(), String> {
+        let ok = unsafe {
+            crate::audiograph::graph_connect(
+                self.app.graph.lg.0,
+                src_node,
+                src_port,
+                dst_node,
+                dst_port,
+            )
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "{context}: graph_connect({}, {}, {}, {}) failed",
+                src_node, src_port, dst_node, dst_port
+            ))
+        }
+    }
+
     fn ensure_custom_engine_runtime(
         &mut self,
         engine_id: usize,
         name: &str,
         manifest: &DGenManifest,
         lib: &LoadedDGenLib,
-    ) {
+    ) -> Result<(), String> {
         self.ensure_engine_slot(engine_id);
         if self.app.graph.engine_node_ids[engine_id].is_some() {
-            return;
+            return Ok(());
         }
 
         let mut gatepitch_ids = Vec::with_capacity(MAX_VOICES);
@@ -308,12 +354,18 @@ impl GraphController<'_> {
                     0,
                 )
             };
+            if gp_id < 0 {
+                return Err(format!(
+                    "ensure_custom_engine_runtime: failed to add gatepitch node for engine {} voice {}",
+                    engine_id, v
+                ));
+            }
 
             let slot_id = engine_id * MAX_VOICES + v;
             lisp_effect::set_dgen_instrument_fn(slot_id, lib.process_fn);
             let init_msg = lisp_effect::build_init_message_for_voice(slot_id, manifest, v);
             let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
-            let state_size = (lisp_effect::HEADER_SLOTS + manifest.total_memory_slots)
+            let state_size = lisp_effect::dgen_total_state_slots(manifest.total_memory_slots)
                 * std::mem::size_of::<f32>();
 
             let synth_name = CString::new(format!("{}_engine_synth_{}", name, v)).unwrap();
@@ -329,18 +381,45 @@ impl GraphController<'_> {
                     init_msg_size,
                 )
             };
-
-            unsafe {
-                crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 0, synth_id, 0);
-                if manifest.n_inputs > 1 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 1, synth_id, 1);
-                }
-                if manifest.n_inputs > 2 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 2, synth_id, 2);
-                }
-                if manifest.n_inputs > 3 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 3, synth_id, 3);
-                }
+            if synth_id < 0 {
+                return Err(format!(
+                    "ensure_custom_engine_runtime: failed to add synth node for engine {} voice {} (manifest.n_inputs={})",
+                    engine_id, v, manifest.n_inputs
+                ));
+            }
+            self.graph_connect_checked(
+                gp_id,
+                0,
+                synth_id,
+                0,
+                &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+            )?;
+            if manifest.n_inputs > 1 {
+                self.graph_connect_checked(
+                    gp_id,
+                    1,
+                    synth_id,
+                    1,
+                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
+            }
+            if manifest.n_inputs > 2 {
+                self.graph_connect_checked(
+                    gp_id,
+                    2,
+                    synth_id,
+                    2,
+                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
+            }
+            if manifest.n_inputs > 3 {
+                self.graph_connect_checked(
+                    gp_id,
+                    3,
+                    synth_id,
+                    3,
+                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
             }
 
             gatepitch_ids.push(gp_id);
@@ -364,6 +443,7 @@ impl GraphController<'_> {
                     .store(sid as u32, Ordering::Release);
             }
         }
+        Ok(())
     }
 
     fn connect_engine_to_track(
@@ -372,14 +452,18 @@ impl GraphController<'_> {
         track_idx: usize,
         track_name: &str,
         voice_sum_id: i32,
-    ) {
+    ) -> Result<(), String> {
         self.ensure_engine_slot(engine_id);
-        let Some(engine) = self.app.graph.engine_node_ids[engine_id].as_mut() else {
-            return;
+        let Some(existing_engine) = self.app.graph.engine_node_ids[engine_id].as_ref() else {
+            return Err(format!(
+                "connect_engine_to_track: missing engine runtime for engine {}",
+                engine_id
+            ));
         };
-        if engine.route_gain_ids[track_idx].len() == MAX_VOICES {
-            return;
+        if existing_engine.route_gain_ids[track_idx].len() == MAX_VOICES {
+            return Ok(());
         }
+        let synth_ids = existing_engine.synth_ids.clone();
 
         let mut route_ids = Vec::with_capacity(MAX_VOICES);
         for v in 0..MAX_VOICES {
@@ -388,28 +472,39 @@ impl GraphController<'_> {
             let route_id = unsafe {
                 crate::audiograph::live_add_gain(self.app.graph.lg.0, 0.0, route_name.as_ptr())
             };
-            unsafe {
-                crate::audiograph::graph_connect(
-                    self.app.graph.lg.0,
-                    engine.synth_ids[v],
-                    0,
-                    route_id,
-                    0,
-                );
-                crate::audiograph::graph_connect(
-                    self.app.graph.lg.0,
-                    route_id,
-                    0,
-                    voice_sum_id,
-                    0,
-                );
+            if route_id < 0 {
+                return Err(format!(
+                    "connect_engine_to_track: failed to add route gain for engine {} track {} voice {}",
+                    engine_id, track_idx, v
+                ));
             }
+            self.graph_connect_checked(
+                synth_ids[v],
+                0,
+                route_id,
+                0,
+                &format!("connect_engine_to_track engine {} track {} voice {}", engine_id, track_idx, v),
+            )?;
+            self.graph_connect_checked(
+                route_id,
+                0,
+                voice_sum_id,
+                0,
+                &format!("connect_engine_to_track engine {} track {} voice {}", engine_id, track_idx, v),
+            )?;
             self.app.state.engine_route_lids[engine_id][v][track_idx]
                 .store(route_id as u64, Ordering::Release);
             route_ids.push(route_id);
         }
 
+        let Some(engine) = self.app.graph.engine_node_ids[engine_id].as_mut() else {
+            return Err(format!(
+                "connect_engine_to_track: engine runtime disappeared for engine {}",
+                engine_id
+            ));
+        };
         engine.route_gain_ids[track_idx] = route_ids;
+        Ok(())
     }
 
     fn rebuild_custom_engine_runtime(
@@ -448,7 +543,7 @@ impl GraphController<'_> {
             lisp_effect::set_dgen_instrument_fn(slot_id, lib.process_fn);
             let init_msg = lisp_effect::build_init_message_for_voice(slot_id, manifest, v);
             let init_msg_size = init_msg.len() * std::mem::size_of::<f32>();
-            let state_size = (lisp_effect::HEADER_SLOTS + manifest.total_memory_slots)
+            let state_size = lisp_effect::dgen_total_state_slots(manifest.total_memory_slots)
                 * std::mem::size_of::<f32>();
             let synth_name = CString::new(format!("engine_{}_synth_{}", engine_id, v)).unwrap();
             let synth_id = unsafe {
@@ -463,27 +558,54 @@ impl GraphController<'_> {
                     init_msg_size,
                 )
             };
-
-            unsafe {
-                crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 0, synth_id, 0);
-                if manifest.n_inputs > 1 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 1, synth_id, 1);
-                }
-                if manifest.n_inputs > 2 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 2, synth_id, 2);
-                }
-                if manifest.n_inputs > 3 {
-                    crate::audiograph::graph_connect(self.app.graph.lg.0, gp_id, 3, synth_id, 3);
-                }
-                for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
-                    crate::audiograph::graph_connect(
-                        self.app.graph.lg.0,
-                        synth_id,
-                        0,
-                        route_id,
-                        0,
-                    );
-                }
+            if synth_id < 0 {
+                return Err(format!(
+                    "rebuild_custom_engine_runtime: failed to add synth node for engine {} voice {} (manifest.n_inputs={})",
+                    engine_id, v, manifest.n_inputs
+                ));
+            }
+            self.graph_connect_checked(
+                gp_id,
+                0,
+                synth_id,
+                0,
+                &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+            )?;
+            if manifest.n_inputs > 1 {
+                self.graph_connect_checked(
+                    gp_id,
+                    1,
+                    synth_id,
+                    1,
+                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
+            }
+            if manifest.n_inputs > 2 {
+                self.graph_connect_checked(
+                    gp_id,
+                    2,
+                    synth_id,
+                    2,
+                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
+            }
+            if manifest.n_inputs > 3 {
+                self.graph_connect_checked(
+                    gp_id,
+                    3,
+                    synth_id,
+                    3,
+                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                )?;
+            }
+            for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
+                self.graph_connect_checked(
+                    synth_id,
+                    0,
+                    route_id,
+                    0,
+                    &format!("rebuild_custom_engine_runtime engine {} voice {} route {}", engine_id, v, route_id),
+                )?;
             }
 
             new_synth_ids.push(synth_id);
@@ -545,6 +667,9 @@ impl GraphController<'_> {
                 sampler_ids,
             } => {
                 self.app.state.track_engine_ids[idx].store(u32::MAX, Ordering::Release);
+                if let Some(sound) = self.app.state.track_sound_state.lock().unwrap().get_mut(idx) {
+                    sound.engine_id = None;
+                }
                 self.app.graph.track_buffer_ids.push(buffer_id);
                 self.app.graph.track_node_ids.push(TrackNodeIds {
                     sampler_ids,
@@ -563,6 +688,9 @@ impl GraphController<'_> {
             }
             InstrumentRegistration::Custom { engine_id, manifest } => {
                 self.app.state.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
+                if let Some(sound) = self.app.state.track_sound_state.lock().unwrap().get_mut(idx) {
+                    sound.engine_id = Some(engine_id);
+                }
                 self.app.graph.track_buffer_ids.push(-1);
                 self.app.graph.track_node_ids.push(TrackNodeIds {
                     sampler_ids: Vec::new(),

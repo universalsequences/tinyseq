@@ -21,6 +21,7 @@ mod voice;
 
 use std::ffi::CString;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn suspend_terminal(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
@@ -128,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (keyboard_tx, keyboard_rx) = std::sync::mpsc::channel();
 
     // Build cpal audio stream
-    let _stream = audio::build_output_stream(
+    let stream = audio::build_output_stream(
         lg,
         Arc::clone(&state),
         sample_rate,
@@ -136,6 +137,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_size,
         keyboard_rx,
     )?;
+
+    let args: Vec<String> = std::env::args().collect();
+    let lg_ptr = audiograph::LiveGraphPtr(lg);
+    let mut app = ui::App::new(
+        Arc::clone(&state),
+        lg_ptr,
+        sample_rate,
+        ui::AudioBuses {
+            bus_l_id,
+            bus_r_id,
+            reverb_bus_id,
+            reverb_node_id,
+        },
+        keyboard_tx,
+    );
+    if args.iter().any(|arg| arg == "--headless-custom-repro") {
+        run_headless_custom_repro(&mut app)?;
+        drop(stream);
+        unsafe {
+            audiograph::engine_stop_workers();
+            audiograph::destroy_live_graph(lg);
+        }
+        return Ok(());
+    }
 
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -150,21 +175,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
-
-    // Create UI app
-    let lg_ptr = audiograph::LiveGraphPtr(lg);
-    let mut app = ui::App::new(
-        Arc::clone(&state),
-        lg_ptr,
-        sample_rate,
-        ui::AudioBuses {
-            bus_l_id,
-            bus_r_id,
-            reverb_bus_id,
-            reverb_node_id,
-        },
-        keyboard_tx,
-    );
 
     // Main loop
     loop {
@@ -182,11 +192,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup
     suspend_terminal(&mut terminal)?;
+    drop(stream);
 
     unsafe {
         audiograph::engine_stop_workers();
         audiograph::destroy_live_graph(lg);
     }
 
+    Ok(())
+}
+
+fn run_headless_custom_repro(app: &mut ui::App) -> Result<(), Box<dyn std::error::Error>> {
+    let instrument_names = lisp_effect::list_saved_instruments();
+    if instrument_names.is_empty() {
+        return Err("No saved instruments found in instruments/".into());
+    }
+
+    let selected: Vec<String> = instrument_names.into_iter().take(5).collect();
+    if selected.len() < 5 {
+        return Err(format!(
+            "Need at least 5 saved instruments for headless repro, found {}",
+            selected.len()
+        )
+        .into());
+    }
+
+    println!("headless custom repro: adding {} instruments", selected.len());
+    for (idx, name) in selected.iter().enumerate() {
+        println!("step {}: adding instrument '{}'", idx + 1, name);
+        let track_idx = app.add_saved_instrument_track_sync(name)?;
+        println!("step {}: added as track {}", idx + 1, track_idx);
+        if idx + 1 < selected.len() {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    println!("headless custom repro complete; exiting after 5 seconds");
+    std::thread::sleep(Duration::from_secs(5));
     Ok(())
 }
