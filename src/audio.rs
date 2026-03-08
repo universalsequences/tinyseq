@@ -175,8 +175,8 @@ impl CustomEnginePool {
     ) -> CustomVoiceAllocation {
         self.age_counter += 1;
         if !polyphonic {
-            if let Some(idx) = (0..self.num_voices)
-                .find(|&i| self.voices[i].assigned_track == Some(track))
+            if let Some(idx) =
+                (0..self.num_voices).find(|&i| self.voices[i].assigned_track == Some(track))
             {
                 let slot = &mut self.voices[idx];
                 let previous_track = slot.assigned_track;
@@ -675,8 +675,11 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                 let Some(engine_id) = engine_id else {
                     continue;
                 };
-                let allocation = data.custom_engine_pools[engine_id]
-                    .allocate_voice(track_idx, transpose, track_polyphonic);
+                let allocation = data.custom_engine_pools[engine_id].allocate_voice(
+                    track_idx,
+                    transpose,
+                    track_polyphonic,
+                );
                 let voice_idx = allocation.voice_idx;
                 let lid = allocation.logical_id;
                 let fingerprint =
@@ -769,8 +772,11 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
             let Some(engine_id) = engine_id else {
                 return;
             };
-            let allocation = data.custom_engine_pools[engine_id]
-                .allocate_voice(track_idx, transpose, track_polyphonic);
+            let allocation = data.custom_engine_pools[engine_id].allocate_voice(
+                track_idx,
+                transpose,
+                track_polyphonic,
+            );
             let voice_idx = allocation.voice_idx;
             let lid = allocation.logical_id;
             let fingerprint =
@@ -981,8 +987,11 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
                     continue;
                 };
-                let allocation = data.custom_engine_pools[engine_id]
-                    .allocate_voice(kt.track, kt.transpose, track_polyphonic);
+                let allocation = data.custom_engine_pools[engine_id].allocate_voice(
+                    kt.track,
+                    kt.transpose,
+                    track_polyphonic,
+                );
                 let voice_idx = allocation.voice_idx;
                 let voice_lid = allocation.logical_id;
                 let fingerprint =

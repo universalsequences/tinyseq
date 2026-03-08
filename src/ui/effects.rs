@@ -11,8 +11,8 @@ use crate::reverb;
 use crate::sequencer::InstrumentType;
 
 use super::{
-    App, CompileTarget, EffectTab, InputMode, ParamMouseDragTarget, PendingCompile,
-    PendingEditor, Region,
+    App, CompileTarget, EffectTab, InputMode, ParamMouseDragTarget, PendingCompile, PendingEditor,
+    Region,
 };
 
 pub(super) const SYNTH_TWO_COLUMN_MIN_WIDTH: u16 = 88;
@@ -31,9 +31,12 @@ impl App {
         let source = lisp_effect::load_instrument_source(name).map_err(|e| e.to_string())?;
 
         if let Some(cache_idx) = self.cached_instrument_engine_idx(name, &source) {
-            let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+            let manifest = self.editor.engine_registry.engines[cache_idx]
+                .manifest
+                .clone();
             let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
-            let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+            let lib_ptr: *const lisp_effect::LoadedDGenLib =
+                &self.editor.instrument_libs[lib_index];
             return unsafe {
                 self.graph_controller()
                     .add_custom_track(name, cache_idx, &manifest, &*lib_ptr)
@@ -42,7 +45,9 @@ impl App {
 
         let result = lisp_effect::compile_and_load_instrument(&source, self.graph.sample_rate)?;
         let cache_idx = self.cache_instrument_engine(name, &source, &result.manifest, result.lib);
-        let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+        let manifest = self.editor.engine_registry.engines[cache_idx]
+            .manifest
+            .clone();
         let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
         let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
         unsafe {
@@ -52,7 +57,9 @@ impl App {
     }
 
     fn cached_instrument_engine_idx(&self, name: &str, source: &str) -> Option<usize> {
-        self.editor.engine_registry.find_by_name_and_source(name, source)
+        self.editor
+            .engine_registry
+            .find_by_name_and_source(name, source)
     }
 
     fn cache_instrument_engine(
@@ -77,7 +84,9 @@ impl App {
         let Some(cache_idx) = self.cached_instrument_engine_idx(name, source) else {
             return false;
         };
-        let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+        let manifest = self.editor.engine_registry.engines[cache_idx]
+            .manifest
+            .clone();
         let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
         let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
         match unsafe {
@@ -455,7 +464,9 @@ impl App {
     ) {
         let source = lisp_effect::load_instrument_source(name).unwrap_or_default();
         let cache_idx = self.cache_instrument_engine(name, &source, &result.manifest, result.lib);
-        let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+        let manifest = self.editor.engine_registry.engines[cache_idx]
+            .manifest
+            .clone();
         let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
         let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
         match unsafe {
@@ -497,7 +508,9 @@ impl App {
                 let track = self.ui.cursor_track;
                 let cache_idx =
                     self.cache_instrument_engine(&r.name, &r.source, &r.manifest, r.lib);
-                let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+                let manifest = self.editor.engine_registry.engines[cache_idx]
+                    .manifest
+                    .clone();
                 let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
                 let lib_ptr: *const lisp_effect::LoadedDGenLib =
                     &self.editor.instrument_libs[lib_index];
@@ -526,7 +539,9 @@ impl App {
             } else {
                 let cache_idx =
                     self.cache_instrument_engine(&r.name, &r.source, &r.manifest, r.lib);
-                let manifest = self.editor.engine_registry.engines[cache_idx].manifest.clone();
+                let manifest = self.editor.engine_registry.engines[cache_idx]
+                    .manifest
+                    .clone();
                 let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
                 let lib_ptr: *const lisp_effect::LoadedDGenLib =
                     &self.editor.instrument_libs[lib_index];
@@ -1278,10 +1293,20 @@ impl App {
             ParamMouseDragTarget::TrackParam { row_idx } => {
                 let tp = &self.state.track_params[drag.track];
                 match row_idx {
-                    super::TP_ATTACK => tp.set_attack_ms((drag.start_display_value + dx as f32 * 5.0).clamp(0.0, 500.0)),
-                    super::TP_RELEASE => tp.set_release_ms((drag.start_display_value + dx as f32 * 10.0).clamp(0.0, 2000.0)),
-                    super::TP_SWING => tp.set_swing((drag.start_display_value + dx as f32 * 0.5).clamp(50.0, 75.0)),
-                    super::TP_STEPS => tp.set_num_steps((drag.start_display_value + (dx as f32 / 2.0).round()).clamp(1.0, crate::sequencer::MAX_STEPS as f32) as usize),
+                    super::TP_ATTACK => tp.set_attack_ms(
+                        (drag.start_display_value + dx as f32 * 5.0).clamp(0.0, 500.0),
+                    ),
+                    super::TP_RELEASE => tp.set_release_ms(
+                        (drag.start_display_value + dx as f32 * 10.0).clamp(0.0, 2000.0),
+                    ),
+                    super::TP_SWING => {
+                        tp.set_swing((drag.start_display_value + dx as f32 * 0.5).clamp(50.0, 75.0))
+                    }
+                    super::TP_STEPS => tp.set_num_steps(
+                        (drag.start_display_value + (dx as f32 / 2.0).round())
+                            .clamp(1.0, crate::sequencer::MAX_STEPS as f32)
+                            as usize,
+                    ),
                     super::TP_SEND => {
                         tp.set_send((drag.start_display_value + dx as f32 * 0.01).clamp(0.0, 1.0));
                         self.push_send_gain(drag.track);
@@ -1311,7 +1336,10 @@ impl App {
                 self.send_instrument_param(drag.track, param_idx, new_stored);
                 self.mark_track_sound_dirty(drag.track);
             }
-            ParamMouseDragTarget::EffectParam { slot_idx, param_idx } => {
+            ParamMouseDragTarget::EffectParam {
+                slot_idx,
+                param_idx,
+            } => {
                 let Some(desc) = self
                     .graph
                     .effect_descriptors
@@ -1326,7 +1354,12 @@ impl App {
                 let new_display =
                     self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
-                let Some(slot) = self.state.effect_chains.get(drag.track).and_then(|c| c.get(slot_idx)) else {
+                let Some(slot) = self
+                    .state
+                    .effect_chains
+                    .get(drag.track)
+                    .and_then(|c| c.get(slot_idx))
+                else {
                     return;
                 };
                 slot.defaults.set(param_idx, new_stored);
@@ -1334,7 +1367,10 @@ impl App {
             }
             ParamMouseDragTarget::ReverbParam { param_idx } => {
                 let sensitivity = 1.0 / 48.0;
-                self.set_reverb_param(param_idx, drag.start_display_value + dx as f32 * sensitivity);
+                self.set_reverb_param(
+                    param_idx,
+                    drag.start_display_value + dx as f32 * sensitivity,
+                );
             }
         }
     }

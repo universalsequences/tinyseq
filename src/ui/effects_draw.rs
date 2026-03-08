@@ -6,9 +6,7 @@ use crate::effects::BUILTIN_SLOT_COUNT;
 
 use super::effects::{OverlayPickerKind, SYNTH_COLUMN_GAP};
 use super::params::draw_dropdown;
-use super::{
-    App, CompileTarget, EffectTab, InputMode, PendingCompile,
-};
+use super::{App, CompileTarget, EffectTab, InputMode, PendingCompile};
 
 fn fit_cell(text: &str, width: usize) -> String {
     let clipped: String = text.chars().take(width).collect();
@@ -228,7 +226,9 @@ pub(super) fn draw_effects_column(
             let formatted = if is_base_row {
                 format!("{display_val:.0} st")
             } else {
-                param_desc.expect("synth param row").format_value(display_val)
+                param_desc
+                    .expect("synth param row")
+                    .format_value(display_val)
             };
 
             let mut spans = vec![
@@ -368,8 +368,7 @@ pub(super) fn draw_effects_column(
                 ),
             ];
 
-            let slider_width =
-                (inner.width as usize).saturating_sub(label_width + value_width + 6);
+            let slider_width = (inner.width as usize).saturating_sub(label_width + value_width + 6);
             if slider_width > 2 {
                 let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
                 let bar: String = "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
@@ -405,7 +404,10 @@ pub(super) fn draw_effects_column(
             Span::styled("  Ctrl+L", Style::default().fg(Color::White).bold()),
             Span::styled(" to add effect", Style::default().fg(Color::DarkGray)),
         ]);
-        frame.render_widget(Paragraph::new(hint), Rect::new(inner.x, inner.y, inner.width, 1));
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
         return;
     }
 

@@ -999,9 +999,7 @@ impl SequencerState {
                 .collect(),
             engine_voice_counts: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
             engine_route_lids: (0..MAX_TRACKS)
-                .map(|_| {
-                    std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0)))
-                })
+                .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))))
                 .collect(),
             instrument_slots: (0..MAX_TRACKS).map(|_| EffectSlotState::empty()).collect(),
             instrument_base_note_offsets: (0..MAX_TRACKS)

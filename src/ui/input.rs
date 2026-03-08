@@ -11,8 +11,8 @@ use crate::sequencer::{KeyboardTrigger, StepParam, STEPS_PER_PAGE};
 use super::browser::BrowserNode;
 use super::draw::rect_contains;
 use super::{
-    App, BrowserState, CompileTarget, EffectTab, InputMode, ParamMouseDrag,
-    ParamMouseDragTarget, PendingEditor, Region, SidebarMode, COL_WIDTH,
+    App, BrowserState, CompileTarget, EffectTab, InputMode, ParamMouseDrag, ParamMouseDragTarget,
+    PendingEditor, Region, SidebarMode, COL_WIDTH,
 };
 
 enum EffectTabHit {
@@ -627,11 +627,21 @@ impl App {
                 self.ui.params_column = 0;
                 self.ui.track_param_cursor = row_idx;
                 let start_display_value = match row_idx {
-                    super::TP_ATTACK => Some(self.state.track_params[self.ui.cursor_track].get_attack_ms()),
-                    super::TP_RELEASE => Some(self.state.track_params[self.ui.cursor_track].get_release_ms()),
-                    super::TP_SWING => Some(self.state.track_params[self.ui.cursor_track].get_swing()),
-                    super::TP_STEPS => Some(self.state.track_params[self.ui.cursor_track].get_num_steps() as f32),
-                    super::TP_SEND => Some(self.state.track_params[self.ui.cursor_track].get_send()),
+                    super::TP_ATTACK => {
+                        Some(self.state.track_params[self.ui.cursor_track].get_attack_ms())
+                    }
+                    super::TP_RELEASE => {
+                        Some(self.state.track_params[self.ui.cursor_track].get_release_ms())
+                    }
+                    super::TP_SWING => {
+                        Some(self.state.track_params[self.ui.cursor_track].get_swing())
+                    }
+                    super::TP_STEPS => {
+                        Some(self.state.track_params[self.ui.cursor_track].get_num_steps() as f32)
+                    }
+                    super::TP_SEND => {
+                        Some(self.state.track_params[self.ui.cursor_track].get_send())
+                    }
                     _ => None,
                 };
                 if let Some(start_display_value) = start_display_value {
@@ -727,11 +737,9 @@ impl App {
                     self.ui.params_column = 1;
                     self.ui.effect_param_cursor = row_idx;
                     if let Some(slot_idx) = self.selected_effect_slot() {
-                        if let Some(start_display_value) = self.effect_row_display_value(
-                            self.ui.cursor_track,
-                            slot_idx,
-                            row_idx,
-                        ) {
+                        if let Some(start_display_value) =
+                            self.effect_row_display_value(self.ui.cursor_track, slot_idx, row_idx)
+                        {
                             self.ui.param_mouse_drag = Some(ParamMouseDrag {
                                 track: self.ui.cursor_track,
                                 target: ParamMouseDragTarget::EffectParam {

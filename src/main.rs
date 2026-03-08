@@ -250,7 +250,10 @@ fn run_headless_custom_repro(app: &mut ui::App) -> Result<(), Box<dyn std::error
         .into());
     }
 
-    println!("headless custom repro: adding {} instruments", selected.len());
+    println!(
+        "headless custom repro: adding {} instruments",
+        selected.len()
+    );
     for (idx, name) in selected.iter().enumerate() {
         println!("step {}: adding instrument '{}'", idx + 1, name);
         let track_idx = app.add_saved_instrument_track_sync(name)?;

@@ -392,7 +392,10 @@ impl GraphController<'_> {
                 0,
                 synth_id,
                 0,
-                &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                &format!(
+                    "ensure_custom_engine_runtime engine {} voice {}",
+                    engine_id, v
+                ),
             )?;
             if manifest.n_inputs > 1 {
                 self.graph_connect_checked(
@@ -400,7 +403,10 @@ impl GraphController<'_> {
                     1,
                     synth_id,
                     1,
-                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "ensure_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
             if manifest.n_inputs > 2 {
@@ -409,7 +415,10 @@ impl GraphController<'_> {
                     2,
                     synth_id,
                     2,
-                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "ensure_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
             if manifest.n_inputs > 3 {
@@ -418,7 +427,10 @@ impl GraphController<'_> {
                     3,
                     synth_id,
                     3,
-                    &format!("ensure_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "ensure_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
 
@@ -467,8 +479,8 @@ impl GraphController<'_> {
 
         let mut route_ids = Vec::with_capacity(MAX_VOICES);
         for v in 0..MAX_VOICES {
-            let route_name = CString::new(format!("{}_eng{}_route_{}", track_name, engine_id, v))
-                .unwrap();
+            let route_name =
+                CString::new(format!("{}_eng{}_route_{}", track_name, engine_id, v)).unwrap();
             let route_id = unsafe {
                 crate::audiograph::live_add_gain(self.app.graph.lg.0, 0.0, route_name.as_ptr())
             };
@@ -483,14 +495,20 @@ impl GraphController<'_> {
                 0,
                 route_id,
                 0,
-                &format!("connect_engine_to_track engine {} track {} voice {}", engine_id, track_idx, v),
+                &format!(
+                    "connect_engine_to_track engine {} track {} voice {}",
+                    engine_id, track_idx, v
+                ),
             )?;
             self.graph_connect_checked(
                 route_id,
                 0,
                 voice_sum_id,
                 0,
-                &format!("connect_engine_to_track engine {} track {} voice {}", engine_id, track_idx, v),
+                &format!(
+                    "connect_engine_to_track engine {} track {} voice {}",
+                    engine_id, track_idx, v
+                ),
             )?;
             self.app.state.engine_route_lids[engine_id][v][track_idx]
                 .store(route_id as u64, Ordering::Release);
@@ -527,7 +545,11 @@ impl GraphController<'_> {
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 1, old_synth, 1);
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 2, old_synth, 2);
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 3, old_synth, 3);
-                for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
+                for &route_id in engine
+                    .route_gain_ids
+                    .iter()
+                    .flat_map(|routes| routes.iter())
+                {
                     crate::audiograph::graph_disconnect(
                         self.app.graph.lg.0,
                         old_synth,
@@ -569,7 +591,10 @@ impl GraphController<'_> {
                 0,
                 synth_id,
                 0,
-                &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                &format!(
+                    "rebuild_custom_engine_runtime engine {} voice {}",
+                    engine_id, v
+                ),
             )?;
             if manifest.n_inputs > 1 {
                 self.graph_connect_checked(
@@ -577,7 +602,10 @@ impl GraphController<'_> {
                     1,
                     synth_id,
                     1,
-                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "rebuild_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
             if manifest.n_inputs > 2 {
@@ -586,7 +614,10 @@ impl GraphController<'_> {
                     2,
                     synth_id,
                     2,
-                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "rebuild_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
             if manifest.n_inputs > 3 {
@@ -595,21 +626,32 @@ impl GraphController<'_> {
                     3,
                     synth_id,
                     3,
-                    &format!("rebuild_custom_engine_runtime engine {} voice {}", engine_id, v),
+                    &format!(
+                        "rebuild_custom_engine_runtime engine {} voice {}",
+                        engine_id, v
+                    ),
                 )?;
             }
-            for &route_id in engine.route_gain_ids.iter().flat_map(|routes| routes.iter()) {
+            for &route_id in engine
+                .route_gain_ids
+                .iter()
+                .flat_map(|routes| routes.iter())
+            {
                 self.graph_connect_checked(
                     synth_id,
                     0,
                     route_id,
                     0,
-                    &format!("rebuild_custom_engine_runtime engine {} voice {} route {}", engine_id, v, route_id),
+                    &format!(
+                        "rebuild_custom_engine_runtime engine {} voice {} route {}",
+                        engine_id, v, route_id
+                    ),
                 )?;
             }
 
             new_synth_ids.push(synth_id);
-            self.app.state.engine_synth_node_ids[engine_id][v].store(synth_id as u32, Ordering::Release);
+            self.app.state.engine_synth_node_ids[engine_id][v]
+                .store(synth_id as u32, Ordering::Release);
         }
 
         engine.synth_ids = new_synth_ids;
@@ -633,10 +675,7 @@ impl GraphController<'_> {
         for (v, &lid) in voice_lids.iter().enumerate() {
             self.app.state.voice_lids[idx][v].store(lid, Ordering::Release);
         }
-        self.app
-            .state
-            .voice_counts[idx]
-            .store(voice_lids.len() as u32, Ordering::Release);
+        self.app.state.voice_counts[idx].store(voice_lids.len() as u32, Ordering::Release);
         self.app.state.sampler_lids[idx]
             .store(voice_lids.first().copied().unwrap_or(0), Ordering::Release);
         self.app.state.delay_lids[idx].store(shell.delay_id as u64, Ordering::Release);
@@ -667,7 +706,14 @@ impl GraphController<'_> {
                 sampler_ids,
             } => {
                 self.app.state.track_engine_ids[idx].store(u32::MAX, Ordering::Release);
-                if let Some(sound) = self.app.state.track_sound_state.lock().unwrap().get_mut(idx) {
+                if let Some(sound) = self
+                    .app
+                    .state
+                    .track_sound_state
+                    .lock()
+                    .unwrap()
+                    .get_mut(idx)
+                {
                     sound.engine_id = None;
                 }
                 self.app.graph.track_buffer_ids.push(buffer_id);
@@ -686,9 +732,19 @@ impl GraphController<'_> {
                     .instrument_descriptors
                     .push(EffectDescriptor::empty_custom_slot());
             }
-            InstrumentRegistration::Custom { engine_id, manifest } => {
+            InstrumentRegistration::Custom {
+                engine_id,
+                manifest,
+            } => {
                 self.app.state.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
-                if let Some(sound) = self.app.state.track_sound_state.lock().unwrap().get_mut(idx) {
+                if let Some(sound) = self
+                    .app
+                    .state
+                    .track_sound_state
+                    .lock()
+                    .unwrap()
+                    .get_mut(idx)
+                {
                     sound.engine_id = Some(engine_id);
                 }
                 self.app.graph.track_buffer_ids.push(-1);
@@ -702,7 +758,10 @@ impl GraphController<'_> {
                 let engine = self.app.graph.engine_node_ids[engine_id]
                     .as_ref()
                     .expect("engine runtime initialized");
-                self.app.graph.track_synth_node_ids.push(engine.synth_ids.clone());
+                self.app
+                    .graph
+                    .track_synth_node_ids
+                    .push(engine.synth_ids.clone());
                 self.app
                     .graph
                     .track_gatepitch_node_ids
