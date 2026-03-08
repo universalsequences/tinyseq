@@ -338,6 +338,7 @@ impl GraphController<'_> {
 
         let mut gatepitch_ids = Vec::with_capacity(MAX_VOICES);
         let mut synth_ids = Vec::with_capacity(MAX_VOICES);
+        let mut modulator_ids = Vec::with_capacity(MAX_VOICES);
         let mut voice_lids = Vec::with_capacity(MAX_VOICES);
 
         for v in 0..MAX_VOICES {
@@ -357,6 +358,26 @@ impl GraphController<'_> {
             if gp_id < 0 {
                 return Err(format!(
                     "ensure_custom_engine_runtime: failed to add gatepitch node for engine {} voice {}",
+                    engine_id, v
+                ));
+            }
+
+            let mod_name = CString::new(format!("{}_mod_{}", name, v)).unwrap();
+            let mod_id = unsafe {
+                crate::audiograph::add_node(
+                    self.app.graph.lg.0,
+                    crate::voice_modulator::voice_modulator_vtable(),
+                    crate::voice_modulator::STATE_SIZE * std::mem::size_of::<f32>(),
+                    mod_name.as_ptr(),
+                    4,
+                    crate::voice_modulator::NUM_OUTPUTS as i32,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            if mod_id < 0 {
+                return Err(format!(
+                    "ensure_custom_engine_runtime: failed to add modulator node for engine {} voice {}",
                     engine_id, v
                 ));
             }
@@ -387,54 +408,78 @@ impl GraphController<'_> {
                     engine_id, v, manifest.n_inputs
                 ));
             }
+            for input in &manifest.inputs {
+                if input.channel < 4 {
+                    self.graph_connect_checked(
+                        gp_id,
+                        input.channel as i32,
+                        synth_id,
+                        input.channel as i32,
+                        &format!(
+                            "ensure_custom_engine_runtime engine {} voice {} input {}",
+                            engine_id, v, input.channel
+                        ),
+                    )?;
+                }
+            }
             self.graph_connect_checked(
                 gp_id,
                 0,
-                synth_id,
+                mod_id,
                 0,
                 &format!(
                     "ensure_custom_engine_runtime engine {} voice {}",
                     engine_id, v
                 ),
             )?;
-            if manifest.n_inputs > 1 {
-                self.graph_connect_checked(
-                    gp_id,
-                    1,
-                    synth_id,
-                    1,
-                    &format!(
-                        "ensure_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
-            }
-            if manifest.n_inputs > 2 {
-                self.graph_connect_checked(
-                    gp_id,
-                    2,
-                    synth_id,
-                    2,
-                    &format!(
-                        "ensure_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
-            }
-            if manifest.n_inputs > 3 {
-                self.graph_connect_checked(
-                    gp_id,
-                    3,
-                    synth_id,
-                    3,
-                    &format!(
-                        "ensure_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
+            self.graph_connect_checked(
+                gp_id,
+                1,
+                mod_id,
+                1,
+                &format!(
+                    "ensure_custom_engine_runtime engine {} voice {}",
+                    engine_id, v
+                ),
+            )?;
+            self.graph_connect_checked(
+                gp_id,
+                2,
+                mod_id,
+                2,
+                &format!(
+                    "ensure_custom_engine_runtime engine {} voice {}",
+                    engine_id, v
+                ),
+            )?;
+            self.graph_connect_checked(
+                gp_id,
+                3,
+                mod_id,
+                3,
+                &format!(
+                    "ensure_custom_engine_runtime engine {} voice {}",
+                    engine_id, v
+                ),
+            )?;
+            for mod_out in 0..crate::voice_modulator::NUM_OUTPUTS {
+                let synth_in = 4 + mod_out as i32;
+                if manifest.n_inputs > synth_in as usize {
+                    self.graph_connect_checked(
+                        mod_id,
+                        mod_out as i32,
+                        synth_id,
+                        synth_in,
+                        &format!(
+                            "ensure_custom_engine_runtime engine {} voice {} mod {}",
+                            engine_id, v, mod_out
+                        ),
+                    )?;
+                }
             }
 
             gatepitch_ids.push(gp_id);
+            modulator_ids.push(mod_id);
             synth_ids.push(synth_id);
             voice_lids.push(gp_id as u64);
         }
@@ -442,17 +487,22 @@ impl GraphController<'_> {
         self.app.graph.engine_node_ids[engine_id] = Some(EngineNodeIds {
             synth_ids,
             gatepitch_ids,
+            modulator_ids,
             route_gain_ids: (0..MAX_TRACKS).map(|_| Vec::new()).collect(),
         });
 
         for (v, &lid) in voice_lids.iter().enumerate() {
-            self.app.state.engine_voice_lids[engine_id][v].store(lid, Ordering::Release);
+            self.app.state.runtime.engine_voice_lids[engine_id][v].store(lid, Ordering::Release);
         }
-        self.app.state.engine_voice_counts[engine_id].store(MAX_VOICES as u32, Ordering::Release);
+        self.app.state.runtime.engine_voice_counts[engine_id].store(MAX_VOICES as u32, Ordering::Release);
         if let Some(engine) = &self.app.graph.engine_node_ids[engine_id] {
             for (v, &sid) in engine.synth_ids.iter().enumerate() {
-                self.app.state.engine_synth_node_ids[engine_id][v]
+                self.app.state.runtime.engine_synth_node_ids[engine_id][v]
                     .store(sid as u32, Ordering::Release);
+            }
+            for (v, &mid) in engine.modulator_ids.iter().enumerate() {
+                self.app.state.runtime.engine_modulator_node_ids[engine_id][v]
+                    .store(mid as u32, Ordering::Release);
             }
         }
         Ok(())
@@ -510,7 +560,7 @@ impl GraphController<'_> {
                     engine_id, track_idx, v
                 ),
             )?;
-            self.app.state.engine_route_lids[engine_id][v][track_idx]
+            self.app.state.runtime.engine_route_lids[engine_id][v][track_idx]
                 .store(route_id as u64, Ordering::Release);
             route_ids.push(route_id);
         }
@@ -539,12 +589,22 @@ impl GraphController<'_> {
         for v in 0..MAX_VOICES {
             let old_synth = engine.synth_ids[v];
             let gp_id = engine.gatepitch_ids[v];
+            let mod_id = engine.modulator_ids[v];
 
             unsafe {
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 0, old_synth, 0);
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 1, old_synth, 1);
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 2, old_synth, 2);
                 crate::audiograph::graph_disconnect(self.app.graph.lg.0, gp_id, 3, old_synth, 3);
+                for mod_out in 0..crate::voice_modulator::NUM_OUTPUTS {
+                    crate::audiograph::graph_disconnect(
+                        self.app.graph.lg.0,
+                        mod_id,
+                        mod_out as i32,
+                        old_synth,
+                        4 + mod_out as i32,
+                    );
+                }
                 for &route_id in engine
                     .route_gain_ids
                     .iter()
@@ -586,51 +646,34 @@ impl GraphController<'_> {
                     engine_id, v, manifest.n_inputs
                 ));
             }
-            self.graph_connect_checked(
-                gp_id,
-                0,
-                synth_id,
-                0,
-                &format!(
-                    "rebuild_custom_engine_runtime engine {} voice {}",
-                    engine_id, v
-                ),
-            )?;
-            if manifest.n_inputs > 1 {
-                self.graph_connect_checked(
-                    gp_id,
-                    1,
-                    synth_id,
-                    1,
-                    &format!(
-                        "rebuild_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
+            for input in &manifest.inputs {
+                if input.channel < 4 {
+                    self.graph_connect_checked(
+                        gp_id,
+                        input.channel as i32,
+                        synth_id,
+                        input.channel as i32,
+                        &format!(
+                            "rebuild_custom_engine_runtime engine {} voice {} input {}",
+                            engine_id, v, input.channel
+                        ),
+                    )?;
+                }
             }
-            if manifest.n_inputs > 2 {
-                self.graph_connect_checked(
-                    gp_id,
-                    2,
-                    synth_id,
-                    2,
-                    &format!(
-                        "rebuild_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
-            }
-            if manifest.n_inputs > 3 {
-                self.graph_connect_checked(
-                    gp_id,
-                    3,
-                    synth_id,
-                    3,
-                    &format!(
-                        "rebuild_custom_engine_runtime engine {} voice {}",
-                        engine_id, v
-                    ),
-                )?;
+            for mod_out in 0..crate::voice_modulator::NUM_OUTPUTS {
+                let synth_in = 4 + mod_out as i32;
+                if manifest.n_inputs > synth_in as usize {
+                    self.graph_connect_checked(
+                        mod_id,
+                        mod_out as i32,
+                        synth_id,
+                        synth_in,
+                        &format!(
+                            "rebuild_custom_engine_runtime engine {} voice {} mod {}",
+                            engine_id, v, mod_out
+                        ),
+                    )?;
+                }
             }
             for &route_id in engine
                 .route_gain_ids
@@ -650,11 +693,15 @@ impl GraphController<'_> {
             }
 
             new_synth_ids.push(synth_id);
-            self.app.state.engine_synth_node_ids[engine_id][v]
+            self.app.state.runtime.engine_synth_node_ids[engine_id][v]
                 .store(synth_id as u32, Ordering::Release);
         }
 
         engine.synth_ids = new_synth_ids;
+        for (v, &mid) in engine.modulator_ids.iter().enumerate() {
+            self.app.state.runtime.engine_modulator_node_ids[engine_id][v]
+                .store(mid as u32, Ordering::Release);
+        }
         self.app.graph.engine_node_ids[engine_id] = Some(engine);
         Ok(())
     }
@@ -673,21 +720,21 @@ impl GraphController<'_> {
         };
 
         for (v, &lid) in voice_lids.iter().enumerate() {
-            self.app.state.voice_lids[idx][v].store(lid, Ordering::Release);
+            self.app.state.runtime.voice_lids[idx][v].store(lid, Ordering::Release);
         }
-        self.app.state.voice_counts[idx].store(voice_lids.len() as u32, Ordering::Release);
-        self.app.state.sampler_lids[idx]
+        self.app.state.runtime.voice_counts[idx].store(voice_lids.len() as u32, Ordering::Release);
+        self.app.state.runtime.sampler_lids[idx]
             .store(voice_lids.first().copied().unwrap_or(0), Ordering::Release);
-        self.app.state.delay_lids[idx].store(shell.delay_id as u64, Ordering::Release);
-        self.app.state.send_lids[idx].store(shell.send_id as u64, Ordering::Release);
-        self.app.state.instrument_type_flags[idx].store(
+        self.app.state.runtime.delay_lids[idx].store(shell.delay_id as u64, Ordering::Release);
+        self.app.state.runtime.send_lids[idx].store(shell.send_id as u64, Ordering::Release);
+        self.app.state.runtime.instrument_type_flags[idx].store(
             (instrument_type == InstrumentType::Custom) as u32,
             Ordering::Release,
         );
 
         let filter_desc = EffectDescriptor::builtin_filter();
         let delay_desc = EffectDescriptor::builtin_delay();
-        let chain = &self.app.state.effect_chains[idx];
+        let chain = &self.app.state.pattern.effect_chains[idx];
         chain[0].apply_descriptor(&filter_desc, shell.filter_id as u32);
         chain[1].apply_descriptor(&delay_desc, shell.delay_id as u32);
 
@@ -705,12 +752,12 @@ impl GraphController<'_> {
                 buffer_id,
                 sampler_ids,
             } => {
-                self.app.state.track_engine_ids[idx].store(u32::MAX, Ordering::Release);
+                self.app.state.runtime.track_engine_ids[idx].store(u32::MAX, Ordering::Release);
                 if let Some(sound) = self
                     .app
                     .state
-                    .track_sound_state
-                    .lock()
+                    .pattern.track_sound_state
+            .lock()
                     .unwrap()
                     .get_mut(idx)
                 {
@@ -736,12 +783,12 @@ impl GraphController<'_> {
                 engine_id,
                 manifest,
             } => {
-                self.app.state.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
+                self.app.state.runtime.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
                 if let Some(sound) = self
                     .app
                     .state
-                    .track_sound_state
-                    .lock()
+                    .pattern.track_sound_state
+            .lock()
                     .unwrap()
                     .get_mut(idx)
                 {
@@ -771,28 +818,81 @@ impl GraphController<'_> {
             }
         }
 
-        let mut bank = self.app.state.pattern_bank.lock().unwrap();
+        let mut bank = self.app.state.pattern.pattern_bank.lock().unwrap();
         for snap in bank.iter_mut() {
             snap.extend_to_tracks(idx + 1, &self.app.graph.effect_descriptors);
         }
 
         self.app
             .state
-            .num_tracks
+            .transport.num_tracks
             .store((idx + 1) as u32, Ordering::Release);
     }
 
     fn initialize_instrument_slot(&mut self, track: usize, name: &str, manifest: &DGenManifest) {
-        let inst_desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
-        let inst_slot = &self.app.state.instrument_slots[track];
+        let mut inst_desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
+        for param in &mut inst_desc.params {
+            if param.node_param_idx < crate::voice_modulator::MOD_PARAM_BASE {
+                param.node_param_idx += lisp_effect::HEADER_SLOTS as u32;
+            }
+        }
+        inst_desc
+            .params
+            .extend(crate::voice_modulator::ui_param_descriptors());
+        let sorted_modulators = {
+            let mut ms = manifest.modulators.clone();
+            ms.sort_by_key(|m| m.slot);
+            ms
+        };
+        let mod_source_labels: Vec<String> = std::iter::once("off".to_string())
+            .chain(sorted_modulators.iter().map(|m| m.name.clone()))
+            .collect();
+        let param_by_cell: std::collections::HashMap<usize, &crate::lisp_effect::DGenParam> =
+            manifest.params.iter().map(|p| (p.cell_id, p)).collect();
+        for dest in &manifest.mod_destinations {
+            let source_default = param_by_cell
+                .get(&dest.source_cell_id)
+                .map(|p| p.default)
+                .unwrap_or(0.0);
+            let depth_default = param_by_cell
+                .get(&dest.depth_cell_id)
+                .map(|p| p.default)
+                .unwrap_or(0.0);
+            inst_desc.params.push(crate::effects::ParamDescriptor {
+                name: format!("mod {} src", dest.name),
+                min: 0.0,
+                max: sorted_modulators.len() as f32,
+                default: source_default,
+                kind: crate::effects::ParamKind::Enum {
+                    labels: mod_source_labels.clone(),
+                },
+                scaling: crate::effects::ParamScaling::Linear,
+                node_param_idx: (lisp_effect::HEADER_SLOTS + dest.source_cell_id) as u32,
+            });
+            inst_desc.params.push(crate::effects::ParamDescriptor {
+                name: format!("mod {} amt", dest.name),
+                min: dest
+                    .depth_min
+                    .unwrap_or_else(|| param_by_cell.get(&dest.depth_cell_id).map(|p| p.min).unwrap_or(-1.0)),
+                max: dest
+                    .depth_max
+                    .unwrap_or_else(|| param_by_cell.get(&dest.depth_cell_id).map(|p| p.max).unwrap_or(1.0)),
+                default: depth_default,
+                kind: crate::effects::ParamKind::Continuous {
+                    unit: dest.unit.clone(),
+                },
+                scaling: crate::effects::ParamScaling::Linear,
+                node_param_idx: (lisp_effect::HEADER_SLOTS + dest.depth_cell_id) as u32,
+            });
+        }
+        let inst_slot = &self.app.state.pattern.instrument_slots[track];
         inst_slot
             .num_params
-            .store(manifest.params.len() as u32, Ordering::Relaxed);
-        for (i, p) in manifest.params.iter().enumerate() {
+            .store(inst_desc.params.len() as u32, Ordering::Relaxed);
+        for (i, p) in inst_desc.params.iter().enumerate() {
             inst_slot.defaults.set(i, p.default);
             if i < inst_slot.param_node_indices.len() {
-                let node_idx = (lisp_effect::HEADER_SLOTS + p.cell_id) as u32;
-                inst_slot.param_node_indices[i].store(node_idx, Ordering::Relaxed);
+                inst_slot.param_node_indices[i].store(p.node_param_idx, Ordering::Relaxed);
             }
         }
 

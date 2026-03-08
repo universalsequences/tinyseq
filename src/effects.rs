@@ -6,7 +6,7 @@ use crate::sequencer::MAX_STEPS;
 /// Custom instruments can easily exceed 16 params, and sequenced p-lock dispatch
 /// iterates over every declared param. Keep this comfortably above current
 /// instrument sizes so defaults/plocks/node indices stay aligned.
-pub const MAX_SLOT_PARAMS: usize = 64;
+pub const MAX_SLOT_PARAMS: usize = 128;
 
 /// Number of built-in effect slots (Filter, Delay). Slots at this index or higher are custom/lisp.
 pub const BUILTIN_SLOT_COUNT: usize = 2;
@@ -303,6 +303,7 @@ impl EffectDescriptor {
     pub fn from_lisp_manifest(name: &str, params: &[crate::lisp_effect::DGenParam]) -> Self {
         let descriptors = params
             .iter()
+            .filter(|p| !p.hidden)
             .map(|p| ParamDescriptor {
                 name: p.name.clone(),
                 min: p.min,

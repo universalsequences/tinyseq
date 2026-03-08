@@ -125,7 +125,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Span::styled(" REC ", rec_style)), rec_rect);
 
     // ── Info text (rest of row 0, without [pat X/Y]) ──
-    let bpm = app.state.bpm.load(Ordering::Relaxed);
+    let bpm = app.state.transport.bpm.load(Ordering::Relaxed);
 
     let mut spans = vec![Span::styled(
         format!("  {} BPM", bpm),
@@ -134,10 +134,10 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if !app.tracks.is_empty() {
         let track = app.ui.cursor_track;
-        let tp = &app.state.track_params[track];
+        let tp = &app.state.pattern.track_params[track];
         let default_tb = tp.get_timebase();
         let current_step = app.state.track_step(track);
-        let resolved_tb = app.state.timebase_plocks[track].resolve(current_step, default_tb);
+        let resolved_tb = app.state.pattern.timebase_plocks[track].resolve(current_step, default_tb);
         spans.push(Span::styled(
             format!("  {:<3}", resolved_tb.label()),
             Style::default().fg(Color::Yellow),
@@ -155,7 +155,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("  Oct:{}", app.ui.keyboard_octave / 12),
             Style::default().fg(Color::Cyan),
         ));
-        let thresh = f32::from_bits(app.state.record_quantize_thresh.load(Ordering::Relaxed));
+        let thresh = f32::from_bits(app.state.transport.record_quantize_thresh.load(Ordering::Relaxed));
         spans.push(Span::styled(
             format!("  Q:{:.0}%", thresh * 100.0),
             Style::default().fg(Color::Magenta),
@@ -179,8 +179,8 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 
     // ── Row 1: Pattern buttons ──
-    let cur_pat = app.state.current_pattern.load(Ordering::Relaxed) as usize;
-    let num_pats = app.state.num_patterns.load(Ordering::Relaxed) as usize;
+    let cur_pat = app.state.pattern.current_pattern.load(Ordering::Relaxed) as usize;
+    let num_pats = app.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
 
     let row1_y = area.y + 1;
     let row1_w = area.width.saturating_sub(AUDIO_STATUS_WIDTH); // leave room for meter + CPU box
@@ -251,7 +251,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     let meter_width = 20u16;
-    let cpu_width = 11u16;
+    let cpu_width = 9u16;
     let gap_width = 1u16;
     let meter_height = 2u16;
     let total_width = meter_width + gap_width + cpu_width;
@@ -263,9 +263,9 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     let x = cpu_x - gap_width - meter_width;
     let y = area.y;
 
-    let peak_l = f32::from_bits(app.state.peak_l.load(Ordering::Relaxed));
-    let peak_r = f32::from_bits(app.state.peak_r.load(Ordering::Relaxed));
-    let cpu_load_pct = f32::from_bits(app.state.cpu_load_pct.load(Ordering::Relaxed));
+    let peak_l = f32::from_bits(app.state.transport.peak_l.load(Ordering::Relaxed));
+    let peak_r = f32::from_bits(app.state.transport.peak_r.load(Ordering::Relaxed));
+    let cpu_load_pct = f32::from_bits(app.state.transport.cpu_load_pct.load(Ordering::Relaxed));
 
     let bar_width = (meter_width - 3) as usize;
 
@@ -326,11 +326,11 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let cpu_label = Line::from(vec![Span::styled(
-        format!("{:>10}", "CPU"),
+        format!("{:>8}", "CPU"),
         Style::default().fg(Color::DarkGray).bold(),
     )]);
     let cpu_value = Line::from(vec![Span::styled(
-        format!("{:>10.1}%", cpu_load_pct),
+        format!("{:>7}%", cpu_load_pct.round() as i32),
         Style::default().fg(cpu_color).bold(),
     )]);
     frame.render_widget(Paragraph::new(cpu_label), Rect::new(cpu_x, y, cpu_width, 1));

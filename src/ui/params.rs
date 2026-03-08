@@ -30,7 +30,7 @@ impl App {
     }
 
     pub(super) fn handle_track_params_column(&mut self, code: KeyCode) {
-        let tp = &self.state.track_params[self.ui.cursor_track];
+        let tp = &self.state.pattern.track_params[self.ui.cursor_track];
 
         match code {
             KeyCode::Up => {
@@ -47,6 +47,8 @@ impl App {
                 self.ui.params_column = 1;
                 if self.is_current_custom_track()
                     && self.ui.effect_tab != EffectTab::Synth
+                    && self.ui.effect_tab != EffectTab::Mod
+                    && self.ui.effect_tab != EffectTab::Sources
                     && self.ui.effect_tab != EffectTab::Reverb
                 {
                     // Default to Synth tab for custom tracks
@@ -71,7 +73,7 @@ impl App {
                     // Show p-locked value for selected step, or track default
                     let current_tb = if self.has_selection() {
                         let step = self.selected_steps()[0];
-                        self.state.timebase_plocks[self.ui.cursor_track]
+                        self.state.pattern.timebase_plocks[self.ui.cursor_track]
                             .get(step)
                             .unwrap_or(tp.get_timebase())
                     } else {
@@ -109,7 +111,7 @@ impl App {
                 // Clear timebase p-locks on selected steps
                 if self.ui.track_param_cursor == TP_TIMEBASE && self.has_selection() {
                     for step in self.selected_steps() {
-                        self.state.timebase_plocks[self.ui.cursor_track].clear(step);
+                        self.state.pattern.timebase_plocks[self.ui.cursor_track].clear(step);
                     }
                 }
             }
@@ -128,9 +130,9 @@ impl App {
     }
 
     pub(super) fn push_send_gain(&self, track: usize) {
-        let send_lid = self.state.send_lids[track].load(Ordering::Acquire);
+        let send_lid = self.state.runtime.send_lids[track].load(Ordering::Acquire);
         if send_lid != 0 {
-            let tp = &self.state.track_params[track];
+            let tp = &self.state.pattern.track_params[track];
             unsafe {
                 crate::audiograph::params_push_wrapper(
                     self.graph.lg.0,
@@ -146,7 +148,7 @@ impl App {
 
     fn adjust_track_send(&mut self, delta: f32) {
         let track = self.ui.cursor_track;
-        let tp = &self.state.track_params[track];
+        let tp = &self.state.pattern.track_params[track];
         tp.set_send(tp.get_send() + delta);
         self.push_send_gain(track);
     }
@@ -186,9 +188,36 @@ impl App {
         // Synth tab dropdown
         if self.ui.effect_tab == EffectTab::Synth {
             if let Some(desc) = self.current_instrument_descriptor() {
-                if self.ui.instrument_param_cursor < desc.params.len() {
+                if self.ui.instrument_param_cursor > 0 {
+                    let synth_indices = self.synth_param_indices(self.ui.cursor_track);
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1) {
+                        if let crate::effects::ParamKind::Enum { ref labels } =
+                            desc.params[param_idx].kind
+                        {
+                            return labels.len();
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        if self.ui.effect_tab == EffectTab::Mod {
+            if let Some(desc) = self.current_mod_descriptor() {
+                if self.ui.mod_param_cursor < desc.params.len() {
                     if let crate::effects::ParamKind::Enum { ref labels } =
-                        desc.params[self.ui.instrument_param_cursor].kind
+                        desc.params[self.ui.mod_param_cursor].kind
+                    {
+                        return labels.len();
+                    }
+                }
+            }
+            return 0;
+        }
+        if self.ui.effect_tab == EffectTab::Sources {
+            if let Some(desc) = self.current_source_descriptor() {
+                if self.ui.source_param_cursor < desc.params.len() {
+                    if let crate::effects::ParamKind::Enum { ref labels } =
+                        desc.params[self.ui.source_param_cursor].kind
                     {
                         return labels.len();
                     }
@@ -212,11 +241,40 @@ impl App {
         // Synth tab dropdown
         if self.ui.effect_tab == EffectTab::Synth {
             if let Some(desc) = self.current_instrument_descriptor() {
-                if self.ui.instrument_param_cursor < desc.params.len() {
-                    if let crate::effects::ParamKind::Enum { ref labels } =
-                        desc.params[self.ui.instrument_param_cursor].kind
-                    {
-                        return labels;
+                if self.ui.instrument_param_cursor > 0 {
+                    let synth_indices = self.synth_param_indices(self.ui.cursor_track);
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1) {
+                        if let crate::effects::ParamKind::Enum { ref labels } =
+                            desc.params[param_idx].kind
+                        {
+                            return labels;
+                        }
+                    }
+                }
+            }
+            return &[];
+        }
+        if self.ui.effect_tab == EffectTab::Mod {
+            if let Some(desc) = self.current_instrument_descriptor() {
+                let mod_indices = self.mod_param_indices(self.ui.cursor_track);
+                if let Some(&param_idx) = mod_indices.get(self.ui.mod_param_cursor) {
+                    if let Some(param) = desc.params.get(param_idx) {
+                        if let crate::effects::ParamKind::Enum { ref labels } = param.kind {
+                            return labels;
+                        }
+                    }
+                }
+            }
+            return &[];
+        }
+        if self.ui.effect_tab == EffectTab::Sources {
+            if let Some(desc) = self.current_instrument_descriptor() {
+                let source_indices = self.source_param_indices(self.ui.cursor_track);
+                if let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) {
+                    if let Some(param) = desc.params.get(param_idx) {
+                        if let crate::effects::ParamKind::Enum { ref labels } = param.kind {
+                            return labels;
+                        }
                     }
                 }
             }
@@ -240,11 +298,11 @@ impl App {
             if self.has_selection() {
                 // P-lock: set timebase override for selected steps
                 for step in self.selected_steps() {
-                    self.state.timebase_plocks[self.ui.cursor_track].set(step, tb);
+                    self.state.pattern.timebase_plocks[self.ui.cursor_track].set(step, tb);
                 }
             } else {
                 // Track default
-                self.state.track_params[self.ui.cursor_track].set_timebase(tb);
+                self.state.pattern.track_params[self.ui.cursor_track].set_timebase(tb);
             }
             return;
         }
@@ -252,8 +310,14 @@ impl App {
         // Synth tab dropdown
         if self.ui.effect_tab == EffectTab::Synth {
             let val = self.ui.dropdown_cursor as f32;
-            let param_idx = self.ui.instrument_param_cursor;
-            let slot = &self.state.instrument_slots[self.ui.cursor_track];
+            if self.ui.instrument_param_cursor == 0 {
+                return;
+            }
+            let synth_indices = self.synth_param_indices(self.ui.cursor_track);
+            let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1) else {
+                return;
+            };
+            let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
             if self.has_selection() {
                 for step in self.selected_steps() {
                     slot.plocks.set(step, param_idx, val);
@@ -263,6 +327,30 @@ impl App {
                 self.send_instrument_param(self.ui.cursor_track, param_idx, val);
                 self.mark_track_sound_dirty(self.ui.cursor_track);
             }
+            return;
+        }
+        if self.ui.effect_tab == EffectTab::Mod {
+            let val = self.ui.dropdown_cursor as f32;
+            let mod_indices = self.mod_param_indices(self.ui.cursor_track);
+            let Some(&param_idx) = mod_indices.get(self.ui.mod_param_cursor) else {
+                return;
+            };
+            let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
+            slot.defaults.set(param_idx, val);
+            self.send_instrument_param(self.ui.cursor_track, param_idx, val);
+            self.mark_track_sound_dirty(self.ui.cursor_track);
+            return;
+        }
+        if self.ui.effect_tab == EffectTab::Sources {
+            let val = self.ui.dropdown_cursor as f32;
+            let source_indices = self.source_param_indices(self.ui.cursor_track);
+            let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
+                return;
+            };
+            let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
+            slot.defaults.set(param_idx, val);
+            self.send_instrument_param(self.ui.cursor_track, param_idx, val);
+            self.mark_track_sound_dirty(self.ui.cursor_track);
             return;
         }
 
@@ -323,7 +411,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
         return;
     }
 
-    let tp = &app.state.track_params[app.ui.cursor_track];
+    let tp = &app.state.pattern.track_params[app.ui.cursor_track];
     let attack = tp.get_attack_ms();
     let release = tp.get_release_ms();
     let swing = tp.get_swing();
@@ -332,7 +420,7 @@ fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region
     // Show p-locked timebase for selected step, or track default
     let timebase_display = if app.has_selection() {
         let step = app.selected_steps()[0]; // show first selected step's value
-        match app.state.timebase_plocks[app.ui.cursor_track].get(step) {
+        match app.state.pattern.timebase_plocks[app.ui.cursor_track].get(step) {
             Some(tb) => format!("{} [P]", tb.label()),
             None => default_tb.label().to_string(),
         }

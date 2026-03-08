@@ -117,7 +117,7 @@ impl App {
                     {
                         let track = self.ui.cursor_track;
                         for step in self.ui.visual_steps.drain() {
-                            if self.state.patterns[track].is_active(step) {
+                            if self.state.pattern.patterns[track].is_active(step) {
                                 self.state.toggle_step_and_clear_plocks(track, step);
                             }
                         }
@@ -173,8 +173,8 @@ impl App {
                 let was_playing = self.state.is_playing();
                 self.state.toggle_play();
                 if was_playing {
-                    self.state.playhead.store(0, Ordering::Relaxed);
-                    for tph in &self.state.track_playheads {
+                    self.state.transport.playhead.store(0, Ordering::Relaxed);
+                    for tph in &self.state.transport.track_playheads {
                         tph.store(0, Ordering::Relaxed);
                     }
                 }
@@ -190,7 +190,7 @@ impl App {
                         && self.ui.focused_region == Region::Params
                         && self.ui.params_column == 1
                     {
-                        let chain = &self.state.effect_chains[self.ui.cursor_track];
+                        let chain = &self.state.pattern.effect_chains[self.ui.cursor_track];
                         if slot_idx < chain.len()
                             && chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
                         {
@@ -265,7 +265,7 @@ impl App {
                 } else if !self.tracks.is_empty() {
                     self.ui.visual_steps.clear();
                     for step in 0..self.num_steps() {
-                        if self.state.patterns[self.ui.cursor_track].is_active(step) {
+                        if self.state.pattern.patterns[self.ui.cursor_track].is_active(step) {
                             self.ui.visual_steps.insert(step);
                         }
                     }
@@ -339,22 +339,22 @@ impl App {
                     '[' => {
                         // Shift record quantize threshold earlier (compensate for more output latency)
                         let cur = f32::from_bits(
-                            self.state.record_quantize_thresh.load(Ordering::Relaxed),
+                            self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
                         );
                         let new = (cur - 0.05).max(0.1);
                         self.state
-                            .record_quantize_thresh
+                            .transport.record_quantize_thresh
                             .store(new.to_bits(), Ordering::Relaxed);
                         return;
                     }
                     ']' => {
                         // Shift record quantize threshold later
                         let cur = f32::from_bits(
-                            self.state.record_quantize_thresh.load(Ordering::Relaxed),
+                            self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
                         );
                         let new = (cur + 0.05).min(0.9);
                         self.state
-                            .record_quantize_thresh
+                            .transport.record_quantize_thresh
                             .store(new.to_bits(), Ordering::Relaxed);
                         return;
                     }
@@ -379,11 +379,11 @@ impl App {
                             // Round-to-nearest-step using fractional phase from audio thread.
                             // If we're past the quantize threshold within the current step,
                             // snap forward to the next step (the user is anticipating it).
-                            let step = self.state.playhead.load(Ordering::Relaxed);
+                            let step = self.state.transport.playhead.load(Ordering::Relaxed);
                             let phase =
-                                f32::from_bits(self.state.playhead_phase.load(Ordering::Relaxed));
+                                f32::from_bits(self.state.transport.playhead_phase.load(Ordering::Relaxed));
                             let thresh = f32::from_bits(
-                                self.state.record_quantize_thresh.load(Ordering::Relaxed),
+                                self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
                             );
                             let step_now = if phase >= thresh {
                                 step.wrapping_add(1) as usize
@@ -492,7 +492,7 @@ impl App {
         if rect_contains(l.info_bar, col, row) {
             self.state.toggle_play();
             if !self.state.is_playing() {
-                self.state.playhead.store(0, Ordering::Relaxed);
+                self.state.transport.playhead.store(0, Ordering::Relaxed);
             }
             return;
         }
@@ -555,7 +555,7 @@ impl App {
                             }
                             self.clamp_cursor_to_steps();
                             // Adjust page if current page is now past the end
-                            let num_pats = self.state.num_patterns.load(Ordering::Relaxed) as usize;
+                            let num_pats = self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
                             let max_page = num_pats.saturating_sub(1) / 10;
                             if self.ui.pattern_page > max_page {
                                 self.ui.pattern_page = max_page;
@@ -628,19 +628,19 @@ impl App {
                 self.ui.track_param_cursor = row_idx;
                 let start_display_value = match row_idx {
                     super::TP_ATTACK => {
-                        Some(self.state.track_params[self.ui.cursor_track].get_attack_ms())
+                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_attack_ms())
                     }
                     super::TP_RELEASE => {
-                        Some(self.state.track_params[self.ui.cursor_track].get_release_ms())
+                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_release_ms())
                     }
                     super::TP_SWING => {
-                        Some(self.state.track_params[self.ui.cursor_track].get_swing())
+                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_swing())
                     }
                     super::TP_STEPS => {
-                        Some(self.state.track_params[self.ui.cursor_track].get_num_steps() as f32)
+                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_num_steps() as f32)
                     }
                     super::TP_SEND => {
-                        Some(self.state.track_params[self.ui.cursor_track].get_send())
+                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_send())
                     }
                     _ => None,
                 };
@@ -678,6 +678,12 @@ impl App {
                     if tab == EffectTab::Synth {
                         self.ui.instrument_param_cursor = 0;
                         self.ui.synth_scroll_offset = 0;
+                    } else if tab == EffectTab::Mod {
+                        self.ui.mod_param_cursor = 0;
+                        self.ui.mod_scroll_offset = 0;
+                    } else if tab == EffectTab::Sources {
+                        self.ui.source_param_cursor = 0;
+                        self.ui.source_scroll_offset = 0;
                     } else if tab == EffectTab::Reverb {
                         self.ui.reverb_param_cursor = 0;
                     } else {
@@ -704,6 +710,72 @@ impl App {
                         self.ui.param_mouse_drag = Some(ParamMouseDrag {
                             track: self.ui.cursor_track,
                             target: ParamMouseDragTarget::SynthParam { row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
+                    }
+                }
+            } else if self.ui.effect_tab == EffectTab::Mod {
+                if let Some(row_idx) = self.mod_row_at_position(l.effects_inner, col, row) {
+                    self.ui.focused_region = Region::Params;
+                    self.ui.params_column = 1;
+                    self.ui.mod_param_cursor = row_idx;
+                    self.ensure_mod_cursor_visible();
+                    if let Some(desc) = self.current_mod_descriptor() {
+                        if let Some(param) = desc.params.get(row_idx) {
+                            if param.is_enum() {
+                                self.ui.dropdown_open = true;
+                                self.ui.dropdown_cursor = 0;
+                                self.ui.input_mode = InputMode::Dropdown;
+                                let actual_idx = self.mod_param_indices(self.ui.cursor_track)[row_idx];
+                                let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
+                                let val = slot.defaults.get(actual_idx);
+                                self.ui.dropdown_cursor = val.round() as usize;
+                                self.ui.param_mouse_drag = None;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(start_display_value) =
+                        self.mod_row_display_value(self.ui.cursor_track, row_idx)
+                    {
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::ModParam { row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
+                    }
+                }
+            } else if self.ui.effect_tab == EffectTab::Sources {
+                if let Some(row_idx) = self.source_row_at_position(l.effects_inner, col, row) {
+                    self.ui.focused_region = Region::Params;
+                    self.ui.params_column = 1;
+                    self.ui.source_param_cursor = row_idx;
+                    self.ensure_source_cursor_visible();
+                    if let Some(desc) = self.current_source_descriptor() {
+                        if let Some(param) = desc.params.get(row_idx) {
+                            if param.is_enum() {
+                                self.ui.dropdown_open = true;
+                                self.ui.dropdown_cursor = 0;
+                                self.ui.input_mode = InputMode::Dropdown;
+                                let actual_idx =
+                                    self.source_param_indices(self.ui.cursor_track)[row_idx];
+                                let slot =
+                                    &self.state.pattern.instrument_slots[self.ui.cursor_track];
+                                let val = slot.defaults.get(actual_idx);
+                                self.ui.dropdown_cursor = val.round() as usize;
+                                self.ui.param_mouse_drag = None;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(start_display_value) =
+                        self.source_row_display_value(self.ui.cursor_track, row_idx)
+                    {
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::SourceParam { row_idx },
                             start_col: col,
                             start_display_value,
                         });
@@ -797,20 +869,52 @@ impl App {
             return;
         }
 
-        if rect_contains(l.effects_inner, col, row) && self.ui.effect_tab == EffectTab::Synth {
-            let visible = self.synth_visible_capacity(l.effects_inner);
-            if visible == 0 {
-                return;
-            }
-            let max_scroll = self.synth_row_count().saturating_sub(visible);
-            if delta < 0 {
-                self.ui.synth_scroll_offset = self
-                    .ui
-                    .synth_scroll_offset
-                    .saturating_sub((-delta) as usize);
-            } else {
-                self.ui.synth_scroll_offset =
-                    (self.ui.synth_scroll_offset + delta as usize).min(max_scroll);
+        if rect_contains(l.effects_inner, col, row) {
+            if self.ui.effect_tab == EffectTab::Synth {
+                let visible = self.synth_visible_capacity(l.effects_inner);
+                if visible == 0 {
+                    return;
+                }
+                let max_scroll = self.synth_row_count().saturating_sub(visible);
+                if delta < 0 {
+                    self.ui.synth_scroll_offset = self
+                        .ui
+                        .synth_scroll_offset
+                        .saturating_sub((-delta) as usize);
+                } else {
+                    self.ui.synth_scroll_offset =
+                        (self.ui.synth_scroll_offset + delta as usize).min(max_scroll);
+                }
+            } else if self.ui.effect_tab == EffectTab::Mod {
+                let visible = self.synth_visible_capacity(l.effects_inner);
+                if visible == 0 {
+                    return;
+                }
+                let max_scroll = self.mod_row_count().saturating_sub(visible);
+                if delta < 0 {
+                    self.ui.mod_scroll_offset = self
+                        .ui
+                        .mod_scroll_offset
+                        .saturating_sub((-delta) as usize);
+                } else {
+                    self.ui.mod_scroll_offset =
+                        (self.ui.mod_scroll_offset + delta as usize).min(max_scroll);
+                }
+            } else if self.ui.effect_tab == EffectTab::Sources {
+                let visible = self.synth_visible_capacity(l.effects_inner);
+                if visible == 0 {
+                    return;
+                }
+                let max_scroll = self.source_row_count().saturating_sub(visible);
+                if delta < 0 {
+                    self.ui.source_scroll_offset = self
+                        .ui
+                        .source_scroll_offset
+                        .saturating_sub((-delta) as usize);
+                } else {
+                    self.ui.source_scroll_offset =
+                        (self.ui.source_scroll_offset + delta as usize).min(max_scroll);
+                }
             }
         }
     }
@@ -874,6 +978,18 @@ impl App {
                 return Some(EffectTabHit::Tab(EffectTab::Synth));
             }
             x += synth_width + 1; // matches the " " separator in rendering
+
+            let mod_width: u16 = 11; // "[< Mod >]" or "[  Mod  ]"
+            if col >= x && col < x + mod_width {
+                return Some(EffectTabHit::Tab(EffectTab::Mod));
+            }
+            x += mod_width + 1;
+
+            let sources_width: u16 = 13; // "[< Sources >]" or "[  Sources  ]"
+            if col >= x && col < x + sources_width {
+                return Some(EffectTabHit::Tab(EffectTab::Sources));
+            }
+            x += sources_width + 1;
         }
 
         for &i in &visible {
@@ -949,7 +1065,7 @@ impl App {
     fn apply_value_entry(&mut self, val: f32) {
         if self.ui.bpm_entry {
             let bpm = (val as u32).clamp(20, 999);
-            self.state.bpm.store(bpm, Ordering::Relaxed);
+            self.state.transport.bpm.store(bpm, Ordering::Relaxed);
             self.ui.bpm_entry = false;
             return;
         }
@@ -960,14 +1076,14 @@ impl App {
 
         match self.ui.focused_region {
             Region::Cirklon => {
-                let sd = &self.state.step_data[self.ui.cursor_track];
+                let sd = &self.state.pattern.step_data[self.ui.cursor_track];
                 for step in self.selected_steps() {
                     sd.set(step, self.ui.active_param, val);
                 }
             }
             Region::Params => {
                 if self.ui.params_column == 0 {
-                    let tp = &self.state.track_params[self.ui.cursor_track];
+                    let tp = &self.state.pattern.track_params[self.ui.cursor_track];
                     match self.ui.track_param_cursor {
                         super::TP_ATTACK => tp.set_attack_ms(val),
                         super::TP_RELEASE => tp.set_release_ms(val),
@@ -984,26 +1100,60 @@ impl App {
                     }
                 } else if self.ui.effect_tab == EffectTab::Reverb {
                     self.set_reverb_param(self.ui.reverb_param_cursor, val);
+                } else if self.ui.effect_tab == EffectTab::Mod {
+                    let track = self.ui.cursor_track;
+                    let mod_indices = self.mod_param_indices(track);
+                    let Some(&param_idx) = mod_indices.get(self.ui.mod_param_cursor) else {
+                        return;
+                    };
+                    let desc = match self.graph.instrument_descriptors.get(track) {
+                        Some(d) => d,
+                        None => return,
+                    };
+                    let param_desc = &desc.params[param_idx];
+                    let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
+                    let slot = &self.state.pattern.instrument_slots[track];
+                    slot.defaults.set(param_idx, store_val);
+                    self.send_instrument_param(track, param_idx, store_val);
+                    self.mark_track_sound_dirty(track);
+                } else if self.ui.effect_tab == EffectTab::Sources {
+                    let track = self.ui.cursor_track;
+                    let source_indices = self.source_param_indices(track);
+                    let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
+                        return;
+                    };
+                    let desc = match self.graph.instrument_descriptors.get(track) {
+                        Some(d) => d,
+                        None => return,
+                    };
+                    let param_desc = &desc.params[param_idx];
+                    let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
+                    let slot = &self.state.pattern.instrument_slots[track];
+                    slot.defaults.set(param_idx, store_val);
+                    self.send_instrument_param(track, param_idx, store_val);
+                    self.mark_track_sound_dirty(track);
                 } else if self.ui.effect_tab == EffectTab::Synth {
                     // Synth tab value entry
                     let track = self.ui.cursor_track;
                     if self.ui.instrument_param_cursor == 0 {
                         let store_val = val.clamp(-48.0, 48.0);
-                        self.state.instrument_base_note_offsets[track]
+                        self.state.pattern.instrument_base_note_offsets[track]
                             .store(store_val.to_bits(), Ordering::Relaxed);
                         self.mark_track_sound_dirty(track);
                     } else {
-                        let param_idx = self.ui.instrument_param_cursor - 1;
+                        let synth_indices = self.synth_param_indices(track);
+                        let Some(&param_idx) =
+                            synth_indices.get(self.ui.instrument_param_cursor - 1)
+                        else {
+                            return;
+                        };
                         let desc = match self.graph.instrument_descriptors.get(track) {
                             Some(d) => d,
                             None => return,
                         };
-                        if param_idx >= desc.params.len() {
-                            return;
-                        }
                         let param_desc = &desc.params[param_idx];
                         let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
-                        let slot = &self.state.instrument_slots[track];
+                        let slot = &self.state.pattern.instrument_slots[track];
 
                         if self.has_selection() {
                             for step in self.selected_steps() {
@@ -1038,7 +1188,7 @@ impl App {
                     let param_desc = &desc.params[param_idx];
                     let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
 
-                    let chain = &self.state.effect_chains[track];
+                    let chain = &self.state.pattern.effect_chains[track];
                     if slot_idx >= chain.len() {
                         return;
                     }
@@ -1062,7 +1212,7 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
-        let sd = &self.state.step_data[self.ui.cursor_track];
+        let sd = &self.state.pattern.step_data[self.ui.cursor_track];
         for step in self.selected_steps() {
             let cur = sd.get(step, self.ui.active_param);
             sd.set(step, self.ui.active_param, cur + delta);
@@ -1133,7 +1283,7 @@ impl App {
                 } else if let Ok(n) = self.ui.value_buffer.parse::<usize>() {
                     if n >= 1 {
                         let num_tracks = self.tracks.len();
-                        let num_patterns = self.state.num_patterns.load(Ordering::Relaxed) as usize;
+                        let num_patterns = self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
                         let idx = n - 1;
                         if idx < num_patterns {
                             if let Some(sample_ids) = self.state.switch_pattern(
@@ -1311,7 +1461,7 @@ impl App {
                 let was_playing = self.state.is_playing();
                 self.state.toggle_play();
                 if was_playing {
-                    self.state.playhead.store(0, Ordering::Relaxed);
+                    self.state.transport.playhead.store(0, Ordering::Relaxed);
                 }
             }
             KeyCode::Esc | KeyCode::Enter => {
@@ -1345,7 +1495,7 @@ impl App {
                         let track = self.ui.cursor_track;
                         let ns = self.num_steps();
                         for step in 0..ns {
-                            if self.state.patterns[track].is_active(step) {
+                            if self.state.pattern.patterns[track].is_active(step) {
                                 self.state.toggle_step_and_clear_plocks(track, step);
                             }
                         }
@@ -1360,19 +1510,19 @@ impl App {
                 if let Some(step) = self.resolve_mode_step(c) {
                     let track = self.ui.cursor_track;
                     let is_accent = has_shift || Self::is_accent_key(c);
-                    let is_active = self.state.patterns[track].is_active(step);
+                    let is_active = self.state.pattern.patterns[track].is_active(step);
 
                     if is_active && is_accent {
                         // Already active + accent: lift velocity to 1.0 instead of toggling off
-                        self.state.step_data[track].set(step, StepParam::Velocity, 1.0);
+                        self.state.pattern.step_data[track].set(step, StepParam::Velocity, 1.0);
                     } else if is_active {
                         // Already active + no accent: toggle off
                         self.state.toggle_step_and_clear_plocks(track, step);
                     } else {
                         // Inactive: toggle on with appropriate velocity
-                        self.state.patterns[track].toggle_step(step);
+                        self.state.pattern.patterns[track].toggle_step(step);
                         let vel = if is_accent { 1.0 } else { 0.5 };
-                        self.state.step_data[track].set(step, StepParam::Velocity, vel);
+                        self.state.pattern.step_data[track].set(step, StepParam::Velocity, vel);
                     }
                     self.ui.cursor_step = step;
                 }
@@ -1403,7 +1553,7 @@ impl App {
                 let was_playing = self.state.is_playing();
                 self.state.toggle_play();
                 if was_playing {
-                    self.state.playhead.store(0, Ordering::Relaxed);
+                    self.state.transport.playhead.store(0, Ordering::Relaxed);
                 }
             }
             KeyCode::Esc | KeyCode::Enter => {
@@ -1419,7 +1569,7 @@ impl App {
                 // Delete: untoggle all selected steps
                 let track = self.ui.cursor_track;
                 for &step in &self.ui.visual_steps {
-                    if self.state.patterns[track].is_active(step) {
+                    if self.state.pattern.patterns[track].is_active(step) {
                         self.state.toggle_step_and_clear_plocks(track, step);
                     }
                 }
@@ -1543,7 +1693,7 @@ impl App {
         }
 
         // Compute duration in 1/16th note units from hold time
-        let bpm = self.state.bpm.load(Ordering::Relaxed) as f64;
+        let bpm = self.state.transport.bpm.load(Ordering::Relaxed) as f64;
         let secs_per_step = 60.0 / bpm / 4.0; // duration of one 1/16th note
         let hold_secs = press_time.elapsed().as_secs_f64();
         let duration_steps = (hold_secs / secs_per_step).max(0.15).min(64.0);
@@ -1552,20 +1702,20 @@ impl App {
             if !*armed {
                 continue;
             }
-            let num_steps = self.state.track_params[track].get_num_steps();
+            let num_steps = self.state.pattern.track_params[track].get_num_steps();
             let local_step = step_at_press % num_steps;
             // Enable step trigger
-            if !self.state.patterns[track].is_active(local_step) {
-                self.state.patterns[track].toggle_step(local_step);
+            if !self.state.pattern.patterns[track].is_active(local_step) {
+                self.state.pattern.patterns[track].toggle_step(local_step);
             }
             // Add note to chord data (supports multiple notes per step)
-            self.state.chord_data[track].add_note(local_step, transpose);
+            self.state.pattern.chord_data[track].add_note(local_step, transpose);
             // Keep StepData::Transpose in sync with first chord note for bar display
-            let first_note = self.state.chord_data[track].get(local_step, 0);
-            self.state.step_data[track].set(local_step, StepParam::Transpose, first_note);
+            let first_note = self.state.pattern.chord_data[track].get(local_step, 0);
+            self.state.pattern.step_data[track].set(local_step, StepParam::Transpose, first_note);
             // Set velocity and duration p-locks
-            self.state.step_data[track].set(local_step, StepParam::Velocity, 1.0);
-            self.state.step_data[track].set(local_step, StepParam::Duration, duration_steps as f32);
+            self.state.pattern.step_data[track].set(local_step, StepParam::Velocity, 1.0);
+            self.state.pattern.step_data[track].set(local_step, StepParam::Duration, duration_steps as f32);
         }
     }
 }

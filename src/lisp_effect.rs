@@ -162,6 +162,9 @@ pub struct DGenManifest {
     pub dylib_path: PathBuf,
     pub total_memory_slots: usize,
     pub params: Vec<DGenParam>,
+    pub inputs: Vec<DGenInput>,
+    pub modulators: Vec<DGenModulator>,
+    pub mod_destinations: Vec<DGenModDestination>,
     pub n_inputs: usize,
     pub n_outputs: usize,
     pub tensor_init_data: Vec<TensorInit>,
@@ -177,12 +180,40 @@ pub struct DGenParam {
     pub min: f32,
     pub max: f32,
     pub unit: Option<String>,
+    pub hidden: bool,
 }
 
 #[derive(Clone)]
 pub struct TensorInit {
     pub offset: usize,
     pub data: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub struct DGenInput {
+    pub channel: usize,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct DGenModulator {
+    pub slot: usize,
+    pub input_channel: usize,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct DGenModDestination {
+    pub name: String,
+    pub param_cell_id: usize,
+    pub source_cell_id: usize,
+    pub depth_cell_id: usize,
+    pub mode: String,
+    pub min: f32,
+    pub max: f32,
+    pub unit: Option<String>,
+    pub depth_min: Option<f32>,
+    pub depth_max: Option<f32>,
 }
 
 // ── Loaded dylib handle ──
@@ -335,12 +366,62 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
                     min: p["min"].as_f64().unwrap_or(0.0) as f32,
                     max: p["max"].as_f64().unwrap_or(1.0) as f32,
                     unit: p["unit"].as_str().map(|s| s.to_string()),
+                    hidden: p["hidden"].as_bool().unwrap_or(false),
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    let n_inputs = v["inputs"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
+    let inputs: Vec<DGenInput> = v["inputs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|inp| DGenInput {
+                    channel: inp["channel"].as_u64().unwrap_or(0) as usize,
+                    name: inp["name"].as_str().unwrap_or("").to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let modulators = v["modulators"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|m| DGenModulator {
+                    slot: m["slot"].as_u64().unwrap_or(0) as usize,
+                    input_channel: m["inputChannel"].as_u64().unwrap_or(0) as usize,
+                    name: m["name"].as_str().unwrap_or("").to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mod_destinations = v["modDestinations"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|m| DGenModDestination {
+                    name: m["name"].as_str().unwrap_or("").to_string(),
+                    param_cell_id: m["paramCellId"].as_u64().unwrap_or(0) as usize,
+                    source_cell_id: m["sourceCellId"].as_u64().unwrap_or(0) as usize,
+                    depth_cell_id: m["depthCellId"].as_u64().unwrap_or(0) as usize,
+                    mode: m["mode"].as_str().unwrap_or("").to_string(),
+                    min: m["min"].as_f64().unwrap_or(0.0) as f32,
+                    max: m["max"].as_f64().unwrap_or(1.0) as f32,
+                    unit: m["unit"].as_str().map(|s| s.to_string()),
+                    depth_min: m["depthMin"].as_f64().map(|v| v as f32),
+                    depth_max: m["depthMax"].as_f64().map(|v| v as f32),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let n_inputs = inputs
+        .iter()
+        .map(|inp| inp.channel + 1)
+        .max()
+        .unwrap_or(1);
     let n_outputs = v["outputs"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
 
     let tensor_init_data = v["tensorInitData"]
@@ -364,6 +445,9 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
         dylib_path,
         total_memory_slots: v["totalMemorySlots"].as_u64().unwrap_or(256) as usize,
         params,
+        inputs,
+        modulators,
+        mod_destinations,
         n_inputs,
         n_outputs,
         tensor_init_data,
@@ -890,9 +974,20 @@ pub fn load_instrument_source(name: &str) -> io::Result<String> {
 const INSTRUMENT_PREAMBLE: &str = r#"; Shared instrument helpers injected at compile time.
 ; Assumes 44.1 kHz for envelope coefficient conversion.
 
-(def trigger (in 4 @name trigger))
+(defmacro mod_unipolar (m)
+  (* (+ m 1.0) 0.5))
 
-(defmacro adsr (attack_ms decay_ms sustain release_ms)
+(defmacro apply_pitch_mod_semi (base_hz mod amt_semi)
+  (def ln2 (log 2))
+  (* base_hz (exp (* ln2 (/ (* mod amt_semi) 12)))))
+
+(defmacro apply_cutoff_mod_safe (base mod amt)
+  (min 11000 (max 60 (+ base (* mod amt)))))
+
+(defmacro apply_pw_mod_safe (base mod amt)
+  (clip (+ base (* mod amt)) 0.03 0.97))
+
+(defmacro adsr (gate_sig trigger_sig attack_ms decay_ms sustain release_ms)
   (make-history env)
   (make-history gate_hist)
   (make-history stage_hist)
@@ -906,9 +1001,9 @@ const INSTRUMENT_PREAMBLE: &str = r#"; Shared instrument helpers injected at com
   (def prev_gate (read-history gate_hist))
   (def prev_stage (read-history stage_hist))
 
-  (def gate_on (gt gate 0.5))
+  (def gate_on (gt gate_sig 0.5))
   (def gate_rising (* gate_on (lte prev_gate 0.5)))
-  (def retrigger (max gate_rising trigger))
+  (def retrigger (max gate_rising trigger_sig))
   (def attack_stage 1.0)
   (def decay_stage 2.0)
   (def attack_done (gte prev_env 0.999))
@@ -936,7 +1031,7 @@ const INSTRUMENT_PREAMBLE: &str = r#"; Shared instrument helpers injected at com
   (def level_raw (+ prev_env (* rate (- target prev_env))))
   (def level (clip level_raw 0 1))
   (write-history env level)
-  (write-history gate_hist gate)
+  (write-history gate_hist gate_sig)
   (write-history stage_hist stage)
   level)
 "#;
@@ -987,15 +1082,22 @@ pub fn compile_and_load_instrument(
 
 // ── Instrument editor flow ──
 
-const INSTRUMENT_TEMPLATE: &str = r#"; DGenLisp instrument — generates audio from gate, pitch, velocity, and trigger
-; Inputs: gate (ch 1), pitch_hz (ch 2), velocity (ch 3)
-; Helper input injected at compile time: trigger (ch 4)
+const INSTRUMENT_TEMPLATE: &str = r#"; DGenLisp instrument — generates audio from gate, pitch, velocity, trigger, and shared mod buses
+; Inputs: gate (ch 1), pitch_hz (ch 2), velocity (ch 3), trigger (ch 4)
+; Mod inputs: mod1..mod6 (ch 5..10)
 ; Output: audio (ch 1)
-; Helpers injected at compile time: (adsr attack_ms decay_ms sustain release_ms)
+; Helpers injected at compile time: adsr/modulation macros
 
 (def gate (in 1 @name gate))
 (def pitch (in 2 @name pitch))
 (def velocity (in 3 @name velocity))
+(def trigger (in 4 @name trigger))
+(def mod1 (in 5 @name mod1 @modulator 1))
+(def mod2 (in 6 @name mod2 @modulator 2))
+(def mod3 (in 7 @name mod3 @modulator 3))
+(def mod4 (in 8 @name mod4 @modulator 4))
+(def mod5 (in 9 @name mod5 @modulator 5))
+(def mod6 (in 10 @name mod6 @modulator 6))
 (def osc (sin (* (phasor pitch) twopi)))
 (out (* osc gate velocity) 1 @name audio)
 "#;

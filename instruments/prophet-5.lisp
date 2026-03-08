@@ -1,11 +1,17 @@
 ; Prophet-5 inspired polysynth
-; Inputs: gate (ch 1), pitch_hz (ch 2), velocity (ch 3)
-; Helper input injected at compile time: trigger (ch 4)
-; Helper macro injected at compile time: (adsr attack_ms decay_ms sustain release_ms)
+; Refactored for the shared modulation system:
+; synth params define the base voice, Mod routes mod1..mod6 into tagged destinations.
 
 (def gate (in 1 @name gate))
 (def pitch (in 2 @name pitch))
 (def velocity (in 3 @name velocity))
+(def trigger (in 4 @name trigger))
+(def mod1 (in 5 @name mod1 @modulator 1))
+(def mod2 (in 6 @name mod2 @modulator 2))
+(def mod3 (in 7 @name mod3 @modulator 3))
+(def mod4 (in 8 @name mod4 @modulator 4))
+(def mod5 (in 9 @name mod5 @modulator 5))
+(def mod6 (in 10 @name mod6 @modulator 6))
 
 (defmacro pulse_from_phase (phase width)
   (scale (lt phase width) 0 1 -1 1))
@@ -29,67 +35,47 @@
 (param filt_sustain     @default 0.0  @min 0    @max 1)
 (param filt_release_ms  @default 320  @min 1    @max 5000 @unit ms)
 
-(param cutoff           @default 920  @min 30   @max 12000 @unit Hz)
-(param resonance        @default 1.0  @min 0.3  @max 4.5)
-(param filter_env_amt   @default 1800 @min -5000 @max 5000 @unit Hz)
-(param keytrack         @default 0.4  @min 0    @max 2)
-(param filter_vel_amt   @default 0.35 @min 0    @max 1)
-(param filter_drive     @default 1.25 @min 0.5  @max 4)
+(param cutoff           @default 920   @min 30    @max 12000 @unit Hz @mod true @mod-mode additive)
+(param resonance        @default 1.0   @min 0.3   @max 4.5 @mod true @mod-mode additive)
+(param filter_env_amt   @default 1800  @min -5000 @max 5000 @unit Hz @mod true @mod-mode additive)
+(param keytrack         @default 0.4   @min 0     @max 2)
+(param filter_vel_amt   @default 0.35  @min 0     @max 1)
+(param filter_drive     @default 1.25  @min 0.5   @max 4 @mod true @mod-mode additive)
 
-(param osc_a_level      @default 0.8  @min 0    @max 1)
-(param osc_b_level      @default 0.75 @min 0    @max 1)
-(param noise_level      @default 0.02 @min 0    @max 0.4)
+(param osc_a_level      @default 0.8   @min 0     @max 1 @mod true @mod-mode additive)
+(param osc_b_level      @default 0.75  @min 0     @max 1 @mod true @mod-mode additive)
+(param noise_level      @default 0.02  @min 0     @max 0.4 @mod true @mod-mode additive)
 
-(param osc_a_semi       @default 0    @min -24  @max 24 @unit st)
-(param osc_b_semi       @default 0    @min -36  @max 36 @unit st)
-(param osc_a_fine_cents @default 0    @min -50  @max 50 @unit cents)
-(param osc_b_fine_cents @default 2    @min -50  @max 50 @unit cents)
+(param osc_a_semi       @default 0     @min -24   @max 24 @unit st @mod true @mod-mode additive)
+(param osc_b_semi       @default 0     @min -36   @max 36 @unit st @mod true @mod-mode additive)
+(param osc_a_fine_cents @default 0     @min -50   @max 50 @unit cents @mod true @mod-mode additive)
+(param osc_b_fine_cents @default 2     @min -50   @max 50 @unit cents @mod true @mod-mode additive)
 
-(param osc_a_saw        @default 1    @min 0    @max 1)
-(param osc_a_pulse      @default 0    @min 0    @max 1)
-(param osc_b_saw        @default 1    @min 0    @max 1)
-(param osc_b_tri        @default 0    @min 0    @max 1)
-(param osc_b_pulse      @default 0    @min 0    @max 1)
+(param osc_a_saw        @default 1     @min 0     @max 1 @mod true @mod-mode additive)
+(param osc_a_pulse      @default 0     @min 0     @max 1 @mod true @mod-mode additive)
+(param osc_b_saw        @default 1     @min 0     @max 1 @mod true @mod-mode additive)
+(param osc_b_tri        @default 0     @min 0     @max 1 @mod true @mod-mode additive)
+(param osc_b_pulse      @default 0     @min 0     @max 1 @mod true @mod-mode additive)
 
-(param osc_a_pw         @default 0.5  @min 0.05 @max 0.95)
-(param osc_b_pw         @default 0.5  @min 0.05 @max 0.95)
-(param sync             @default 0    @min 0    @max 1)
+(param osc_a_pw         @default 0.5   @min 0.05  @max 0.95 @mod true @mod-mode additive)
+(param osc_b_pw         @default 0.5   @min 0.05  @max 0.95 @mod true @mod-mode additive)
+(param sync             @default 0     @min 0     @max 1 @mod true @mod-mode additive)
 
-(param osc_b_keytrack   @default 1    @min 0    @max 1)
-(param osc_b_lfo_mode   @default 0    @min 0    @max 1)
-(param osc_b_lfo_rate   @default 7    @min 0.05 @max 40 @unit Hz)
+(param env_pitch_amt    @default 0     @min -24   @max 24 @unit st @mod true @mod-mode additive)
+(param poly_pitch_amt   @default 0     @min -24   @max 24 @unit st @mod true @mod-mode additive)
+(param env_pw_amt       @default 0     @min -0.45 @max 0.45 @mod true @mod-mode additive)
+(param poly_pw_amt      @default 0     @min -0.45 @max 0.45 @mod true @mod-mode additive)
+(param poly_filter_amt  @default 0     @min -4000 @max 4000 @unit Hz @mod true @mod-mode additive)
 
-(param lfo_rate         @default 4.8  @min 0.05 @max 20 @unit Hz)
-(param lfo_tri          @default 1    @min 0    @max 1)
-(param lfo_saw          @default 0    @min 0    @max 1)
-(param lfo_square       @default 0    @min 0    @max 1)
-(param lfo_to_a_st      @default 0    @min -2   @max 2 @unit st)
-(param lfo_to_b_st      @default 0    @min -2   @max 2 @unit st)
-(param lfo_to_a_pw      @default 0    @min -0.45 @max 0.45)
-(param lfo_to_b_pw      @default 0    @min -0.45 @max 0.45)
-(param lfo_to_filter    @default 0    @min -2500 @max 2500 @unit Hz)
+(param osc_b_keytrack   @default 1     @min 0     @max 1)
+(param amp_vel_amt      @default 0.35  @min 0     @max 1)
+(param vintage          @default 0.12  @min 0     @max 1)
+(param gain             @default 0.16  @min 0     @max 1)
 
-(param poly_env_to_a_st  @default 0    @min -24  @max 24 @unit st)
-(param poly_oscb_to_a_st @default 0    @min -24  @max 24 @unit st)
-(param poly_env_to_a_pw  @default 0    @min -0.45 @max 0.45)
-(param poly_oscb_to_a_pw @default 0    @min -0.45 @max 0.45)
-(param poly_env_to_filter @default 0   @min -4000 @max 4000 @unit Hz)
-(param poly_oscb_to_filter @default 0  @min -4000 @max 4000 @unit Hz)
-
-(param amp_vel_amt      @default 0.35 @min 0    @max 1)
-(param vintage          @default 0.12 @min 0    @max 1)
-(param gain             @default 0.16 @min 0    @max 1)
-
-(def amp_env (adsr amp_attack_ms amp_decay_ms amp_sustain amp_release_ms))
-(def filt_env (adsr filt_attack_ms filt_decay_ms filt_sustain filt_release_ms))
+(def amp_env (adsr gate trigger amp_attack_ms amp_decay_ms amp_sustain amp_release_ms))
+(def filt_env (adsr gate trigger filt_attack_ms filt_decay_ms filt_sustain filt_release_ms))
 
 (def ln2 (log 2))
-
-(def lfo_phase (phasor lfo_rate))
-(def lfo_tri_sig (triangle lfo_phase))
-(def lfo_saw_sig (scale lfo_phase 0 1 -1 1))
-(def lfo_square_sig (pulse_from_phase lfo_phase 0.5))
-(def lfo_mod (weighted_mix3 lfo_tri_sig lfo_tri lfo_saw_sig lfo_saw lfo_square_sig lfo_square))
 
 (def note_rand_a (latch (noise) trigger))
 (def note_rand_b (latch (noise) trigger))
@@ -101,53 +87,68 @@
 (def drift_pw (* note_rand_pw vintage 0.04))
 (def drift_cutoff (* note_rand_cutoff vintage 180))
 
-(def osc_b_pitch_semi (+ osc_b_semi (/ (+ osc_b_fine_cents drift_b_cents) 100)))
+(def osc_b_pitch_semi (+ (mod osc_b_semi) (/ (+ (mod osc_b_fine_cents) drift_b_cents) 100)))
 (def osc_b_ratio (exp (* ln2 (/ osc_b_pitch_semi 12))))
-(def osc_b_keyboard_freq (* (mix 440.0 pitch osc_b_keytrack) osc_b_ratio))
-(def osc_b_freq (mix osc_b_keyboard_freq osc_b_lfo_rate osc_b_lfo_mode))
+(def osc_b_freq (* (mix 440.0 pitch osc_b_keytrack) osc_b_ratio))
 
 (def osc_b_phase (phasor osc_b_freq))
 (make-history osc_b_phase_hist)
 (def osc_b_phase_prev (read-history osc_b_phase_hist))
-(def osc_b_wrap (* (gt sync 0.5) (lt osc_b_phase osc_b_phase_prev)))
+(def osc_b_wrap (* (gt (mod sync) 0.5) (lt osc_b_phase osc_b_phase_prev)))
 (write-history osc_b_phase_hist osc_b_phase)
 
-(def osc_b_pw_mod (clip (+ osc_b_pw (* lfo_mod lfo_to_b_pw) drift_pw) 0.04 0.96))
+(def osc_b_pw_ctl (clip (+ (mod osc_b_pw) drift_pw) 0.04 0.96))
 (def osc_b_saw_sig (scale osc_b_phase 0 1 -1 1))
 (def osc_b_tri_sig (triangle osc_b_phase))
-(def osc_b_pulse_sig (pulse_from_phase osc_b_phase osc_b_pw_mod))
-(def osc_b_mix (weighted_mix3 osc_b_saw_sig osc_b_saw osc_b_tri_sig osc_b_tri osc_b_pulse_sig osc_b_pulse))
+(def osc_b_pulse_sig (pulse_from_phase osc_b_phase osc_b_pw_ctl))
+(def osc_b_mix
+  (weighted_mix3
+    osc_b_saw_sig (clip (mod osc_b_saw) 0 1)
+    osc_b_tri_sig (clip (mod osc_b_tri) 0 1)
+    osc_b_pulse_sig (clip (mod osc_b_pulse) 0 1)))
 (def osc_b_filter_mod (smooth osc_b_mix 0.995))
 
-(def osc_a_pitch_mod (+ (* lfo_mod lfo_to_a_st) (* filt_env poly_env_to_a_st) (* osc_b_mix poly_oscb_to_a_st)))
-(def osc_a_pitch_semi (+ osc_a_semi (/ (+ osc_a_fine_cents drift_a_cents) 100) osc_a_pitch_mod))
+(def osc_a_pitch_mod (+ (* filt_env (mod env_pitch_amt))
+                        (* osc_b_mix (mod poly_pitch_amt))))
+(def osc_a_pitch_semi (+ (mod osc_a_semi) (/ (+ (mod osc_a_fine_cents) drift_a_cents) 100) osc_a_pitch_mod))
 (def osc_a_ratio (exp (* ln2 (/ osc_a_pitch_semi 12))))
 (def osc_a_freq (* pitch osc_a_ratio))
 (def osc_a_phase (phasor osc_a_freq osc_b_wrap))
-(def osc_a_pw_mod
-  (clip (+ osc_a_pw (* lfo_mod lfo_to_a_pw) (* filt_env poly_env_to_a_pw) (* osc_b_mix poly_oscb_to_a_pw) drift_pw) 0.04 0.96))
+(def osc_a_pw_ctl
+  (clip (+ (mod osc_a_pw)
+           (* filt_env (mod env_pw_amt))
+           (* osc_b_mix (mod poly_pw_amt))
+           drift_pw)
+        0.04 0.96))
 (def osc_a_saw_sig (scale osc_a_phase 0 1 -1 1))
-(def osc_a_pulse_sig (pulse_from_phase osc_a_phase osc_a_pw_mod))
-(def osc_a_mix (weighted_mix3 osc_a_saw_sig osc_a_saw osc_a_pulse_sig osc_a_pulse 0 0))
-
-(def osc_b_pitch_lfo_ratio (exp (* ln2 (/ (* lfo_mod lfo_to_b_st) 12))))
-(def osc_b_audio_phase (phasor (* osc_b_freq osc_b_pitch_lfo_ratio)))
-(def osc_b_audio_mix
+(def osc_a_pulse_sig (pulse_from_phase osc_a_phase osc_a_pw_ctl))
+(def osc_a_mix
   (weighted_mix3
-    (scale osc_b_audio_phase 0 1 -1 1) osc_b_saw
-    (triangle osc_b_audio_phase) osc_b_tri
-    (pulse_from_phase osc_b_audio_phase osc_b_pw_mod) osc_b_pulse))
+    osc_a_saw_sig (clip (mod osc_a_saw) 0 1)
+    osc_a_pulse_sig (clip (mod osc_a_pulse) 0 1)
+    0 0))
 
-(def mixer (+ (* osc_a_mix osc_a_level) (* osc_b_audio_mix osc_b_level) (* (noise) noise_level)))
-(def driven (tanh (* mixer filter_drive)))
+(def mixer (+ (* osc_a_mix (clip (mod osc_a_level) 0 1))
+              (* osc_b_mix (clip (mod osc_b_level) 0 1))
+              (* (noise) (clip (mod noise_level) 0 0.4))))
+(def driven (tanh (* mixer (mod filter_drive))))
 
-(def filter_env_scaled (* filt_env (* filter_env_amt (+ (- 1 filter_vel_amt) (* filter_vel_amt velocity)))))
-(def filter_mod (+ cutoff (* pitch keytrack) filter_env_scaled (* filt_env poly_env_to_filter) (* osc_b_filter_mod poly_oscb_to_filter) (* lfo_mod lfo_to_filter) drift_cutoff))
+(def filter_env_scaled (* filt_env (* (mod filter_env_amt) (+ (- 1 filter_vel_amt) (* filter_vel_amt velocity)))))
+(def filter_mod (+ (mod cutoff)
+                   (* pitch keytrack)
+                   filter_env_scaled
+                   (* osc_b_filter_mod (mod poly_filter_amt))
+                   drift_cutoff))
 (def safe_filter_cutoff (min 10000 (max 30 filter_mod)))
-(def safe_resonance (min 3.2 (max 0.35 resonance)))
+(def safe_resonance (min 3.2 (max 0.35 (mod resonance))))
 
 (def filter_stage1 (biquad driven safe_filter_cutoff safe_resonance 1 0))
-(def filter_stage2 (biquad (tanh (* filter_stage1 (+ 0.6 (* 0.4 filter_drive)))) safe_filter_cutoff safe_resonance 1 0))
+(def filter_stage2
+  (biquad (tanh (* filter_stage1 (+ 0.6 (* 0.4 (mod filter_drive)))))
+          safe_filter_cutoff
+          safe_resonance
+          1
+          0))
 
 (def amp_velocity (+ (- 1 amp_vel_amt) (* amp_vel_amt velocity)))
 (out (* (tanh (* filter_stage2 1.15)) amp_env amp_velocity gain) 1 @name audio)

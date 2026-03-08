@@ -12,11 +12,13 @@ use crate::sequencer::{
 mod browser;
 mod cirklon;
 mod draw;
+mod effect_params;
 mod effects;
 mod effects_draw;
 mod graph;
 mod input;
 mod params;
+mod synth;
 
 pub use browser::BrowserNode;
 pub use draw::draw;
@@ -28,6 +30,8 @@ const COL_WIDTH: u16 = 3;
 pub enum EffectTab {
     Slot(usize),
     Synth,
+    Mod,
+    Sources,
     Reverb,
 }
 
@@ -115,6 +119,7 @@ impl EngineRegistry {
 pub struct EngineNodeIds {
     pub synth_ids: Vec<i32>,
     pub gatepitch_ids: Vec<i32>,
+    pub modulator_ids: Vec<i32>,
     pub route_gain_ids: Vec<Vec<i32>>,
 }
 
@@ -122,6 +127,8 @@ pub struct EngineNodeIds {
 pub enum ParamMouseDragTarget {
     TrackParam { row_idx: usize },
     SynthParam { row_idx: usize },
+    ModParam { row_idx: usize },
+    SourceParam { row_idx: usize },
     EffectParam { slot_idx: usize, param_idx: usize },
     ReverbParam { param_idx: usize },
 }
@@ -308,6 +315,10 @@ pub struct UiState {
     pub instrument_picker_cursor: usize,
     pub instrument_param_cursor: usize,
     pub synth_scroll_offset: usize,
+    pub mod_param_cursor: usize,
+    pub mod_scroll_offset: usize,
+    pub source_param_cursor: usize,
+    pub source_scroll_offset: usize,
     pub preset_prompt_kind: PresetPromptKind,
     pub param_mouse_drag: Option<ParamMouseDrag>,
 }
@@ -387,6 +398,10 @@ impl App {
                 instrument_picker_cursor: 0,
                 instrument_param_cursor: 0,
                 synth_scroll_offset: 0,
+                mod_param_cursor: 0,
+                mod_scroll_offset: 0,
+                source_param_cursor: 0,
+                source_scroll_offset: 0,
                 preset_prompt_kind: PresetPromptKind::SaveNew,
                 param_mouse_drag: None,
             },
@@ -479,7 +494,7 @@ impl App {
         if self.tracks.is_empty() {
             STEPS_PER_PAGE
         } else {
-            self.state.track_params[self.ui.cursor_track].get_num_steps()
+            self.state.pattern.track_params[self.ui.cursor_track].get_num_steps()
         }
     }
 
@@ -530,7 +545,7 @@ impl App {
     fn selected_effect_slot(&self) -> Option<usize> {
         match self.ui.effect_tab {
             EffectTab::Slot(idx) => Some(idx),
-            EffectTab::Synth | EffectTab::Reverb => None,
+            EffectTab::Synth | EffectTab::Mod | EffectTab::Sources | EffectTab::Reverb => None,
         }
     }
 

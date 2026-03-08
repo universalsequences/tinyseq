@@ -4,8 +4,9 @@ use std::sync::atomic::Ordering;
 
 use crate::effects::BUILTIN_SLOT_COUNT;
 
-use super::effects::{OverlayPickerKind, SYNTH_COLUMN_GAP};
+use super::effects::OverlayPickerKind;
 use super::params::draw_dropdown;
+use super::synth::SYNTH_COLUMN_GAP;
 use super::{App, CompileTarget, EffectTab, InputMode, PendingCompile};
 
 fn fit_cell(text: &str, width: usize) -> String {
@@ -49,6 +50,48 @@ pub(super) fn draw_effects_column(
             "[  Synth  ]"
         };
         title_spans.push(Span::styled(synth_label, synth_style));
+        title_spans.push(Span::raw(" "));
+
+        let mod_selected = app.ui.effect_tab == EffectTab::Mod;
+        let mod_style = if mod_selected && col_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(120, 190, 220))
+                .bold()
+        } else if mod_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(70, 120, 150))
+        } else {
+            Style::default().fg(Color::Rgb(70, 120, 150))
+        };
+        let mod_label = if mod_selected {
+            "[< Mod >]"
+        } else {
+            "[  Mod  ]"
+        };
+        title_spans.push(Span::styled(mod_label, mod_style));
+        title_spans.push(Span::raw(" "));
+
+        let sources_selected = app.ui.effect_tab == EffectTab::Sources;
+        let sources_style = if sources_selected && col_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(220, 180, 120))
+                .bold()
+        } else if sources_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(150, 115, 70))
+        } else {
+            Style::default().fg(Color::Rgb(150, 115, 70))
+        };
+        let sources_label = if sources_selected {
+            "[< Sources >]"
+        } else {
+            "[  Sources  ]"
+        };
+        title_spans.push(Span::styled(sources_label, sources_style));
         title_spans.push(Span::raw(" "));
     }
 
@@ -127,7 +170,8 @@ pub(super) fn draw_effects_column(
             Some(d) if !d.params.is_empty() => d,
             _ => return,
         };
-        let slot = &app.state.instrument_slots[app.ui.cursor_track];
+        let synth_indices = app.synth_param_indices(app.ui.cursor_track);
+        let slot = &app.state.pattern.instrument_slots[app.ui.cursor_track];
         let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
         let total_rows = app.synth_row_count();
         let columns = app.synth_column_count(inner);
@@ -152,16 +196,21 @@ pub(super) fn draw_effects_column(
             let row_area = Rect::new(row_x, row_y, column_width, 1);
 
             let is_base_row = row_idx == 0;
-            let param_idx = row_idx.saturating_sub(1);
+            let param_idx = if is_base_row {
+                None
+            } else {
+                synth_indices.get(row_idx - 1).copied()
+            };
             let param_desc = if is_base_row {
                 None
             } else {
-                Some(&desc.params[param_idx])
+                param_idx.and_then(|idx| desc.params.get(idx))
             };
             let default_val = if is_base_row {
                 app.instrument_base_note_offset(app.ui.cursor_track)
             } else {
-                slot.defaults.get(param_idx)
+                slot.defaults
+                    .get(param_idx.expect("synth param row should resolve to param idx"))
             };
             let is_cursor_row = col_focused && app.ui.instrument_param_cursor == row_idx;
             let cursor = if is_cursor_row { "> " } else { "  " };
@@ -214,7 +263,10 @@ pub(super) fn draw_effects_column(
 
             let (display_val, plock_label) = if !is_base_row && app.has_selection() && is_cursor_row
             {
-                let plock_val = slot.plocks.get(app.ui.cursor_step, param_idx);
+                let plock_val = slot.plocks.get(
+                    app.ui.cursor_step,
+                    param_idx.expect("synth param row should resolve to param idx"),
+                );
                 match plock_val {
                     Some(v) => (v, Some(" (p-lock)")),
                     None => (default_val, None),
@@ -252,11 +304,17 @@ pub(super) fn draw_effects_column(
                     let (slider_val, is_plock) = if is_base_row {
                         (default_val, false)
                     } else if app.has_selection() {
-                        let pv = slot.plocks.get(app.ui.cursor_step, param_idx);
+                        let pv = slot.plocks.get(
+                            app.ui.cursor_step,
+                            param_idx.expect("synth param row should resolve to param idx"),
+                        );
                         (pv.unwrap_or(default_val), pv.is_some())
                     } else if app.state.is_playing() {
                         let step = app.state.track_step(app.ui.cursor_track);
-                        let pv = slot.plocks.get(step, param_idx);
+                        let pv = slot.plocks.get(
+                            step,
+                            param_idx.expect("synth param row should resolve to param idx"),
+                        );
                         (pv.unwrap_or(default_val), pv.is_some())
                     } else {
                         (default_val, false)
@@ -298,6 +356,242 @@ pub(super) fn draw_effects_column(
             );
         }
 
+        if app.ui.dropdown_open && col_focused {
+            draw_dropdown(frame, app, inner);
+        }
+        return;
+    }
+
+    if app.ui.effect_tab == EffectTab::Mod {
+        app.clamp_mod_scroll(inner);
+        let desc = match app.current_mod_descriptor() {
+            Some(d) if !d.params.is_empty() => d,
+            _ => return,
+        };
+        let track = app.ui.cursor_track;
+        let mod_indices = app.mod_param_indices(track);
+        let slot = &app.state.pattern.instrument_slots[track];
+        let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
+        let total_rows = app.mod_row_count();
+        let columns = app.synth_column_count(inner);
+        let rows_per_column = app.synth_rows_per_column(inner);
+        let visible_capacity = app.synth_visible_capacity(inner);
+        let column_width = if columns == 1 {
+            inner.width
+        } else {
+            inner.width.saturating_sub(SYNTH_COLUMN_GAP) / 2
+        };
+
+        for visible_idx in 0..visible_capacity {
+            let row_idx = app.ui.mod_scroll_offset + visible_idx;
+            if row_idx >= total_rows {
+                break;
+            }
+
+            let column = visible_idx / rows_per_column;
+            let local_row = visible_idx % rows_per_column;
+            let row_y = inner.y + local_row as u16;
+            let row_x = inner.x + column as u16 * (column_width + SYNTH_COLUMN_GAP);
+            let row_area = Rect::new(row_x, row_y, column_width, 1);
+
+            let actual_idx = mod_indices[row_idx];
+            let param_desc = &desc.params[row_idx];
+            let default_val = slot.defaults.get(actual_idx);
+            let is_cursor_row = col_focused && app.ui.mod_param_cursor == row_idx;
+            let cursor = if is_cursor_row { "> " } else { "  " };
+            let cursor_style = if is_cursor_row {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Rgb(100, 200, 140))
+            };
+            let label_width = if column_width >= 44 { 16 } else { 13 };
+            let value_width = if column_width >= 40 { 12 } else { 9 };
+            let slider_width =
+                (column_width as usize).saturating_sub(label_width + value_width + 6);
+            let label = fit_cell(&param_desc.name, label_width);
+
+            if is_cursor_row && is_entering_value {
+                let spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(label.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}\u{2588}", app.ui.value_buffer),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 60, 20))
+                            .bold(),
+                    ),
+                ];
+                frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+                continue;
+            }
+
+            let display_val = param_desc.format_value(default_val);
+            let norm = param_desc.normalize(default_val);
+            let fill = ((slider_width as f32 * norm).round() as usize).min(slider_width);
+            let bar = format!("{}{}", "─".repeat(fill), " ".repeat(slider_width.saturating_sub(fill)));
+            let label_style = if is_cursor_row {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let value_style = if is_cursor_row {
+                Style::default().fg(Color::Rgb(255, 210, 120))
+            } else {
+                Style::default().fg(Color::Rgb(100, 200, 140))
+            };
+            let bar_style = Style::default().fg(Color::Rgb(90, 220, 180));
+            let line = Line::from(vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(label, label_style),
+                Span::raw(" "),
+                Span::styled(fit_cell(&display_val, value_width), value_style),
+                Span::raw(" "),
+                Span::styled(format!("[{}]", bar), bar_style),
+            ]);
+            frame.render_widget(Paragraph::new(line), row_area);
+        }
+        if total_rows > visible_capacity && inner.width > 12 {
+            let end = (app.ui.mod_scroll_offset + visible_capacity).min(total_rows);
+            let summary = format!("{}-{}/{}", app.ui.mod_scroll_offset + 1, end, total_rows);
+            let summary_len = summary.len() as u16;
+            let x = inner.x + inner.width.saturating_sub(summary_len);
+            frame.render_widget(
+                Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+                Rect::new(x, inner.y, summary_len, 1),
+            );
+        }
+        if app.ui.dropdown_open && col_focused {
+            draw_dropdown(frame, app, inner);
+        }
+        return;
+    }
+
+    if app.ui.effect_tab == EffectTab::Sources {
+        app.clamp_source_scroll(inner);
+        let desc = match app.current_source_descriptor() {
+            Some(d) if !d.params.is_empty() => d,
+            _ => return,
+        };
+        let track = app.ui.cursor_track;
+        let source_indices = app.source_param_indices(track);
+        let slot = &app.state.pattern.instrument_slots[track];
+        let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
+        let total_rows = app.source_row_count();
+        let columns = app.synth_column_count(inner);
+        let rows_per_column = app.synth_rows_per_column(inner);
+        let visible_capacity = app.synth_visible_capacity(inner);
+        let column_width = if columns == 1 {
+            inner.width
+        } else {
+            inner.width.saturating_sub(SYNTH_COLUMN_GAP) / 2
+        };
+
+        for visible_idx in 0..visible_capacity {
+            let display_row = app.ui.source_scroll_offset + visible_idx;
+            if display_row >= total_rows {
+                break;
+            }
+
+            let column = visible_idx / rows_per_column;
+            let local_row = visible_idx % rows_per_column;
+            let row_y = inner.y + local_row as u16;
+            let row_x = inner.x + column as u16 * (column_width + SYNTH_COLUMN_GAP);
+            let row_area = Rect::new(row_x, row_y, column_width, 1);
+
+            let header = match display_row {
+                0 => Some("mod1 / LFO"),
+                2 => Some("mod2 / ENV"),
+                7 => Some("mod3 / RAND"),
+                9 => Some("mod4 / DRIFT"),
+                11 => Some("mod5 / LFO 2"),
+                13 => Some("mod6 / LFO 3"),
+                _ => None,
+            };
+
+            if let Some(header) = header {
+                let line = Line::from(vec![Span::styled(
+                    header,
+                    Style::default().fg(Color::Rgb(220, 180, 120)).bold(),
+                )]);
+                frame.render_widget(Paragraph::new(line), row_area);
+                continue;
+            }
+
+            let Some(row_idx) = app.source_param_row_for_display(display_row) else {
+                continue;
+            };
+            let actual_idx = source_indices[row_idx];
+            let param_desc = &desc.params[row_idx];
+            let default_val = slot.defaults.get(actual_idx);
+            let is_cursor_row = col_focused && app.ui.source_param_cursor == row_idx;
+            let cursor = if is_cursor_row { "> " } else { "  " };
+            let cursor_style = if is_cursor_row {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Rgb(220, 180, 120))
+            };
+            let label_width = if column_width >= 44 { 16 } else { 13 };
+            let value_width = if column_width >= 40 { 12 } else { 9 };
+            let slider_width =
+                (column_width as usize).saturating_sub(label_width + value_width + 6);
+            let label = fit_cell(&param_desc.name, label_width);
+
+            if is_cursor_row && is_entering_value {
+                let spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(label.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}\u{2588}", app.ui.value_buffer),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 60, 20))
+                            .bold(),
+                    ),
+                ];
+                frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+                continue;
+            }
+
+            let display_val = param_desc.format_value(default_val);
+            let norm = param_desc.normalize(default_val);
+            let fill = ((slider_width as f32 * norm).round() as usize).min(slider_width);
+            let bar = format!(
+                "{}{}",
+                "─".repeat(fill),
+                " ".repeat(slider_width.saturating_sub(fill))
+            );
+            let label_style = if is_cursor_row {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let value_style = if is_cursor_row {
+                Style::default().fg(Color::Rgb(255, 220, 140))
+            } else {
+                Style::default().fg(Color::Rgb(220, 180, 120))
+            };
+            let bar_style = Style::default().fg(Color::Rgb(220, 180, 120));
+            let line = Line::from(vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(label, label_style),
+                Span::raw(" "),
+                Span::styled(fit_cell(&display_val, value_width), value_style),
+                Span::raw(" "),
+                Span::styled(format!("[{}]", bar), bar_style),
+            ]);
+            frame.render_widget(Paragraph::new(line), row_area);
+        }
+        if total_rows > visible_capacity && inner.width > 12 {
+            let end = (app.ui.source_scroll_offset + visible_capacity).min(total_rows);
+            let summary = format!("{}-{}/{}", app.ui.source_scroll_offset + 1, end, total_rows);
+            let summary_len = summary.len() as u16;
+            let x = inner.x + inner.width.saturating_sub(summary_len);
+            frame.render_widget(
+                Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+                Rect::new(x, inner.y, summary_len, 1),
+            );
+        }
         if app.ui.dropdown_open && col_focused {
             draw_dropdown(frame, app, inner);
         }
@@ -392,7 +686,7 @@ pub(super) fn draw_effects_column(
     };
 
     let is_custom_slot = slot_idx >= BUILTIN_SLOT_COUNT;
-    let chain = &app.state.effect_chains[track];
+    let chain = &app.state.pattern.effect_chains[track];
     let has_node = if slot_idx < chain.len() {
         chain[slot_idx].node_id.load(Ordering::Relaxed) != 0
     } else {

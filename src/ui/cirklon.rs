@@ -112,7 +112,7 @@ impl App {
                 if !self.tracks.is_empty() {
                     let track = self.ui.cursor_track;
                     for step in self.selected_steps() {
-                        if self.state.patterns[track].is_active(step) {
+                        if self.state.pattern.patterns[track].is_active(step) {
                             self.state.toggle_step_and_clear_plocks(track, step);
                         }
                     }
@@ -325,9 +325,9 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Yellow).bold()
         } else {
             // Flash decay: read value, decay by 30 per frame, interpolate gray(90)→white(255)
-            let flash = app.state.trigger_flash[i].load(Ordering::Relaxed);
+            let flash = app.state.transport.trigger_flash[i].load(Ordering::Relaxed);
             let decayed = flash.saturating_sub(30);
-            app.state.trigger_flash[i].store(decayed, Ordering::Relaxed);
+            app.state.transport.trigger_flash[i].store(decayed, Ordering::Relaxed);
             let base = 90u8;
             let brightness = base + ((255 - base) as u32 * decayed / 255) as u8;
             Style::default().fg(Color::Rgb(brightness, brightness, brightness))
@@ -444,7 +444,7 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
     let track_ph = app.state.track_step(app.ui.cursor_track);
     let playhead = track_ph % ns;
     let is_playing = app.state.is_playing();
-    let sd = &app.state.step_data[app.ui.cursor_track];
+    let sd = &app.state.pattern.step_data[app.ui.cursor_track];
     let is_transpose = app.ui.active_param == StepParam::Transpose;
     let is_sync = app.ui.active_param == StepParam::Sync;
 
@@ -460,7 +460,7 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
 
         let raw = sd.get(step, app.ui.active_param);
         let normalized = app.ui.active_param.normalize(raw);
-        let active = app.state.patterns[app.ui.cursor_track].is_active(step);
+        let active = app.state.pattern.patterns[app.ui.cursor_track].is_active(step);
         let playhead_on_page = playhead >= page_start && playhead < page_end;
         let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
 
@@ -628,7 +628,7 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let chain = &app.state.effect_chains[track];
+    let chain = &app.state.pattern.effect_chains[track];
     if slot_idx >= chain.len() {
         return;
     }
@@ -653,7 +653,7 @@ fn draw_slot_bars(frame: &mut Frame, app: &App, area: Rect) {
         let value = plock_val.unwrap_or_else(|| slot.defaults.get(param_idx));
         let normalized = param_desc.normalize(value);
 
-        let active = app.state.patterns[track].is_active(step);
+        let active = app.state.pattern.patterns[track].is_active(step);
         let playhead_on_page = playhead >= page_start && playhead < page_end;
         let bg = step_bg(app, step, is_playing && playhead_on_page, playhead);
 
@@ -715,9 +715,9 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
 
-        let active = app.state.patterns[app.ui.cursor_track].is_active(step);
+        let active = app.state.pattern.patterns[app.ui.cursor_track].is_active(step);
         // Check all slots for p-locks
-        let has_plock = app.state.effect_chains[app.ui.cursor_track]
+        let has_plock = app.state.pattern.effect_chains[app.ui.cursor_track]
             .iter()
             .any(|slot| {
                 let np = slot.num_params.load(Ordering::Relaxed) as usize;
@@ -911,7 +911,7 @@ fn draw_value_line(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Rgb(160, 160, 160)),
         ))
     } else {
-        let sd = &app.state.step_data[app.ui.cursor_track];
+        let sd = &app.state.pattern.step_data[app.ui.cursor_track];
         let val = sd.get(app.ui.cursor_step, app.ui.active_param);
         Line::from(Span::styled(
             format!(
@@ -950,23 +950,23 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
         if step != app.ui.piano_last_step {
             app.ui.piano_last_step = step;
 
-            if app.state.patterns[track].is_active(step) {
+            if app.state.pattern.patterns[track].is_active(step) {
                 // Calculate note duration in wall-clock seconds
-                let bpm = app.state.bpm.load(Ordering::Relaxed) as f64;
+                let bpm = app.state.transport.bpm.load(Ordering::Relaxed) as f64;
                 let secs_per_step = 60.0 / bpm / 4.0;
-                let dur = app.state.step_data[track].get(step, StepParam::Duration) as f64;
-                let release_ms = app.state.track_params[track].get_release_ms() as f64;
+                let dur = app.state.pattern.step_data[track].get(step, StepParam::Duration) as f64;
+                let release_ms = app.state.pattern.track_params[track].get_release_ms() as f64;
                 let total_secs = dur * secs_per_step + release_ms / 1000.0;
                 let expires = now + Duration::from_secs_f64(total_secs);
 
-                let cc = app.state.chord_data[track].count(step);
+                let cc = app.state.pattern.chord_data[track].count(step);
                 if cc > 0 {
                     for n in 0..cc {
-                        let t = app.state.chord_data[track].get(step, n).round() as i32;
+                        let t = app.state.pattern.chord_data[track].get(step, n).round() as i32;
                         app.ui.piano_notes.push((t, expires));
                     }
                 } else {
-                    let t = app.state.step_data[track]
+                    let t = app.state.pattern.step_data[track]
                         .get(step, StepParam::Transpose)
                         .round() as i32;
                     app.ui.piano_notes.push((t, expires));

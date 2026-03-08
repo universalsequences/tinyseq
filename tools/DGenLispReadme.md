@@ -89,9 +89,11 @@ Local `def` and `make-history` bindings inside macros are automatically scoped �
 
 (param freq @default 440 @min 20 @max 20000 @unit Hz)
 (param gain @default 0.5 @min 0 @max 1)
+(param cutoff @default 2400 @min 60 @max 12000 @unit Hz @mod true @mod-mode additive)
 ```
 
 The name becomes a symbol you can use in expressions. Parameters appear in the manifest with their physical memory cell ID for host-side control.
+Modulatable params generate hidden modulation source/depth params plus `modDestinations` metadata in the manifest.
 
 #### in — audio input channel
 
@@ -99,7 +101,10 @@ The name becomes a symbol you can use in expressions. Parameters appear in the m
 (in channel @name string)
 
 (in 1 @name signal)     ; channel 1 (1-indexed)
+(in 5 @name mod1 @modulator 1)
 ```
+
+`@modulator <slot>` marks an input as a host-visible modulation source.
 
 #### out — audio output channel
 
@@ -153,7 +158,7 @@ Work on signal, tensor, signalTensor, and float.
 (pow base exponent)
 (min a b)
 (max a b)
-(mod a b)
+(% a b)
 (mse prediction target)    ; mean squared error
 ```
 
@@ -226,7 +231,21 @@ Works on both signal and signalTensor.
 
 ```lisp
 (gswitch condition true_value false_value)
+(selector mode option1 option2 ...)
 ```
+
+`selector` is 1-based: `mode <= 0` returns `0`, `1` returns `option1`, `2` returns `option2`, and so on.
+
+### Modulation
+
+```lisp
+(param cutoff @default 2400 @min 60 @max 12000 @unit Hz @mod true @mod-mode additive)
+(def mod1 (in 5 @name mod1 @modulator 1))
+(def filtered (biquad sig (mod cutoff) 0.8 1 0))
+```
+
+`(mod name)` resolves the generated modulated value for a parameter declared with `@mod true`.
+Supported modulation modes are `additive`, `multiplicative`, and `semitone`.
 
 ### Utility
 

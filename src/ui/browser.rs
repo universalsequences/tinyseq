@@ -465,7 +465,7 @@ impl App {
 
     fn current_track_sound_state(&self) -> crate::sequencer::TrackSoundState {
         self.state
-            .track_sound_state
+            .pattern.track_sound_state
             .lock()
             .unwrap()
             .get(self.ui.cursor_track)
@@ -480,7 +480,7 @@ impl App {
         loaded_preset: Option<String>,
         dirty: bool,
     ) {
-        if let Some(meta) = self.state.track_sound_state.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self.state.pattern.track_sound_state.lock().unwrap().get_mut(track) {
             meta.engine_id = engine_id;
             meta.loaded_preset = loaded_preset;
             meta.dirty = dirty;
@@ -488,7 +488,7 @@ impl App {
     }
 
     pub(super) fn mark_track_sound_dirty(&self, track: usize) {
-        if let Some(meta) = self.state.track_sound_state.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self.state.pattern.track_sound_state.lock().unwrap().get_mut(track) {
             meta.dirty = true;
         }
     }
@@ -546,7 +546,7 @@ impl App {
         let Some(desc) = self.current_instrument_descriptor() else {
             return;
         };
-        let slot = &self.state.instrument_slots[track];
+        let slot = &self.state.pattern.instrument_slots[track];
         for (idx, param) in desc.params.iter().enumerate() {
             let value = preset
                 .params
@@ -557,7 +557,7 @@ impl App {
             slot.defaults.set(idx, clamped);
             self.send_instrument_param(track, idx, clamped);
         }
-        self.state.instrument_base_note_offsets[track].store(
+        self.state.pattern.instrument_base_note_offsets[track].store(
             preset.base_note_offset.to_bits(),
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -575,7 +575,7 @@ impl App {
         let Some(desc) = self.current_instrument_descriptor() else {
             return;
         };
-        let slot = &self.state.instrument_slots[track];
+        let slot = &self.state.pattern.instrument_slots[track];
         let mut params = std::collections::BTreeMap::new();
         for (idx, param) in desc.params.iter().enumerate() {
             params.insert(param.name.clone(), slot.defaults.get(idx));
@@ -584,7 +584,7 @@ impl App {
             id: preset_name.to_string(),
             name: preset_name.to_string(),
             base_note_offset: f32::from_bits(
-                self.state.instrument_base_note_offsets[track]
+                self.state.pattern.instrument_base_note_offsets[track]
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
             params,

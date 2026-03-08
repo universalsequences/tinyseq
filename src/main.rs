@@ -18,6 +18,8 @@ mod sequencer;
 mod ui;
 #[allow(dead_code)]
 mod voice;
+#[allow(dead_code)]
+mod voice_modulator;
 
 use std::ffi::CString;
 use std::sync::Arc;
