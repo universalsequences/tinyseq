@@ -11,8 +11,8 @@ use crate::sequencer::{KeyboardTrigger, StepParam, STEPS_PER_PAGE};
 use super::browser::BrowserNode;
 use super::draw::rect_contains;
 use super::{
-    App, BrowserState, CompileTarget, EffectTab, InputMode, PendingEditor, Region, SidebarMode,
-    COL_WIDTH,
+    App, BrowserState, CompileTarget, EffectTab, InputMode, ParamMouseDrag,
+    ParamMouseDragTarget, PendingEditor, Region, SidebarMode, COL_WIDTH,
 };
 
 enum EffectTabHit {
@@ -141,6 +141,12 @@ impl App {
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.handle_mouse_click(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        self.handle_mouse_drag(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.ui.param_mouse_drag = None;
                     }
                     MouseEventKind::ScrollUp => {
                         self.handle_mouse_scroll(mouse.column, mouse.row, -3);
@@ -423,6 +429,7 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        self.ui.param_mouse_drag = None;
         match self.ui.input_mode {
             // Allow mouse through in Normal and step modes
             InputMode::Normal | InputMode::StepInsert | InputMode::StepSelect => {}
@@ -619,6 +626,22 @@ impl App {
                 self.ui.focused_region = Region::Params;
                 self.ui.params_column = 0;
                 self.ui.track_param_cursor = row_idx;
+                let start_display_value = match row_idx {
+                    super::TP_ATTACK => Some(self.state.track_params[self.ui.cursor_track].get_attack_ms()),
+                    super::TP_RELEASE => Some(self.state.track_params[self.ui.cursor_track].get_release_ms()),
+                    super::TP_SWING => Some(self.state.track_params[self.ui.cursor_track].get_swing()),
+                    super::TP_STEPS => Some(self.state.track_params[self.ui.cursor_track].get_num_steps() as f32),
+                    super::TP_SEND => Some(self.state.track_params[self.ui.cursor_track].get_send()),
+                    _ => None,
+                };
+                if let Some(start_display_value) = start_display_value {
+                    self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                        track: self.ui.cursor_track,
+                        target: ParamMouseDragTarget::TrackParam { row_idx },
+                        start_col: col,
+                        start_display_value,
+                    });
+                }
             }
             return;
         }
@@ -665,6 +688,16 @@ impl App {
                     self.ui.params_column = 1;
                     self.ui.instrument_param_cursor = row_idx;
                     self.ensure_synth_cursor_visible();
+                    if let Some(start_display_value) =
+                        self.synth_row_display_value(self.ui.cursor_track, row_idx)
+                    {
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::SynthParam { row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
+                    }
                 }
             } else if self.ui.effect_tab == EffectTab::Reverb {
                 let row_idx = (row - l.effects_inner.y) as usize;
@@ -672,6 +705,20 @@ impl App {
                     self.ui.focused_region = Region::Params;
                     self.ui.params_column = 1;
                     self.ui.reverb_param_cursor = row_idx;
+                    let start_display_value = match row_idx {
+                        0 => Some(self.ui.reverb_size),
+                        1 => Some(self.ui.reverb_brightness),
+                        2 => Some(self.ui.reverb_replace),
+                        _ => None,
+                    };
+                    if let Some(start_display_value) = start_display_value {
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::ReverbParam { param_idx: row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
+                    }
                 }
             } else if let Some(desc) = self.current_slot_descriptor() {
                 let row_idx = (row - l.effects_inner.y) as usize;
@@ -679,6 +726,23 @@ impl App {
                     self.ui.focused_region = Region::Params;
                     self.ui.params_column = 1;
                     self.ui.effect_param_cursor = row_idx;
+                    if let Some(slot_idx) = self.selected_effect_slot() {
+                        if let Some(start_display_value) = self.effect_row_display_value(
+                            self.ui.cursor_track,
+                            slot_idx,
+                            row_idx,
+                        ) {
+                            self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                                track: self.ui.cursor_track,
+                                target: ParamMouseDragTarget::EffectParam {
+                                    slot_idx,
+                                    param_idx: row_idx,
+                                },
+                                start_col: col,
+                                start_display_value,
+                            });
+                        }
+                    }
                 }
             }
             return;
@@ -722,6 +786,30 @@ impl App {
             } else {
                 self.browser.scroll(delta, &self.ui);
             }
+            return;
+        }
+
+        if rect_contains(l.effects_inner, col, row) && self.ui.effect_tab == EffectTab::Synth {
+            let visible = self.synth_visible_capacity(l.effects_inner);
+            if visible == 0 {
+                return;
+            }
+            let max_scroll = self.synth_row_count().saturating_sub(visible);
+            if delta < 0 {
+                self.ui.synth_scroll_offset = self
+                    .ui
+                    .synth_scroll_offset
+                    .saturating_sub((-delta) as usize);
+            } else {
+                self.ui.synth_scroll_offset =
+                    (self.ui.synth_scroll_offset + delta as usize).min(max_scroll);
+            }
+        }
+    }
+
+    fn handle_mouse_drag(&mut self, col: u16, _row: u16) {
+        if self.ui.param_mouse_drag.is_some() {
+            self.apply_param_mouse_drag(col);
         }
     }
 

@@ -109,6 +109,15 @@ impl ParamDescriptor {
         }
     }
 
+    /// Convert a stored value to the display/user-edit domain.
+    pub fn stored_to_user(&self, val: f32) -> f32 {
+        if self.is_percent() {
+            val * 100.0
+        } else {
+            val
+        }
+    }
+
     pub fn format_value(&self, val: f32) -> String {
         match &self.kind {
             ParamKind::Boolean => {
@@ -126,7 +135,7 @@ impl ParamDescriptor {
                     .unwrap_or_else(|| format!("{}", idx))
             }
             ParamKind::Continuous { unit } => {
-                let display_val = if self.is_percent() { val * 100.0 } else { val };
+                let display_val = self.stored_to_user(val);
                 match unit.as_deref() {
                     Some("Hz") => format!("{:.0} Hz", display_val),
                     Some("ms") => format!("{:.0} ms", display_val),

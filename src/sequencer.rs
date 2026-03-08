@@ -567,7 +567,8 @@ impl Default for TrackParamsSnapshot {
 }
 
 #[derive(Clone, Default)]
-pub struct TrackPresetMeta {
+pub struct TrackSoundState {
+    pub engine_id: Option<usize>,
     pub loaded_preset: Option<String>,
     pub dirty: bool,
 }
@@ -580,7 +581,7 @@ pub struct PatternSnapshot {
     pub effect_slots: Vec<Vec<EffectSlotSnapshot>>,
     pub instrument_slots: Vec<EffectSlotSnapshot>,
     pub instrument_base_note_offsets: Vec<f32>,
-    pub track_preset_meta: Vec<TrackPresetMeta>,
+    pub track_sound_states: Vec<TrackSoundState>,
     /// Per-track (buffer_id, sample_name). -1 means no sample assigned.
     pub sample_ids: Vec<(i32, String)>,
     /// Per-track chord data snapshots.
@@ -605,8 +606,8 @@ impl PatternSnapshot {
         let mut effect_slots = Vec::with_capacity(num_tracks);
         let mut instrument_slots = Vec::with_capacity(num_tracks);
         let mut instrument_base_note_offsets = Vec::with_capacity(num_tracks);
-        let track_preset_meta = state.track_preset_meta.lock().unwrap();
-        let mut preset_meta = Vec::with_capacity(num_tracks);
+        let track_sound_state = state.track_sound_state.lock().unwrap();
+        let mut sound_states = Vec::with_capacity(num_tracks);
         let mut sample_ids = Vec::with_capacity(num_tracks);
         let mut chord_snapshots = Vec::with_capacity(num_tracks);
         let mut timebase_plock_snapshots = Vec::with_capacity(num_tracks);
@@ -647,7 +648,14 @@ impl PatternSnapshot {
             instrument_base_note_offsets.push(f32::from_bits(
                 state.instrument_base_note_offsets[t].load(Ordering::Relaxed),
             ));
-            preset_meta.push(track_preset_meta.get(t).cloned().unwrap_or_default());
+            let mut sound = track_sound_state.get(t).cloned().unwrap_or_default();
+            let engine_id = state.track_engine_ids[t].load(Ordering::Relaxed);
+            sound.engine_id = if engine_id == u32::MAX {
+                None
+            } else {
+                Some(engine_id as usize)
+            };
+            sound_states.push(sound);
 
             // Capture sample assignment
             let buf_id = if t < track_buffer_ids.len() {
@@ -683,7 +691,7 @@ impl PatternSnapshot {
             effect_slots,
             instrument_slots,
             instrument_base_note_offsets,
-            track_preset_meta: preset_meta,
+            track_sound_states: sound_states,
             sample_ids,
             chord_snapshots,
             timebase_plock_snapshots,
@@ -693,7 +701,7 @@ impl PatternSnapshot {
 
     pub fn restore(&self, state: &SequencerState) {
         let num_tracks = self.track_bits.len();
-        let mut track_preset_meta = state.track_preset_meta.lock().unwrap();
+        let mut track_sound_state = state.track_sound_state.lock().unwrap();
         for t in 0..num_tracks {
             state.patterns[t].store_bits(self.track_bits[t]);
 
@@ -730,8 +738,13 @@ impl PatternSnapshot {
                     Ordering::Relaxed,
                 );
             }
-            if t < self.track_preset_meta.len() && t < track_preset_meta.len() {
-                track_preset_meta[t] = self.track_preset_meta[t].clone();
+            if t < self.track_sound_states.len() && t < track_sound_state.len() {
+                track_sound_state[t] = self.track_sound_states[t].clone();
+                let engine_id = self.track_sound_states[t]
+                    .engine_id
+                    .map(|id| id as u32)
+                    .unwrap_or(u32::MAX);
+                state.track_engine_ids[t].store(engine_id, Ordering::Relaxed);
             }
 
             // Restore chord data
@@ -785,7 +798,7 @@ impl PatternSnapshot {
             .push(Self::default_effect_slots(t, slot_descriptors));
         self.instrument_slots.push(Self::default_instrument_slot());
         self.instrument_base_note_offsets.push(0.0);
-        self.track_preset_meta.push(TrackPresetMeta::default());
+        self.track_sound_states.push(TrackSoundState::default());
         self.sample_ids.push((-1, String::new()));
         self.chord_snapshots.push(ChordSnapshot::new_default());
         self.timebase_plock_snapshots.push([None; MAX_STEPS]);
@@ -800,7 +813,7 @@ impl PatternSnapshot {
             effect_slots: Vec::with_capacity(num_tracks),
             instrument_slots: Vec::with_capacity(num_tracks),
             instrument_base_note_offsets: Vec::with_capacity(num_tracks),
-            track_preset_meta: Vec::with_capacity(num_tracks),
+            track_sound_states: Vec::with_capacity(num_tracks),
             sample_ids: Vec::with_capacity(num_tracks),
             chord_snapshots: Vec::with_capacity(num_tracks),
             timebase_plock_snapshots: Vec::with_capacity(num_tracks),
@@ -853,6 +866,8 @@ pub struct SequencerState {
     pub peak_l: AtomicU32,
     /// Peak level for R channel (f32 bits, 0.0..1.0+), updated by audio thread.
     pub peak_r: AtomicU32,
+    /// Smoothed audio callback load as a percentage of the current block budget.
+    pub cpu_load_pct: AtomicU32,
     /// Per-track trigger flash intensity (0-255). Audio writes 255, UI decays each frame.
     pub trigger_flash: Vec<AtomicU32>,
     /// Inactive patterns stored here (only accessed by UI thread during switches).
@@ -902,8 +917,8 @@ pub struct SequencerState {
     pub instrument_slots: Vec<EffectSlotState>,
     /// Per-track host-side semitone offset for custom instrument pitch interpretation.
     pub instrument_base_note_offsets: Vec<AtomicU32>,
-    /// Per-track loaded preset metadata for custom instruments.
-    pub track_preset_meta: Mutex<Vec<TrackPresetMeta>>,
+    /// Per-track sound state for custom instruments.
+    pub track_sound_state: Mutex<Vec<TrackSoundState>>,
 }
 
 #[derive(Clone)]
@@ -951,6 +966,7 @@ impl SequencerState {
             bpm: AtomicU32::new(DEFAULT_BPM),
             peak_l: AtomicU32::new(0.0_f32.to_bits()),
             peak_r: AtomicU32::new(0.0_f32.to_bits()),
+            cpu_load_pct: AtomicU32::new(0.0_f32.to_bits()),
             trigger_flash,
             pattern_bank: Mutex::new(vec![PatternSnapshot::new_default(
                 num_tracks,
@@ -991,9 +1007,9 @@ impl SequencerState {
             instrument_base_note_offsets: (0..MAX_TRACKS)
                 .map(|_| AtomicU32::new(0.0_f32.to_bits()))
                 .collect(),
-            track_preset_meta: Mutex::new(
+            track_sound_state: Mutex::new(
                 (0..MAX_TRACKS)
-                    .map(|_| TrackPresetMeta::default())
+                    .map(|_| TrackSoundState::default())
                     .collect(),
             ),
         }

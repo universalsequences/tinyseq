@@ -433,7 +433,7 @@ impl App {
         } else if let Some(Some(engine_id)) = self.graph.track_engine_ids.get(self.ui.cursor_track)
         {
             self.editor
-                .cached_instruments
+                .engine_registry
                 .get(*engine_id)
                 .map(|engine| engine.name.as_str())
         } else {
@@ -463,9 +463,9 @@ impl App {
         self.current_custom_instrument_name()
     }
 
-    fn current_track_preset_meta(&self) -> crate::sequencer::TrackPresetMeta {
+    fn current_track_sound_state(&self) -> crate::sequencer::TrackSoundState {
         self.state
-            .track_preset_meta
+            .track_sound_state
             .lock()
             .unwrap()
             .get(self.ui.cursor_track)
@@ -473,20 +473,22 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub(super) fn set_track_preset_meta(
+    pub(super) fn set_track_sound_state(
         &self,
         track: usize,
+        engine_id: Option<usize>,
         loaded_preset: Option<String>,
         dirty: bool,
     ) {
-        if let Some(meta) = self.state.track_preset_meta.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self.state.track_sound_state.lock().unwrap().get_mut(track) {
+            meta.engine_id = engine_id;
             meta.loaded_preset = loaded_preset;
             meta.dirty = dirty;
         }
     }
 
     pub(super) fn mark_track_sound_dirty(&self, track: usize) {
-        if let Some(meta) = self.state.track_preset_meta.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self.state.track_sound_state.lock().unwrap().get_mut(track) {
             meta.dirty = true;
         }
     }
@@ -559,7 +561,8 @@ impl App {
             preset.base_note_offset.to_bits(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.set_track_preset_meta(track, Some(preset.name.clone()), false);
+        let engine_id = self.graph.track_engine_ids.get(track).and_then(|id| *id);
+        self.set_track_sound_state(track, engine_id, Some(preset.name.clone()), false);
         self.editor.status_message =
             Some((format!("Loaded preset '{}'", preset.name), Instant::now()));
     }
@@ -612,7 +615,8 @@ impl App {
 
         match lisp_effect::save_instrument_presets(instrument_name, &presets) {
             Ok(()) => {
-                self.set_track_preset_meta(track, Some(preset_name.to_string()), false);
+                let engine_id = self.graph.track_engine_ids.get(track).and_then(|id| *id);
+                self.set_track_sound_state(track, engine_id, Some(preset_name.to_string()), false);
                 self.editor.status_message =
                     Some((format!("Saved preset '{}'", preset_name), Instant::now()));
                 self.clamp_preset_browser();
@@ -624,7 +628,7 @@ impl App {
     }
 
     pub(super) fn overwrite_loaded_preset(&mut self) {
-        let meta = self.current_track_preset_meta();
+        let meta = self.current_track_sound_state();
         let Some(name) = meta.loaded_preset else {
             self.editor.status_message =
                 Some(("No loaded preset to overwrite".to_string(), Instant::now()));
@@ -634,7 +638,7 @@ impl App {
     }
 
     pub(super) fn revert_loaded_preset(&mut self) {
-        let meta = self.current_track_preset_meta();
+        let meta = self.current_track_sound_state();
         if let Some(name) = meta.loaded_preset {
             let items = self.visible_preset_items();
             if let Some(idx) = items.iter().position(|item| item == &name) {
@@ -779,7 +783,7 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         app.clamp_preset_browser();
         let items = app.visible_preset_items();
         let max_visible = (inner.height as usize).saturating_sub(3);
-        let meta = app.current_track_preset_meta();
+        let meta = app.current_track_sound_state();
         let engine_name = app.current_preset_engine_name().unwrap_or("None");
         let engine_header = format!(" engine: {}", engine_name);
         let loaded = meta

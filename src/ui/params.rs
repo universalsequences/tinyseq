@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use crate::sequencer::{Timebase, MAX_STEPS};
 
-use super::effects::draw_effects_column;
+use super::effects_draw::draw_effects_column;
 use super::{
     App, EffectTab, InputMode, Region, TP_ATTACK, TP_GATE, TP_LAST, TP_POLY, TP_RELEASE, TP_SEND,
     TP_STEPS, TP_SWING, TP_TIMEBASE,

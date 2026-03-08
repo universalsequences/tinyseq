@@ -1,0 +1,87 @@
+; Elektron Monomachine-inspired FM+ family
+; Covers FM+ STATIC / PARALLEL / DYNAMIC as presets on one engine.
+
+(def gate (in 1 @name gate))
+(def pitch (in 2 @name pitch))
+(def velocity (in 3 @name velocity))
+
+(defmacro semi_ratio (semi)
+  (exp (/ (* (log 2) semi) 12)))
+
+(param amp_attack_ms    @default 4    @min 1     @max 5000 @unit ms)
+(param amp_decay_ms     @default 180  @min 1     @max 5000 @unit ms)
+(param amp_sustain      @default 0.7  @min 0     @max 1)
+(param amp_release_ms   @default 200  @min 1     @max 5000 @unit ms)
+
+(param mod_attack_ms    @default 2    @min 1     @max 5000 @unit ms)
+(param mod_decay_ms     @default 120  @min 1     @max 5000 @unit ms)
+(param mod_sustain      @default 0.0  @min 0     @max 1)
+(param mod_release_ms   @default 140  @min 1     @max 5000 @unit ms)
+
+(param ratio_a          @default 1.0  @min 0.125 @max 16)
+(param ratio_b          @default 2.0  @min 0.125 @max 16)
+(param ratio_c          @default 1.0  @min 0.125 @max 16)
+(param ratio_d          @default 3.0  @min 0.125 @max 16)
+
+(param index_a          @default 1.8  @min 0     @max 16)
+(param index_b          @default 0.0  @min 0     @max 16)
+(param dyn_index_amt    @default 2.0  @min -16   @max 16)
+(param feedback_a       @default 0.08 @min 0     @max 1.4)
+(param feedback_b       @default 0.0  @min 0     @max 1.4)
+(param crossmod         @default 0.0  @min 0     @max 8)
+(param self_fm          @default 0.0  @min 0     @max 8)
+(param ratio_warp       @default 0.0  @min -8    @max 8)
+(param glitch_rate      @default 0.0  @min 0     @max 80 @unit Hz)
+(param glitch_amt       @default 0.0  @min 0     @max 1)
+
+(param parallel_mix     @default 0.0  @min 0     @max 1)
+(param tone             @default 4200 @min 80    @max 12000 @unit Hz)
+(param resonance        @default 0.7  @min 0.35  @max 3.5)
+(param keytrack         @default 0.22 @min 0     @max 2)
+(param vibrato_rate     @default 5.2  @min 0.05  @max 12 @unit Hz)
+(param vibrato_depth    @default 0.0  @min 0     @max 0.3 @unit st)
+(param filter_drive     @default 1.0  @min 0.5   @max 4)
+(param gain             @default 0.13 @min 0     @max 1)
+
+(def amp_env (adsr amp_attack_ms amp_decay_ms amp_sustain amp_release_ms))
+(def mod_env (adsr mod_attack_ms mod_decay_ms mod_sustain mod_release_ms))
+
+(def ln2 (log 2))
+(def vib_lfo (sin (* twopi (phasor vibrato_rate))))
+(def vib_ratio (exp (* ln2 (/ (* vib_lfo vibrato_depth) 12))))
+(def glitch_trig (lt (phasor (+ 0.05 glitch_rate)) 0.001))
+(def glitch_step (latch (noise) glitch_trig))
+(def base (* pitch vib_ratio))
+(def warp_a (exp (* ln2 (/ (+ ratio_warp (* glitch_step glitch_amt 6)) 12))))
+(def warp_b (exp (* ln2 (/ (- ratio_warp (* glitch_step glitch_amt 4)) 12))))
+
+(def phase_a (phasor (* base ratio_a warp_a)))
+(def phase_b (phasor (* base ratio_b warp_b)))
+(def phase_c (phasor (* base ratio_c warp_b)))
+(def phase_d (phasor (* base ratio_d warp_a)))
+
+(make-history fb_a_hist)
+(make-history fb_b_hist)
+(make-history car_a_hist)
+(make-history car_b_hist)
+(def fb_a (read-history fb_a_hist))
+(def fb_b (read-history fb_b_hist))
+(def car_a_prev (read-history car_a_hist))
+(def car_b_prev (read-history car_b_hist))
+
+(def mod_a (sin (+ (* twopi phase_b) (* fb_a feedback_a) (* car_a_prev self_fm))))
+(def mod_b (sin (+ (* twopi phase_d) (* fb_b feedback_b) (* car_b_prev self_fm 0.7))))
+(write-history fb_a_hist mod_a)
+(write-history fb_b_hist mod_b)
+
+(def dyn_index (+ index_a (* mod_env dyn_index_amt)))
+(def car_a (sin (+ (* twopi phase_a) (* mod_a dyn_index) (* mod_b crossmod) (* glitch_step glitch_amt 2.2))))
+(def car_b (sin (+ (* twopi phase_c) (* mod_b index_b) (* mod_a (* crossmod 0.5)) (* glitch_step glitch_amt 1.3))))
+(write-history car_a_hist car_a)
+(write-history car_b_hist car_b)
+
+(def fm_mix (mix car_a (+ (* 0.82 car_a) (* 0.82 car_b)) parallel_mix))
+(def voiced (* fm_mix (+ 0.25 (* 0.75 velocity))))
+(def hot (tanh (* voiced filter_drive)))
+(def filtered (biquad hot (clip (+ tone (* pitch keytrack) (* fm_mix glitch_amt 2400)) 80 11000) resonance 1 0))
+(out (* filtered amp_env gain) 1 @name audio)

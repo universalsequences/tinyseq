@@ -60,6 +60,11 @@ extern "C" {
     pub fn initialize_engine(block_size: c_int, sample_rate: c_int);
     pub fn engine_start_workers(workers: c_int);
     pub fn engine_stop_workers();
+    #[allow(dead_code)]
+    pub fn engine_set_os_workgroup(oswg: *mut c_void);
+    pub fn engine_clear_os_workgroup();
+    pub fn engine_enable_rt_logging(enable: c_int);
+    pub fn engine_enable_rt_time_constraint(enable: c_int);
 
     // Graph lifecycle
     pub fn create_live_graph(
@@ -121,5 +126,21 @@ extern "C" {
 
     // Delete
     pub fn delete_node(lg: *mut LiveGraph, node_id: c_int) -> bool;
+}
 
+#[allow(dead_code)]
+pub unsafe fn set_os_workgroup(oswg: *mut c_void) {
+    engine_set_os_workgroup(oswg);
+}
+
+pub unsafe fn clear_os_workgroup() {
+    engine_clear_os_workgroup();
+}
+
+pub unsafe fn enable_rt_logging(enable: bool) {
+    engine_enable_rt_logging(if enable { 1 } else { 0 });
+}
+
+pub unsafe fn enable_rt_time_constraint(enable: bool) {
+    engine_enable_rt_time_constraint(if enable { 1 } else { 0 });
 }

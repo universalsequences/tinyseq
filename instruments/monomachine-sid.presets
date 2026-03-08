@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "engine_name": "monomachine-sid",
+  "source_file": "instruments/monomachine-sid.lisp",
+  "presets": [
+    {
+      "id": "sid-bass",
+      "name": "SID BASS",
+      "base_note_offset": -12.0,
+      "params": {
+        "bit_depth": 7.0,
+        "cutoff": 1800.0,
+        "drive": 1.65,
+        "filter_mode": 0.0,
+        "gain": 0.14,
+        "noise_mix": 0.0,
+        "osc1_level": 1.0,
+        "osc2_level": 0.4,
+        "osc2_semi": 0.0,
+        "osc3_level": 0.0,
+        "pulse_mix": 0.72,
+        "pulse_width": 0.38,
+        "resonance": 1.05,
+        "ring_amt": 0.0,
+        "saw_mix": 0.52,
+        "sync_amt": 0.25,
+        "tri_mix": 0.0
+      }
+    },
+    {
+      "id": "sid-lead",
+      "name": "SID LEAD",
+      "base_note_offset": 0.0,
+      "params": {
+        "bit_depth": 8.0,
+        "cutoff": 3400.0,
+        "drive": 1.45,
+        "filter_mode": 1.0,
+        "gain": 0.13,
+        "noise_mix": 0.0,
+        "osc1_level": 0.9,
+        "osc2_level": 0.58,
+        "osc2_semi": 12.0,
+        "osc3_level": 0.25,
+        "osc3_semi": 19.0,
+        "pulse_mix": 0.4,
+        "pulse_width": 0.46,
+        "resonance": 1.4,
+        "ring_amt": 0.28,
+        "saw_mix": 0.82,
+        "sync_amt": 0.62,
+        "tri_mix": 0.18
+      }
+    },
+    {
+      "id": "sid-noise",
+      "name": "SID NOISE",
+      "base_note_offset": -24.0,
+      "params": {
+        "amp_decay_ms": 140.0,
+        "amp_release_ms": 60.0,
+        "bit_depth": 6.0,
+        "cutoff": 4200.0,
+        "drive": 1.8,
+        "filter_mode": 2.0,
+        "gain": 0.11,
+        "noise_mix": 0.45,
+        "osc1_level": 0.75,
+        "osc2_level": 0.0,
+        "osc3_level": 0.0,
+        "pulse_mix": 0.0,
+        "resonance": 1.7,
+        "saw_mix": 0.28,
+        "sync_amt": 0.0,
+        "tri_mix": 0.0
+      }
+    },
+    {
+      "id": "sid-melt",
+      "name": "SID MELT",
+      "base_note_offset": -12.0,
+      "params": {
+        "bit_depth": 5.0,
+        "buzz": 0.85,
+        "cutoff": 2100.0,
+        "drive": 1.95,
+        "filter_fm": 1450.0,
+        "filter_mode": 1.0,
+        "fold_amt": 0.9,
+        "gain": 0.1,
+        "glitch_amt": 0.34,
+        "glitch_rate": 13.0,
+        "noise_mix": 0.14,
+        "osc1_level": 0.92,
+        "osc2_level": 0.66,
+        "osc2_semi": 7.0,
+        "osc3_level": 0.58,
+        "osc3_semi": -5.0,
+        "pulse_mix": 0.82,
+        "pulse_width": 0.21,
+        "resonance": 1.2,
+        "ring_amt": 0.8,
+        "saw_mix": 0.24,
+        "sync_amt": 0.72,
+        "tri_mix": 0.0
+      }
+    }
+  ]
+}

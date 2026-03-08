@@ -71,7 +71,7 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_sum_high_fanin tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect tests/test_buffer_api tests/test_cycle_prevention
+test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_custom_engine_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_sum_high_fanin tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect tests/test_buffer_api tests/test_cycle_prevention
 	./tests/test_watchlist
 	./tests/test_watchlist_advanced
 	./tests/test_watchlist_validation
@@ -84,6 +84,7 @@ test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_va
 	./tests/test_graph_edit_queue
 	./tests/test_queue_api
 	./tests/test_capacity_growth
+	./tests/test_custom_engine_growth
 	./tests/test_simple_teardown
 	./tests/test_orphan_comprehensive
 	./tests/test_auto_sum
@@ -130,6 +131,9 @@ tests/test_deletion_safety: tests/test_deletion_safety.c $(HEADERS) $(TEST_OBJS)
 # Build capacity growth test (dynamic node array expansion)
 tests/test_capacity_growth: tests/test_capacity_growth.c $(HEADERS) $(TEST_OBJS)
 	$(CC) $(CFLAGS) -I. -o tests/test_capacity_growth tests/test_capacity_growth.c $(TEST_OBJS)
+
+tests/test_custom_engine_growth: tests/test_custom_engine_growth.c $(HEADERS) $(TEST_OBJS)
+	$(CC) $(CFLAGS) -I. -o tests/test_custom_engine_growth tests/test_custom_engine_growth.c $(TEST_OBJS)
 
 # Build simple teardown test (basic graph destruction)
 tests/test_simple_teardown: tests/test_simple_teardown.c $(HEADERS) $(TEST_OBJS)

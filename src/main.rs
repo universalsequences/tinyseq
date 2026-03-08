@@ -23,6 +23,25 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+fn env_i32(name: &str) -> Option<i32> {
+    std::env::var(name).ok()?.trim().parse::<i32>().ok()
+}
+
+fn recommended_worker_count() -> i32 {
+    6
+}
+
 fn suspend_terminal(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> std::io::Result<()> {
@@ -117,10 +136,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audiograph::graph_connect(lg, reverb_node_id, 1, bus_r_id, 0);
     }
 
-    // Start engine with 0 workers (audio callback is single-threaded)
+    let workers = env_i32("TINYSEQ_AUDIOGRAPH_WORKERS")
+        .unwrap_or_else(recommended_worker_count)
+        .max(0);
+    let mach_rt_default = cfg!(target_os = "macos") && workers > 0;
+    let mach_rt = env_flag("TINYSEQ_AUDIOGRAPH_MACH_RT", mach_rt_default);
+    let rt_log = env_flag("TINYSEQ_AUDIOGRAPH_RT_LOG", false);
+
     unsafe {
-        audiograph::engine_start_workers(0);
+        audiograph::enable_rt_logging(rt_log);
+        audiograph::enable_rt_time_constraint(mach_rt);
+        audiograph::engine_start_workers(workers);
     }
+    eprintln!(
+        "audiograph: started {workers} worker(s), Mach RT {}, OS workgroup exposed via FFI only",
+        if mach_rt { "enabled" } else { "disabled" }
+    );
 
     // Create shared sequencer state (start with 0 tracks)
     let state = Arc::new(sequencer::SequencerState::new(0, vec![]));
@@ -156,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_headless_custom_repro(&mut app)?;
         drop(stream);
         unsafe {
+            audiograph::clear_os_workgroup();
             audiograph::engine_stop_workers();
             audiograph::destroy_live_graph(lg);
         }
@@ -195,6 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(stream);
 
     unsafe {
+        audiograph::clear_os_workgroup();
         audiograph::engine_stop_workers();
         audiograph::destroy_live_graph(lg);
     }

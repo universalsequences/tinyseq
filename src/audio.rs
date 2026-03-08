@@ -1,7 +1,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::audiograph::*;
 use crate::delay;
@@ -90,6 +93,12 @@ impl GateOffTracker {
     }
 }
 
+fn cancel_gate_off_for_lid(gate_off_state: &mut [GateOffTracker], lid: u64) {
+    for tracker in gate_off_state {
+        tracker.cancel(lid);
+    }
+}
+
 struct AudioCallbackData {
     lg: LiveGraphPtr,
     clock: SequencerClock,
@@ -111,6 +120,15 @@ struct CustomVoiceSlot {
     active: bool,
     note: f32,
     assigned_track: Option<usize>,
+    fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CustomVoiceAllocation {
+    voice_idx: usize,
+    logical_id: u64,
+    previous_track: Option<usize>,
+    stole_active_voice: bool,
 }
 
 struct CustomEnginePool {
@@ -128,6 +146,7 @@ impl CustomEnginePool {
                 active: false,
                 note: 0.0,
                 assigned_track: None,
+                fingerprint: 0,
             }),
             num_voices: 0,
             age_counter: 0,
@@ -142,23 +161,36 @@ impl CustomEnginePool {
                 active: false,
                 note: 0.0,
                 assigned_track: None,
+                fingerprint: 0,
             };
             self.num_voices += 1;
         }
     }
 
-    fn allocate_voice(&mut self, track: usize, note: f32, polyphonic: bool) -> usize {
+    fn allocate_voice(
+        &mut self,
+        track: usize,
+        note: f32,
+        polyphonic: bool,
+    ) -> CustomVoiceAllocation {
         self.age_counter += 1;
         if !polyphonic {
             if let Some(idx) = (0..self.num_voices)
                 .find(|&i| self.voices[i].assigned_track == Some(track))
             {
                 let slot = &mut self.voices[idx];
+                let previous_track = slot.assigned_track;
+                let stole_active_voice = slot.active;
                 slot.age = self.age_counter;
                 slot.active = true;
                 slot.note = note;
                 slot.assigned_track = Some(track);
-                return idx;
+                return CustomVoiceAllocation {
+                    voice_idx: idx,
+                    logical_id: slot.logical_id,
+                    previous_track,
+                    stole_active_voice,
+                };
             }
         }
 
@@ -187,11 +219,18 @@ impl CustomEnginePool {
 
         let idx = free_idx.or(oldest_same_track).unwrap_or(oldest_idx);
         let slot = &mut self.voices[idx];
+        let previous_track = slot.assigned_track;
+        let stole_active_voice = slot.active;
         slot.age = self.age_counter;
         slot.active = true;
         slot.note = note;
         slot.assigned_track = Some(track);
-        idx
+        CustomVoiceAllocation {
+            voice_idx: idx,
+            logical_id: slot.logical_id,
+            previous_track,
+            stole_active_voice,
+        }
     }
 
     fn release_voice_by_note(&mut self, track: usize, note: f32) -> Option<u64> {
@@ -454,6 +493,35 @@ fn track_engine_id(state: &SequencerState, track_idx: usize) -> Option<usize> {
     }
 }
 
+fn instrument_sound_fingerprint(
+    state: &SequencerState,
+    track_idx: usize,
+    engine_id: usize,
+    step: Option<usize>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    engine_id.hash(&mut hasher);
+    state.instrument_base_note_offsets[track_idx]
+        .load(Ordering::Relaxed)
+        .hash(&mut hasher);
+
+    let slot = &state.instrument_slots[track_idx];
+    let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+    for param_idx in 0..num_params {
+        let value_bits = if let Some(step_idx) = step {
+            slot.plocks
+                .get(step_idx, param_idx)
+                .unwrap_or_else(|| slot.defaults.get(param_idx))
+                .to_bits()
+        } else {
+            slot.defaults.get(param_idx).to_bits()
+        };
+        value_bits.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
 /// Dispatch effect p-locks for all slots in a track's effect chain.
 unsafe fn dispatch_effect_chain_for_track(
     lg: *mut LiveGraph,
@@ -607,40 +675,64 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                 let Some(engine_id) = engine_id else {
                     continue;
                 };
-                let voice_idx = data.custom_engine_pools[engine_id]
+                let allocation = data.custom_engine_pools[engine_id]
                     .allocate_voice(track_idx, transpose, track_polyphonic);
-                let lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+                let voice_idx = allocation.voice_idx;
+                let lid = allocation.logical_id;
+                let fingerprint =
+                    instrument_sound_fingerprint(&data.state, track_idx, engine_id, Some(step));
                 let synth_id =
                     data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
                 if lid == 0 || synth_id == 0 {
                     continue;
                 }
                 let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
-                if !track_polyphonic {
-                    data.gate_off_state[track_idx].cancel(lid);
+                cancel_gate_off_for_lid(&mut data.gate_off_state, lid);
+                if allocation.stole_active_voice || !track_polyphonic {
                     unsafe {
-                        route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
-                        dispatch_instrument_params_to_voice(
+                        send_custom_note_off(data.lg.0, lid);
+                        route_custom_voice_to_track(
                             data.lg.0,
                             &data.state,
+                            engine_id,
+                            voice_idx,
                             track_idx,
-                            step,
-                            synth_id as u64,
                         );
-                        send_custom_note_off(data.lg.0, lid);
+                        if data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint
+                            != fingerprint
+                        {
+                            dispatch_instrument_params_to_voice(
+                                data.lg.0,
+                                &data.state,
+                                track_idx,
+                                step,
+                                synth_id as u64,
+                            );
+                        }
                     }
                 } else {
                     unsafe {
-                        route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
-                        dispatch_instrument_params_to_voice(
+                        route_custom_voice_to_track(
                             data.lg.0,
                             &data.state,
+                            engine_id,
+                            voice_idx,
                             track_idx,
-                            step,
-                            synth_id as u64,
                         );
+                        if data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint
+                            != fingerprint
+                        {
+                            dispatch_instrument_params_to_voice(
+                                data.lg.0,
+                                &data.state,
+                                track_idx,
+                                step,
+                                synth_id as u64,
+                            );
+                        }
                     }
                 }
+                data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint = fingerprint;
                 unsafe {
                     send_custom_trigger(data.lg.0, lid, pitch_hz, velocity);
                 }
@@ -677,40 +769,64 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
             let Some(engine_id) = engine_id else {
                 return;
             };
-            let voice_idx = data.custom_engine_pools[engine_id]
+            let allocation = data.custom_engine_pools[engine_id]
                 .allocate_voice(track_idx, transpose, track_polyphonic);
-            let lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+            let voice_idx = allocation.voice_idx;
+            let lid = allocation.logical_id;
+            let fingerprint =
+                instrument_sound_fingerprint(&data.state, track_idx, engine_id, Some(step));
             let synth_id =
                 data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
             if lid == 0 || synth_id == 0 {
                 return;
             }
             let pitch_hz = custom_pitch_hz(transpose, base_note_offset);
-            if !track_polyphonic {
-                data.gate_off_state[track_idx].cancel(lid);
+            cancel_gate_off_for_lid(&mut data.gate_off_state, lid);
+            if allocation.stole_active_voice || !track_polyphonic {
                 unsafe {
-                    route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
-                    dispatch_instrument_params_to_voice(
+                    send_custom_note_off(data.lg.0, lid);
+                    route_custom_voice_to_track(
                         data.lg.0,
                         &data.state,
+                        engine_id,
+                        voice_idx,
                         track_idx,
-                        step,
-                        synth_id as u64,
                     );
-                    send_custom_note_off(data.lg.0, lid);
+                    if data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint
+                        != fingerprint
+                    {
+                        dispatch_instrument_params_to_voice(
+                            data.lg.0,
+                            &data.state,
+                            track_idx,
+                            step,
+                            synth_id as u64,
+                        );
+                    }
                 }
             } else {
                 unsafe {
-                    route_custom_voice_to_track(data.lg.0, &data.state, engine_id, voice_idx, track_idx);
-                    dispatch_instrument_params_to_voice(
+                    route_custom_voice_to_track(
                         data.lg.0,
                         &data.state,
+                        engine_id,
+                        voice_idx,
                         track_idx,
-                        step,
-                        synth_id as u64,
                     );
+                    if data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint
+                        != fingerprint
+                    {
+                        dispatch_instrument_params_to_voice(
+                            data.lg.0,
+                            &data.state,
+                            track_idx,
+                            step,
+                            synth_id as u64,
+                        );
+                    }
                 }
             }
+            data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint = fingerprint;
             unsafe {
                 send_custom_trigger(data.lg.0, lid, pitch_hz, velocity);
             }
@@ -773,6 +889,7 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
 }
 
 fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
+    let callback_start = Instant::now();
     let nframes = output.len() / data.num_channels;
     let num_tracks = data.state.active_track_count();
 
@@ -864,15 +981,19 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
                     continue;
                 };
-                let voice_idx = data.custom_engine_pools[engine_id]
+                let allocation = data.custom_engine_pools[engine_id]
                     .allocate_voice(kt.track, kt.transpose, track_polyphonic);
-                let voice_lid = data.custom_engine_pools[engine_id].voices[voice_idx].logical_id;
+                let voice_idx = allocation.voice_idx;
+                let voice_lid = allocation.logical_id;
+                let fingerprint =
+                    instrument_sound_fingerprint(&data.state, kt.track, engine_id, None);
                 let synth_id =
                     data.state.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
                 if voice_lid == 0 || synth_id == 0 {
                     continue;
                 }
                 let pitch_hz = custom_pitch_hz(kt.transpose, base_note_offset);
+                cancel_gate_off_for_lid(&mut data.gate_off_state, voice_lid);
                 unsafe {
                     route_custom_voice_to_track(
                         data.lg.0,
@@ -881,14 +1002,19 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                         voice_idx,
                         kt.track,
                     );
-                    dispatch_instrument_defaults_to_voice(
-                        data.lg.0,
-                        &data.state,
-                        kt.track,
-                        synth_id as u64,
-                    );
+                    if data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint
+                        != fingerprint
+                    {
+                        dispatch_instrument_defaults_to_voice(
+                            data.lg.0,
+                            &data.state,
+                            kt.track,
+                            synth_id as u64,
+                        );
+                    }
                 }
-                if !track_polyphonic {
+                data.custom_engine_pools[engine_id].voices[voice_idx].fingerprint = fingerprint;
+                if allocation.stole_active_voice || !track_polyphonic {
                     unsafe {
                         send_custom_note_off(data.lg.0, voice_lid);
                     }
@@ -1066,6 +1192,25 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     }
     data.state.peak_l.store(peak_l.to_bits(), Ordering::Relaxed);
     data.state.peak_r.store(peak_r.to_bits(), Ordering::Relaxed);
+
+    if nframes > 0 {
+        let elapsed_secs = callback_start.elapsed().as_secs_f32();
+        let block_budget_secs = nframes as f32 / data.sample_rate as f32;
+        let raw_load_pct = if block_budget_secs > 0.0 {
+            (elapsed_secs / block_budget_secs) * 100.0
+        } else {
+            0.0
+        };
+        let prev_load_pct = f32::from_bits(data.state.cpu_load_pct.load(Ordering::Relaxed));
+        let smoothed_load_pct = if prev_load_pct <= 0.0 {
+            raw_load_pct
+        } else {
+            prev_load_pct * 0.88 + raw_load_pct * 0.12
+        };
+        data.state
+            .cpu_load_pct
+            .store(smoothed_load_pct.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// Build a cpal output stream that drives the audiograph.
@@ -1180,4 +1325,115 @@ pub fn query_device_config() -> Result<(u32, u16), String> {
         .default_output_config()
         .map_err(|e| format!("Failed to get default config: {e}"))?;
     Ok((config.sample_rate().0, config.channels()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use super::{instrument_sound_fingerprint, CustomEnginePool, GateOffTracker};
+    use crate::sequencer::SequencerState;
+
+    #[test]
+    fn custom_engine_pool_prefers_inactive_voices_before_stealing() {
+        let mut pool = CustomEnginePool::new();
+        for lid in 1..=4 {
+            pool.add_voice(lid);
+        }
+
+        let a = pool.allocate_voice(0, 0.0, true);
+        let b = pool.allocate_voice(0, 4.0, true);
+        assert_eq!(a.logical_id, 1);
+        assert_eq!(b.logical_id, 2);
+        assert!(!a.stole_active_voice);
+        assert!(!b.stole_active_voice);
+
+        pool.release_voice_by_logical_id(a.logical_id);
+        pool.release_voice_by_logical_id(b.logical_id);
+
+        let c = pool.allocate_voice(0, 7.0, true);
+        let d = pool.allocate_voice(0, 11.0, true);
+        assert_eq!(c.logical_id, 3);
+        assert_eq!(d.logical_id, 4);
+        assert!(!c.stole_active_voice);
+        assert!(!d.stole_active_voice);
+    }
+
+    #[test]
+    fn custom_engine_pool_steals_same_tracks_active_voice_first() {
+        let mut pool = CustomEnginePool::new();
+        for lid in 1..=2 {
+            pool.add_voice(lid);
+        }
+
+        let first = pool.allocate_voice(0, 0.0, true);
+        let second = pool.allocate_voice(1, 4.0, true);
+        assert_eq!(first.logical_id, 1);
+        assert_eq!(second.logical_id, 2);
+
+        let stolen = pool.allocate_voice(1, 7.0, true);
+        assert!(stolen.stole_active_voice);
+        assert_eq!(stolen.previous_track, Some(1));
+        assert_eq!(stolen.logical_id, 2);
+    }
+
+    #[test]
+    fn custom_engine_pool_mono_reuses_same_tracks_voice_and_marks_active_steal() {
+        let mut pool = CustomEnginePool::new();
+        for lid in 1..=2 {
+            pool.add_voice(lid);
+        }
+
+        let first = pool.allocate_voice(3, 0.0, false);
+        let reused = pool.allocate_voice(3, 12.0, false);
+
+        assert_eq!(reused.logical_id, first.logical_id);
+        assert!(reused.stole_active_voice);
+        assert_eq!(reused.previous_track, Some(3));
+    }
+
+    #[test]
+    fn gate_off_tracker_cancel_removes_matching_pending_lids() {
+        let mut tracker = GateOffTracker::new();
+        tracker.schedule(10, 100.0);
+        tracker.schedule(20, 100.0);
+        tracker.cancel(10);
+
+        let expired = tracker.process(200);
+        assert_eq!(expired, vec![20]);
+    }
+
+    #[test]
+    fn sound_fingerprint_changes_when_step_sound_changes() {
+        let state = Arc::new(SequencerState::new(1, Vec::new()));
+        state.track_engine_ids[0].store(2, Ordering::Relaxed);
+        state.instrument_slots[0]
+            .num_params
+            .store(2, Ordering::Relaxed);
+        state.instrument_slots[0].defaults.set(0, 0.2);
+        state.instrument_slots[0].defaults.set(1, 0.4);
+
+        let base = instrument_sound_fingerprint(&state, 0, 2, Some(3));
+        state.instrument_slots[0].plocks.set(3, 1, 0.9);
+        let changed = instrument_sound_fingerprint(&state, 0, 2, Some(3));
+
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn sound_fingerprint_changes_when_base_note_changes() {
+        let state = Arc::new(SequencerState::new(1, Vec::new()));
+        state.track_engine_ids[0].store(5, Ordering::Relaxed);
+        state.instrument_slots[0]
+            .num_params
+            .store(1, Ordering::Relaxed);
+        state.instrument_slots[0].defaults.set(0, 0.5);
+
+        let base = instrument_sound_fingerprint(&state, 0, 5, None);
+        state.instrument_base_note_offsets[0].store(12.0f32.to_bits(), Ordering::Relaxed);
+        let changed = instrument_sound_fingerprint(&state, 0, 5, None);
+
+        assert_ne!(base, changed);
+    }
 }

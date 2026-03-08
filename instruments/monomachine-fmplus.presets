@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "engine_name": "monomachine-fmplus",
+  "source_file": "instruments/monomachine-fmplus.lisp",
+  "presets": [
+    {
+      "id": "fm-static",
+      "name": "FM+ STATIC",
+      "base_note_offset": 0.0,
+      "params": {
+        "crossmod": 0.0,
+        "dyn_index_amt": 0.0,
+        "feedback_a": 0.06,
+        "feedback_b": 0.0,
+        "gain": 0.13,
+        "index_a": 1.85,
+        "index_b": 0.0,
+        "mod_decay_ms": 140.0,
+        "parallel_mix": 0.0,
+        "ratio_a": 1.0,
+        "ratio_b": 2.0,
+        "ratio_c": 1.0,
+        "ratio_d": 3.0,
+        "resonance": 0.7,
+        "tone": 5200.0,
+        "vibrato_depth": 0.0
+      }
+    },
+    {
+      "id": "fm-parallel",
+      "name": "FM+ PARALLEL",
+      "base_note_offset": 0.0,
+      "params": {
+        "crossmod": 0.0,
+        "dyn_index_amt": 0.0,
+        "feedback_a": 0.04,
+        "feedback_b": 0.1,
+        "gain": 0.12,
+        "index_a": 1.3,
+        "index_b": 2.1,
+        "parallel_mix": 1.0,
+        "ratio_a": 1.0,
+        "ratio_b": 2.0,
+        "ratio_c": 1.0,
+        "ratio_d": 3.0,
+        "resonance": 0.82,
+        "tone": 4600.0,
+        "vibrato_depth": 0.02
+      }
+    },
+    {
+      "id": "fm-dynamic",
+      "name": "FM+ DYNAMIC",
+      "base_note_offset": 0.0,
+      "params": {
+        "crossmod": 1.2,
+        "dyn_index_amt": 3.6,
+        "feedback_a": 0.14,
+        "feedback_b": 0.08,
+        "gain": 0.11,
+        "index_a": 1.1,
+        "index_b": 1.4,
+        "mod_attack_ms": 1.0,
+        "mod_decay_ms": 220.0,
+        "mod_release_ms": 180.0,
+        "mod_sustain": 0.0,
+        "parallel_mix": 0.46,
+        "ratio_a": 1.0,
+        "ratio_b": 4.0,
+        "ratio_c": 0.5,
+        "ratio_d": 7.0,
+        "resonance": 1.0,
+        "tone": 3600.0,
+        "vibrato_depth": 0.03
+      }
+    },
+    {
+      "id": "fm-collapse",
+      "name": "FM+ COLLAPSE",
+      "base_note_offset": 0.0,
+      "params": {
+        "crossmod": 3.8,
+        "dyn_index_amt": 6.5,
+        "feedback_a": 0.52,
+        "feedback_b": 0.34,
+        "filter_drive": 1.9,
+        "gain": 0.09,
+        "glitch_amt": 0.56,
+        "glitch_rate": 17.0,
+        "index_a": 2.2,
+        "index_b": 3.1,
+        "mod_attack_ms": 1.0,
+        "mod_decay_ms": 420.0,
+        "parallel_mix": 0.58,
+        "ratio_a": 1.0,
+        "ratio_b": 6.0,
+        "ratio_c": 0.5,
+        "ratio_d": 9.0,
+        "ratio_warp": 5.0,
+        "resonance": 1.25,
+        "self_fm": 1.9,
+        "tone": 2900.0,
+        "vibrato_depth": 0.08
+      }
+    }
+  ]
+}

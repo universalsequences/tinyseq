@@ -7,7 +7,7 @@ use crate::sequencer::StepParam;
 
 use super::browser::draw_sidebar;
 use super::cirklon::draw_cirklon_region;
-use super::effects::{draw_compiling_overlay, draw_effect_picker, draw_instrument_picker};
+use super::effects_draw::{draw_compiling_overlay, draw_effect_picker, draw_instrument_picker};
 use super::params::draw_params_region;
 use super::{App, InputMode, Region, SidebarMode};
 
@@ -88,6 +88,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     use super::PatternBtn;
+    const AUDIO_STATUS_WIDTH: u16 = 31;
 
     // ── Play button (3 chars) ──
     let play_label = if app.state.is_playing() {
@@ -182,7 +183,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     let num_pats = app.state.num_patterns.load(Ordering::Relaxed) as usize;
 
     let row1_y = area.y + 1;
-    let row1_w = area.width.saturating_sub(22); // leave room for stereo meter
+    let row1_w = area.width.saturating_sub(AUDIO_STATUS_WIDTH); // leave room for meter + CPU box
     let row1_area = Rect::new(area.x, row1_y, row1_w, 1);
     app.ui.layout.pattern_buttons_area = row1_area;
 
@@ -250,16 +251,21 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     let meter_width = 20u16;
+    let cpu_width = 11u16;
+    let gap_width = 1u16;
     let meter_height = 2u16;
-    if area.width < meter_width + 2 || area.height < meter_height {
+    let total_width = meter_width + gap_width + cpu_width;
+    if area.width < total_width + 2 || area.height < meter_height {
         return;
     }
 
-    let x = area.x + area.width - meter_width - 1;
+    let cpu_x = area.x + area.width - cpu_width - 1;
+    let x = cpu_x - gap_width - meter_width;
     let y = area.y;
 
     let peak_l = f32::from_bits(app.state.peak_l.load(Ordering::Relaxed));
     let peak_r = f32::from_bits(app.state.peak_r.load(Ordering::Relaxed));
+    let cpu_load_pct = f32::from_bits(app.state.cpu_load_pct.load(Ordering::Relaxed));
 
     let bar_width = (meter_width - 3) as usize;
 
@@ -310,6 +316,28 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
     r_spans.extend(render_bar(peak_r));
     let r_line = Line::from(r_spans);
     frame.render_widget(Paragraph::new(r_line), Rect::new(x, y + 1, meter_width, 1));
+
+    let cpu_color = if cpu_load_pct >= 95.0 {
+        Color::Red
+    } else if cpu_load_pct >= 75.0 {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+
+    let cpu_label = Line::from(vec![Span::styled(
+        format!("{:>10}", "CPU"),
+        Style::default().fg(Color::DarkGray).bold(),
+    )]);
+    let cpu_value = Line::from(vec![Span::styled(
+        format!("{:>10.1}%", cpu_load_pct),
+        Style::default().fg(cpu_color).bold(),
+    )]);
+    frame.render_widget(Paragraph::new(cpu_label), Rect::new(cpu_x, y, cpu_width, 1));
+    frame.render_widget(
+        Paragraph::new(cpu_value),
+        Rect::new(cpu_x, y + 1, cpu_width, 1),
+    );
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {

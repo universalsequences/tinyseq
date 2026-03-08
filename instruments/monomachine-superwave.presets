@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "engine_name": "monomachine-superwave",
+  "source_file": "instruments/monomachine-superwave.lisp",
+  "presets": [
+    {
+      "id": "swave-saw",
+      "name": "SWAVE SAW",
+      "base_note_offset": 0.0,
+      "params": {
+        "brightness": 0.22,
+        "cutoff": 5400.0,
+        "detune_cents": 15.0,
+        "drive": 1.1,
+        "filter_env_amt": 1800.0,
+        "gain": 0.11,
+        "motion_depth": 0.05,
+        "motion_rate": 0.18,
+        "noise_level": 0.0,
+        "phase_smear": 0.08,
+        "pulse_mix": 0.0,
+        "pulse_width": 0.5,
+        "resonance": 0.7,
+        "saw_mix": 1.0,
+        "sub_level": 0.0
+      }
+    },
+    {
+      "id": "swave-pulse",
+      "name": "SWAVE PULSE",
+      "base_note_offset": 0.0,
+      "params": {
+        "brightness": 0.3,
+        "cutoff": 4200.0,
+        "detune_cents": 18.0,
+        "drive": 1.2,
+        "filter_env_amt": 2400.0,
+        "gain": 0.11,
+        "motion_depth": 0.07,
+        "motion_rate": 0.26,
+        "phase_smear": 0.16,
+        "pulse_mix": 1.0,
+        "pulse_width": 0.42,
+        "resonance": 0.9,
+        "saw_mix": 0.0,
+        "sub_level": 0.08
+      }
+    },
+    {
+      "id": "swave-ens",
+      "name": "SWAVE ENS",
+      "base_note_offset": 0.0,
+      "params": {
+        "amp_attack_ms": 18.0,
+        "amp_release_ms": 320.0,
+        "brightness": 0.45,
+        "cutoff": 3600.0,
+        "detune_cents": 24.0,
+        "drive": 1.0,
+        "filter_env_amt": 1200.0,
+        "gain": 0.1,
+        "motion_depth": 0.16,
+        "motion_rate": 0.38,
+        "phase_smear": 0.26,
+        "pulse_mix": 0.34,
+        "pulse_width": 0.48,
+        "resonance": 0.8,
+        "saw_mix": 0.84,
+        "sub_level": 0.14
+      }
+    },
+    {
+      "id": "swave-shred",
+      "name": "SWAVE SHRED",
+      "base_note_offset": 0.0,
+      "params": {
+        "brightness": 0.82,
+        "chaos": 0.62,
+        "comb_amt": 0.44,
+        "comb_time": 31.0,
+        "cutoff": 2800.0,
+        "detune_cents": 30.0,
+        "drive": 2.4,
+        "filter_env_amt": 3200.0,
+        "fm_smear": 0.95,
+        "gain": 0.09,
+        "motion_depth": 0.22,
+        "motion_rate": 1.8,
+        "phase_smear": 0.36,
+        "pulse_mix": 0.48,
+        "pulse_width": 0.37,
+        "pwm_warp": 0.45,
+        "resonance": 1.6,
+        "saw_mix": 1.0,
+        "sub_level": 0.18,
+        "swarm": 0.78
+      }
+    }
+  ]
+}

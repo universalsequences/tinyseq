@@ -608,8 +608,10 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
     }
   }
 
-  // Relaxed is fine here - just a counter
-  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_relaxed);
+  // Publish this node's output writes before signaling global block completion.
+  // The audio thread waits on jobsInFlight with acquire loads, so the final
+  // transition to zero must carry release semantics.
+  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_release);
 }
 
 // Check if a node has any connected outputs (for scheduling)
@@ -804,6 +806,11 @@ void process_live_block(LiveGraph *lg, int nframes) {
         }
       }
     }
+
+    // Paired with the release decrement in execute_and_fanout so downstream
+    // consumers (DAC copy, watch snapshots, retire list) see completed node
+    // writes from all worker threads.
+    atomic_thread_fence(memory_order_acquire);
 
     // Clear session
     atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);

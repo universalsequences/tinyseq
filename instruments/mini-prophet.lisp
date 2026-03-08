@@ -61,7 +61,8 @@
 
 (def voiced (* osc_mix (+ 0.35 (* 0.65 velocity))))
 (def driven (tanh (* voiced drive)))
-(def filter_cutoff (clip (+ cutoff (* filt_env filter_env_amt) (* pitch keytrack)) 30 10000))
-(def filtered (biquad driven filter_cutoff resonance 1 0))
+(def safe_filter_cutoff (min 10000 (max 30 (+ cutoff (* filt_env filter_env_amt) (* pitch keytrack)))))
+(def safe_resonance (min 4.0 (max 0.35 resonance)))
+(def filtered (biquad driven safe_filter_cutoff safe_resonance 1 0))
 (def body filtered)
 (out (* body amp_env velocity gain) 1 @name audio)

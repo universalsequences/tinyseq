@@ -13,6 +13,7 @@ mod browser;
 mod cirklon;
 mod draw;
 mod effects;
+mod effects_draw;
 mod graph;
 mod input;
 mod params;
@@ -77,17 +78,60 @@ struct PendingCompile {
     tick: usize,
 }
 
-pub struct CachedInstrumentEngine {
+pub struct EngineDescriptor {
     pub name: String,
     pub source: String,
     pub manifest: DGenManifest,
     pub lib_index: usize,
 }
 
+#[derive(Default)]
+pub struct EngineRegistry {
+    pub engines: Vec<EngineDescriptor>,
+}
+
+impl EngineRegistry {
+    pub fn find_by_name_and_source(&self, name: &str, source: &str) -> Option<usize> {
+        self.engines
+            .iter()
+            .position(|entry| entry.name == name && entry.source == source)
+    }
+
+    pub fn get(&self, engine_id: usize) -> Option<&EngineDescriptor> {
+        self.engines.get(engine_id)
+    }
+
+    pub fn upsert(&mut self, entry: EngineDescriptor) -> usize {
+        if let Some(existing_idx) = self.find_by_name_and_source(&entry.name, &entry.source) {
+            self.engines[existing_idx] = entry;
+            existing_idx
+        } else {
+            self.engines.push(entry);
+            self.engines.len() - 1
+        }
+    }
+}
+
 pub struct EngineNodeIds {
     pub synth_ids: Vec<i32>,
     pub gatepitch_ids: Vec<i32>,
     pub route_gain_ids: Vec<Vec<i32>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ParamMouseDragTarget {
+    TrackParam { row_idx: usize },
+    SynthParam { row_idx: usize },
+    EffectParam { slot_idx: usize, param_idx: usize },
+    ReverbParam { param_idx: usize },
+}
+
+#[derive(Clone, Copy)]
+pub struct ParamMouseDrag {
+    pub track: usize,
+    pub target: ParamMouseDragTarget,
+    pub start_col: u16,
+    pub start_display_value: f32,
 }
 
 pub struct EditorState {
@@ -99,7 +143,7 @@ pub struct EditorState {
     pub picker_filter: String,
     pub picker_items: Vec<String>,
     pub status_message: Option<(String, Instant)>,
-    pub cached_instruments: Vec<CachedInstrumentEngine>,
+    pub engine_registry: EngineRegistry,
 }
 
 pub struct BrowserState {
@@ -265,6 +309,7 @@ pub struct UiState {
     pub instrument_param_cursor: usize,
     pub synth_scroll_offset: usize,
     pub preset_prompt_kind: PresetPromptKind,
+    pub param_mouse_drag: Option<ParamMouseDrag>,
 }
 
 pub struct App {
@@ -343,6 +388,7 @@ impl App {
                 instrument_param_cursor: 0,
                 synth_scroll_offset: 0,
                 preset_prompt_kind: PresetPromptKind::SaveNew,
+                param_mouse_drag: None,
             },
             editor: EditorState {
                 pending_editor: None,
@@ -353,7 +399,7 @@ impl App {
                 picker_filter: String::new(),
                 picker_items: Vec::new(),
                 status_message: None,
-                cached_instruments: Vec::new(),
+                engine_registry: EngineRegistry::default(),
             },
             browser: BrowserState {
                 tree: browser_tree,

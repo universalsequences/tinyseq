@@ -471,7 +471,8 @@ pub unsafe fn add_effect_to_chain_at(
     set_dgen_process_fn(slot_id, lib.process_fn);
 
     // Full state allocation (header + distinct read/write buffers), zeroed by the engine
-    let state_size = dgen_total_state_slots(manifest.total_memory_slots) * std::mem::size_of::<f32>();
+    let state_size =
+        dgen_total_state_slots(manifest.total_memory_slots) * std::mem::size_of::<f32>();
 
     // Compact init message: only header + non-zero index/value pairs
     let init_msg = build_init_message(slot_id, manifest);
@@ -960,7 +961,7 @@ pub fn compile_instrument(source: &str, sample_rate: u32) -> Result<String, Stri
         .args(["-o", dir.to_str().unwrap()])
         .args(["--name", &dylib_name])
         .args(["--sample-rate", &sample_rate.to_string()])
-        .args(["--voices", "6"])
+        .args(["--voices", "12"])
         .output()
         .map_err(|e| format!("Failed to run DGenLisp: {e}"))?;
 
