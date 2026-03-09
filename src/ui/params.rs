@@ -335,10 +335,7 @@ impl App {
             let Some(&param_idx) = mod_indices.get(self.ui.mod_param_cursor) else {
                 return;
             };
-            let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
-            slot.defaults.set(param_idx, val);
-            self.send_instrument_param(self.ui.cursor_track, param_idx, val);
-            self.mark_track_sound_dirty(self.ui.cursor_track);
+            self.set_instrument_param_or_plock(self.ui.cursor_track, param_idx, val);
             return;
         }
         if self.ui.effect_tab == EffectTab::Sources {
@@ -347,10 +344,7 @@ impl App {
             let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
                 return;
             };
-            let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
-            slot.defaults.set(param_idx, val);
-            self.send_instrument_param(self.ui.cursor_track, param_idx, val);
-            self.mark_track_sound_dirty(self.ui.cursor_track);
+            self.set_instrument_param_or_plock(self.ui.cursor_track, param_idx, val);
             return;
         }
 

@@ -396,8 +396,16 @@ pub(super) fn draw_effects_column(
 
             let actual_idx = mod_indices[row_idx];
             let param_desc = &desc.params[row_idx];
-            let default_val = slot.defaults.get(actual_idx);
             let is_cursor_row = col_focused && app.ui.mod_param_cursor == row_idx;
+            let (display_stored, is_plock) = if app.has_selection() && is_cursor_row {
+                let step = app.ui.cursor_step;
+                match slot.plocks.get(step, actual_idx) {
+                    Some(v) => (v, true),
+                    None => (slot.defaults.get(actual_idx), false),
+                }
+            } else {
+                (slot.defaults.get(actual_idx), false)
+            };
             let cursor = if is_cursor_row { "> " } else { "  " };
             let cursor_style = if is_cursor_row {
                 Style::default().fg(Color::Yellow)
@@ -426,8 +434,8 @@ pub(super) fn draw_effects_column(
                 continue;
             }
 
-            let display_val = param_desc.format_value(default_val);
-            let norm = param_desc.normalize(default_val);
+            let display_val = param_desc.format_value(display_stored);
+            let norm = param_desc.normalize(display_stored);
             let fill = ((slider_width as f32 * norm).round() as usize).min(slider_width);
             let bar = format!("{}{}", "─".repeat(fill), " ".repeat(slider_width.saturating_sub(fill)));
             let label_style = if is_cursor_row {
@@ -435,7 +443,9 @@ pub(super) fn draw_effects_column(
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let value_style = if is_cursor_row {
+            let value_style = if is_plock {
+                Style::default().fg(Color::Cyan)
+            } else if is_cursor_row {
                 Style::default().fg(Color::Rgb(255, 210, 120))
             } else {
                 Style::default().fg(Color::Rgb(100, 200, 140))
@@ -518,8 +528,16 @@ pub(super) fn draw_effects_column(
             };
             let actual_idx = source_indices[row_idx];
             let param_desc = &desc.params[row_idx];
-            let default_val = slot.defaults.get(actual_idx);
             let is_cursor_row = col_focused && app.ui.source_param_cursor == row_idx;
+            let (display_stored, is_plock) = if app.has_selection() && is_cursor_row {
+                let step = app.ui.cursor_step;
+                match slot.plocks.get(step, actual_idx) {
+                    Some(v) => (v, true),
+                    None => (slot.defaults.get(actual_idx), false),
+                }
+            } else {
+                (slot.defaults.get(actual_idx), false)
+            };
             let cursor = if is_cursor_row { "> " } else { "  " };
             let cursor_style = if is_cursor_row {
                 Style::default().fg(Color::Yellow)
@@ -548,8 +566,8 @@ pub(super) fn draw_effects_column(
                 continue;
             }
 
-            let display_val = param_desc.format_value(default_val);
-            let norm = param_desc.normalize(default_val);
+            let display_val = param_desc.format_value(display_stored);
+            let norm = param_desc.normalize(display_stored);
             let fill = ((slider_width as f32 * norm).round() as usize).min(slider_width);
             let bar = format!(
                 "{}{}",
@@ -561,7 +579,9 @@ pub(super) fn draw_effects_column(
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let value_style = if is_cursor_row {
+            let value_style = if is_plock {
+                Style::default().fg(Color::Cyan)
+            } else if is_cursor_row {
                 Style::default().fg(Color::Rgb(255, 220, 140))
             } else {
                 Style::default().fg(Color::Rgb(220, 180, 120))

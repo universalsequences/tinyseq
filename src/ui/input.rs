@@ -1117,10 +1117,7 @@ impl App {
                     };
                     let param_desc = &desc.params[param_idx];
                     let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
-                    let slot = &self.state.pattern.instrument_slots[track];
-                    slot.defaults.set(param_idx, store_val);
-                    self.send_instrument_param(track, param_idx, store_val);
-                    self.mark_track_sound_dirty(track);
+                    self.set_instrument_param_or_plock(track, param_idx, store_val);
                 } else if self.ui.effect_tab == EffectTab::Sources {
                     let track = self.ui.cursor_track;
                     let source_indices = self.source_param_actual_indices(track);
@@ -1133,10 +1130,7 @@ impl App {
                     };
                     let param_desc = &desc.params[param_idx];
                     let store_val = param_desc.clamp(param_desc.user_input_to_stored(val));
-                    let slot = &self.state.pattern.instrument_slots[track];
-                    slot.defaults.set(param_idx, store_val);
-                    self.send_instrument_param(track, param_idx, store_val);
-                    self.mark_track_sound_dirty(track);
+                    self.set_instrument_param_or_plock(track, param_idx, store_val);
                 } else if self.ui.effect_tab == EffectTab::Synth {
                     // Synth tab value entry
                     let track = self.ui.cursor_track;
@@ -1165,9 +1159,7 @@ impl App {
                                 slot.plocks.set(step, param_idx, store_val);
                             }
                         } else {
-                            slot.defaults.set(param_idx, store_val);
-                            self.send_instrument_param(track, param_idx, store_val);
-                            self.mark_track_sound_dirty(track);
+                            self.set_instrument_param_or_plock(track, param_idx, store_val);
                         }
                     }
                 } else {

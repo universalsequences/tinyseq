@@ -21,6 +21,7 @@ const IDX_RNG: usize = 7;
 const IDX_RAND_HOLD: usize = 8;
 const IDX_RAND_SMOOTH: usize = 9;
 const IDX_LAST_RESET_COUNTER: usize = 10;
+const IDX_ENV_STAGE: usize = 11;
 const IDX_SAMPLE_RATE: usize = 48;
 
 pub const PARAM_LFO1_RATE_HZ: usize = 13;
@@ -66,6 +67,11 @@ const SHAPE_TRIANGLE: usize = 0;
 const SHAPE_SINE: usize = 1;
 const SHAPE_PULSE: usize = 2;
 const SHAPE_SAW: usize = 3;
+const ENV_STAGE_IDLE: f32 = 0.0;
+const ENV_STAGE_ATTACK: f32 = 1.0;
+const ENV_STAGE_DECAY: f32 = 2.0;
+const ENV_STAGE_SUSTAIN: f32 = 3.0;
+const ENV_STAGE_RELEASE: f32 = 4.0;
 
 fn sync_labels() -> Vec<String> {
     SYNC_RESOLUTIONS
@@ -321,6 +327,7 @@ unsafe extern "C" fn voice_modulator_process(
     let mut rand_hold = *s.add(IDX_RAND_HOLD);
     let mut rand_smooth = *s.add(IDX_RAND_SMOOTH);
     let mut last_reset_counter = *s.add(IDX_LAST_RESET_COUNTER);
+    let mut env_stage = *s.add(IDX_ENV_STAGE);
 
     let sample_rate = (*s.add(IDX_SAMPLE_RATE)).max(1.0);
     let bpm = (*s.add(PARAM_BPM)).clamp(20.0, 400.0);
@@ -334,6 +341,8 @@ unsafe extern "C" fn voice_modulator_process(
         rand_hold = 0.0;
         rand_smooth = 0.0;
         drift = 0.0;
+        env2 = 0.0;
+        env_stage = ENV_STAGE_IDLE;
         last_reset_counter = reset_counter;
     }
 
@@ -380,6 +389,7 @@ unsafe extern "C" fn voice_modulator_process(
         let note_on = gate_rising || trigger > 0.5;
         if note_on {
             env2 = 0.0;
+            env_stage = ENV_STAGE_ATTACK;
             rand_hold = next_rand(&mut rng_state);
             if lfo1_retrigger {
                 lfo1_phase = 0.0;
@@ -403,16 +413,37 @@ unsafe extern "C" fn voice_modulator_process(
         }
         rand_smooth += (rand_hold - rand_smooth) * (1.0 - rand_slew);
 
-        if gate > 0.5 {
-            if env2 < 0.999 {
-                env2 = (env2 + env_attack).min(1.0);
-            } else {
-                env2 += (env_sustain - env2) * env_decay;
+        if gate <= 0.5 && env_stage != ENV_STAGE_IDLE && env_stage != ENV_STAGE_RELEASE {
+            env_stage = ENV_STAGE_RELEASE;
+        }
+
+        if env_stage == ENV_STAGE_ATTACK {
+            env2 = (env2 + env_attack).min(1.0);
+            if env2 >= 0.999 {
+                env2 = 1.0;
+                env_stage = ENV_STAGE_DECAY;
             }
-        } else if env2 > env_sustain + 0.001 {
+        } else if env_stage == ENV_STAGE_DECAY {
             env2 += (env_sustain - env2) * env_decay;
-        } else {
+            if (env2 - env_sustain).abs() <= 0.001 {
+                env2 = env_sustain;
+                env_stage = if gate > 0.5 {
+                    ENV_STAGE_SUSTAIN
+                } else {
+                    ENV_STAGE_RELEASE
+                };
+            }
+        } else if env_stage == ENV_STAGE_SUSTAIN {
+            env2 = env_sustain;
+            if gate <= 0.5 {
+                env_stage = ENV_STAGE_RELEASE;
+            }
+        } else if env_stage == ENV_STAGE_RELEASE {
             env2 += (0.0 - env2) * env_release;
+            if env2 <= 0.0005 {
+                env2 = 0.0;
+                env_stage = ENV_STAGE_IDLE;
+            }
         }
         env2 = env2.clamp(0.0, 1.0);
 
@@ -440,6 +471,7 @@ unsafe extern "C" fn voice_modulator_process(
     *s.add(IDX_RAND_HOLD) = rand_hold;
     *s.add(IDX_RAND_SMOOTH) = rand_smooth;
     *s.add(IDX_LAST_RESET_COUNTER) = last_reset_counter;
+    *s.add(IDX_ENV_STAGE) = env_stage;
 }
 
 pub fn voice_modulator_vtable() -> NodeVTable {

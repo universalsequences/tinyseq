@@ -535,10 +535,7 @@ impl App {
                 let new_display =
                     self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
-                let slot = &self.state.pattern.instrument_slots[drag.track];
-                slot.defaults.set(param_idx, new_stored);
-                self.send_instrument_param(drag.track, param_idx, new_stored);
-                self.mark_track_sound_dirty(drag.track);
+                self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
             ParamMouseDragTarget::ModParam { row_idx } => {
                 let mod_indices = self.mod_param_indices(drag.track);
@@ -554,10 +551,7 @@ impl App {
                 let new_display =
                     self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
-                let slot = &self.state.pattern.instrument_slots[drag.track];
-                slot.defaults.set(param_idx, new_stored);
-                self.send_instrument_param(drag.track, param_idx, new_stored);
-                self.mark_track_sound_dirty(drag.track);
+                self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
             ParamMouseDragTarget::SourceParam { row_idx } => {
                 let source_indices = self.source_param_actual_indices(drag.track);
@@ -573,10 +567,7 @@ impl App {
                 let new_display =
                     self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
-                let slot = &self.state.pattern.instrument_slots[drag.track];
-                slot.defaults.set(param_idx, new_stored);
-                self.send_instrument_param(drag.track, param_idx, new_stored);
-                self.mark_track_sound_dirty(drag.track);
+                self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
             ParamMouseDragTarget::EffectParam { slot_idx, param_idx } => {
                 let Some(desc) = self

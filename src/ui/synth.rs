@@ -847,6 +847,19 @@ impl App {
             .and_then(|(_, maybe_row)| *maybe_row)
     }
 
+    pub(super) fn set_instrument_param_or_plock(&self, track: usize, param_idx: usize, value: f32) {
+        let slot = &self.state.pattern.instrument_slots[track];
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                slot.plocks.set(step, param_idx, value);
+            }
+        } else {
+            slot.defaults.set(param_idx, value);
+            self.send_instrument_param(track, param_idx, value);
+            self.mark_track_sound_dirty(track);
+        }
+    }
+
     fn adjust_instrument_param(&self, direction: f32) {
         let track = self.ui.cursor_track;
         if self.ui.instrument_param_cursor == 0 {
@@ -881,9 +894,7 @@ impl App {
             let old = slot.defaults.get(param_idx);
             let inc = param_desc.increment(old);
             let new_val = param_desc.clamp(old + direction * inc);
-            slot.defaults.set(param_idx, new_val);
-            self.send_instrument_param(track, param_idx, new_val);
-            self.mark_track_sound_dirty(track);
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
         }
     }
 
@@ -901,12 +912,22 @@ impl App {
             return;
         };
         let slot = &self.state.pattern.instrument_slots[track];
-        let old = slot.defaults.get(param_idx);
-        let inc = param_desc.increment(old);
-        let new_val = param_desc.clamp(old + direction * inc);
-        slot.defaults.set(param_idx, new_val);
-        self.send_instrument_param(track, param_idx, new_val);
-        self.mark_track_sound_dirty(track);
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let inc = param_desc.increment(current);
+                let new_val = param_desc.clamp(current + direction * inc);
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let old = slot.defaults.get(param_idx);
+            let inc = param_desc.increment(old);
+            let new_val = param_desc.clamp(old + direction * inc);
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
+        }
     }
 
     fn adjust_source_param(&self, direction: f32) {
@@ -923,12 +944,22 @@ impl App {
             return;
         };
         let slot = &self.state.pattern.instrument_slots[track];
-        let old = slot.defaults.get(param_idx);
-        let inc = param_desc.increment(old);
-        let new_val = param_desc.clamp(old + direction * inc);
-        slot.defaults.set(param_idx, new_val);
-        self.send_instrument_param(track, param_idx, new_val);
-        self.mark_track_sound_dirty(track);
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let inc = param_desc.increment(current);
+                let new_val = param_desc.clamp(current + direction * inc);
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let old = slot.defaults.get(param_idx);
+            let inc = param_desc.increment(old);
+            let new_val = param_desc.clamp(old + direction * inc);
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
+        }
     }
 
     pub(super) fn send_instrument_param(&self, track: usize, param_idx: usize, value: f32) {
@@ -1021,9 +1052,7 @@ impl App {
         } else {
             let current = slot.defaults.get(param_idx);
             let new_val = if current > 0.5 { 0.0 } else { 1.0 };
-            slot.defaults.set(param_idx, new_val);
-            self.send_instrument_param(track, param_idx, new_val);
-            self.mark_track_sound_dirty(track);
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
         }
     }
 
@@ -1034,11 +1063,20 @@ impl App {
             return;
         };
         let slot = &self.state.pattern.instrument_slots[track];
-        let current = slot.defaults.get(param_idx);
-        let new_val = if current > 0.5 { 0.0 } else { 1.0 };
-        slot.defaults.set(param_idx, new_val);
-        self.send_instrument_param(track, param_idx, new_val);
-        self.mark_track_sound_dirty(track);
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let current = slot.defaults.get(param_idx);
+            let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
+        }
     }
 
     fn toggle_source_boolean(&self) {
@@ -1048,11 +1086,20 @@ impl App {
             return;
         };
         let slot = &self.state.pattern.instrument_slots[track];
-        let current = slot.defaults.get(param_idx);
-        let new_val = if current > 0.5 { 0.0 } else { 1.0 };
-        slot.defaults.set(param_idx, new_val);
-        self.send_instrument_param(track, param_idx, new_val);
-        self.mark_track_sound_dirty(track);
+        if self.has_selection() {
+            for step in self.selected_steps() {
+                let current = slot
+                    .plocks
+                    .get(step, param_idx)
+                    .unwrap_or_else(|| slot.defaults.get(param_idx));
+                let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+                slot.plocks.set(step, param_idx, new_val);
+            }
+        } else {
+            let current = slot.defaults.get(param_idx);
+            let new_val = if current > 0.5 { 0.0 } else { 1.0 };
+            self.set_instrument_param_or_plock(track, param_idx, new_val);
+        }
     }
 }
 
