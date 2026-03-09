@@ -10,6 +10,197 @@ pub(super) const SYNTH_TWO_COLUMN_MIN_WIDTH: u16 = 88;
 pub(super) const SYNTH_COLUMN_GAP: u16 = 2;
 
 impl App {
+    pub(super) fn source_param_actual_indices(&self, track: usize) -> Vec<usize> {
+        let Some(desc) = self.graph.instrument_descriptors.get(track) else {
+            return Vec::new();
+        };
+        let slot = &self.state.pattern.instrument_slots[track];
+        let source_indices = self.source_param_indices(track);
+
+        let find_idx_by_node = |node_param_idx: u32| {
+            source_indices
+                .iter()
+                .copied()
+                .find(|&idx| desc.params.get(idx).map(|p| p.node_param_idx) == Some(node_param_idx))
+        };
+
+        let mut out = Vec::new();
+
+        let lfo_sync = |sync_idx: u32| -> bool {
+            find_idx_by_node(sync_idx)
+                .map(|idx| slot.defaults.get(idx) > 0.5)
+                .unwrap_or(false)
+        };
+        let lfo_shape_is_pulse = |shape_idx: u32| -> bool {
+            find_idx_by_node(shape_idx)
+                .map(|idx| slot.defaults.get(idx).round() as i32 == 2)
+                .unwrap_or(false)
+        };
+
+        let push_lfo = |out: &mut Vec<usize>, rate_idx: usize, sync_idx: usize, div_idx: usize, shape_idx: usize, pw_idx: usize, retrig_idx: usize| {
+            let rate_node = crate::voice_modulator::MOD_PARAM_BASE + rate_idx as u32;
+            let sync_node = crate::voice_modulator::MOD_PARAM_BASE + sync_idx as u32;
+            let div_node = crate::voice_modulator::MOD_PARAM_BASE + div_idx as u32;
+            let shape_node = crate::voice_modulator::MOD_PARAM_BASE + shape_idx as u32;
+            let pw_node = crate::voice_modulator::MOD_PARAM_BASE + pw_idx as u32;
+            let retrig_node = crate::voice_modulator::MOD_PARAM_BASE + retrig_idx as u32;
+
+            if let Some(idx) = if lfo_sync(sync_node) { find_idx_by_node(div_node) } else { find_idx_by_node(rate_node) } {
+                out.push(idx);
+            }
+            if let Some(idx) = find_idx_by_node(sync_node) {
+                out.push(idx);
+            }
+            if let Some(idx) = find_idx_by_node(shape_node) {
+                out.push(idx);
+            }
+            if let Some(idx) = find_idx_by_node(retrig_node) {
+                out.push(idx);
+            }
+            if lfo_shape_is_pulse(shape_node) {
+                if let Some(idx) = find_idx_by_node(pw_node) {
+                    out.push(idx);
+                }
+            }
+        };
+
+        push_lfo(
+            &mut out,
+            crate::voice_modulator::PARAM_LFO1_RATE_HZ,
+            crate::voice_modulator::PARAM_LFO1_SYNC,
+            crate::voice_modulator::PARAM_LFO1_DIV,
+            crate::voice_modulator::PARAM_LFO1_SHAPE,
+            crate::voice_modulator::PARAM_LFO1_PW,
+            crate::voice_modulator::PARAM_LFO1_RETRIGGER,
+        );
+
+        for idx_const in [
+            crate::voice_modulator::PARAM_ENV_ATTACK_MS,
+            crate::voice_modulator::PARAM_ENV_DECAY_MS,
+            crate::voice_modulator::PARAM_ENV_SUSTAIN,
+            crate::voice_modulator::PARAM_ENV_RELEASE_MS,
+        ] {
+            if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + idx_const as u32) {
+                out.push(idx);
+            }
+        }
+
+        if let Some(idx) = if lfo_sync(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32) {
+            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_DIV as u32)
+        } else {
+            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32)
+        } {
+            out.push(idx);
+        }
+        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32) {
+            out.push(idx);
+        }
+        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SLEW as u32) {
+            out.push(idx);
+        }
+
+        if let Some(idx) = if lfo_sync(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_SYNC as u32) {
+            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_DIV as u32)
+        } else {
+            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_RATE as u32)
+        } {
+            out.push(idx);
+        }
+        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_SYNC as u32) {
+            out.push(idx);
+        }
+
+        push_lfo(
+            &mut out,
+            crate::voice_modulator::PARAM_LFO2_RATE_HZ,
+            crate::voice_modulator::PARAM_LFO2_SYNC,
+            crate::voice_modulator::PARAM_LFO2_DIV,
+            crate::voice_modulator::PARAM_LFO2_SHAPE,
+            crate::voice_modulator::PARAM_LFO2_PW,
+            crate::voice_modulator::PARAM_LFO2_RETRIGGER,
+        );
+        push_lfo(
+            &mut out,
+            crate::voice_modulator::PARAM_LFO3_RATE_HZ,
+            crate::voice_modulator::PARAM_LFO3_SYNC,
+            crate::voice_modulator::PARAM_LFO3_DIV,
+            crate::voice_modulator::PARAM_LFO3_SHAPE,
+            crate::voice_modulator::PARAM_LFO3_PW,
+            crate::voice_modulator::PARAM_LFO3_RETRIGGER,
+        );
+
+        out
+    }
+
+    pub(super) fn source_display_rows(&self, track: usize) -> Vec<(Option<&'static str>, Option<usize>)> {
+        let actual = self.source_param_actual_indices(track);
+        let Some(desc) = self.graph.instrument_descriptors.get(track) else {
+            return Vec::new();
+        };
+
+        let mut rows = Vec::new();
+        let mut cursor = 0usize;
+        let sections = [
+            ("LFO 1", 0usize),
+            ("ENV 1", 0usize),
+            ("RAND", 0usize),
+            ("DRIFT", 0usize),
+            ("LFO 2", 0usize),
+            ("LFO 3", 0usize),
+        ];
+
+        let section_name = |idx: usize, desc: &EffectDescriptor| -> &'static str {
+            let node_idx = desc.params[idx].node_param_idx;
+            if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO1_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO1_RETRIGGER as u32)
+                .contains(&node_idx)
+            {
+                "LFO 1"
+            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_ENV_ATTACK_MS as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_ENV_RELEASE_MS as u32)
+                .contains(&node_idx)
+            {
+                "ENV 1"
+            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SLEW as u32)
+                .contains(&node_idx)
+            {
+                "RAND"
+            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_RATE as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_DIV as u32)
+                .contains(&node_idx)
+            {
+                "DRIFT"
+            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO2_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO2_RETRIGGER as u32)
+                .contains(&node_idx)
+            {
+                "LFO 2"
+            } else {
+                "LFO 3"
+            }
+        };
+
+        for (section, _) in sections {
+            let section_params: Vec<usize> = actual
+                .iter()
+                .enumerate()
+                .filter_map(|(row_idx, &actual_idx)| (section_name(actual_idx, desc) == section).then_some(row_idx))
+                .collect();
+            if section_params.is_empty() {
+                continue;
+            }
+            rows.push((Some(section), None));
+            for row_idx in section_params {
+                rows.push((None, Some(row_idx)));
+            }
+            cursor += 1;
+            let _ = cursor;
+        }
+
+        rows
+    }
+
     fn is_modulation_param_name(name: &str) -> bool {
         name.starts_with("mod ")
     }
@@ -507,7 +698,7 @@ impl App {
                             self.ui.input_mode = InputMode::Dropdown;
                             let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
                             let actual_idx =
-                                self.source_param_indices(self.ui.cursor_track)[row_idx];
+                                self.source_param_actual_indices(self.ui.cursor_track)[row_idx];
                             let val = slot.defaults.get(actual_idx);
                             self.ui.dropdown_cursor = val.round() as usize;
                         }
@@ -557,10 +748,45 @@ impl App {
 
     pub(super) fn current_source_descriptor(&self) -> Option<EffectDescriptor> {
         let desc = self.current_instrument_descriptor()?;
+        let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
         let params = self
-            .source_param_indices(self.ui.cursor_track)
+            .source_param_actual_indices(self.ui.cursor_track)
             .into_iter()
             .filter_map(|i| desc.params.get(i).cloned())
+            .map(|mut p| {
+                if p.name.ends_with("_div") {
+                    p.name = "rate".to_string();
+                } else if p.name.ends_with("_rate") {
+                    p.name = "rate".to_string();
+                } else if p.name.ends_with("_sync") {
+                    p.name = "sync".to_string();
+                } else if p.name.ends_with("_shape") {
+                    p.name = "shape".to_string();
+                } else if p.name.ends_with("_pw") {
+                    p.name = "pulse width".to_string();
+                } else if p.name.ends_with("_retrigger") {
+                    p.name = "retrigger".to_string();
+                } else if p.name == "mod_rand_slew" {
+                    p.name = "slew".to_string();
+                } else if p.name == "mod_env_attack" {
+                    p.name = "attack".to_string();
+                } else if p.name == "mod_env_decay" {
+                    p.name = "decay".to_string();
+                } else if p.name == "mod_env_sustain" {
+                    p.name = "sustain".to_string();
+                } else if p.name == "mod_env_release" {
+                    p.name = "release".to_string();
+                }
+
+                if p.name == "rate" && matches!(p.kind, crate::effects::ParamKind::Enum { .. }) {
+                    p.scaling = crate::effects::ParamScaling::Linear;
+                }
+
+                if p.name == "sustain" {
+                    let _ = slot;
+                }
+                p
+            })
             .collect::<Vec<_>>();
         Some(EffectDescriptor {
             name: "Sources".to_string(),
@@ -591,7 +817,7 @@ impl App {
     }
 
     pub(super) fn source_row_display_value(&self, track: usize, row_idx: usize) -> Option<f32> {
-        let source_indices = self.source_param_indices(track);
+        let source_indices = self.source_param_actual_indices(track);
         let param_idx = *source_indices.get(row_idx)?;
         let desc = self.graph.instrument_descriptors.get(track)?;
         let param_desc = desc.params.get(param_idx)?;
@@ -600,52 +826,25 @@ impl App {
     }
 
     pub(super) fn source_param_count(&self) -> usize {
-        self.source_param_indices(self.ui.cursor_track).len()
+        self.source_param_actual_indices(self.ui.cursor_track).len()
     }
 
     fn source_display_row_count(&self) -> usize {
-        match self.source_param_count() {
-            0 => 0,
-            1 => 2,
-            2 => 4,
-            3 => 5,
-            4 => 6,
-            5 => 8,
-            6 => 10,
-            7 => 11,
-            8 => 13,
-            _ => 15,
-        }
+        self.source_display_rows(self.ui.cursor_track).len()
     }
 
     pub(super) fn source_display_row_for_param_row(&self, param_row: usize) -> usize {
-        match param_row {
-            0 => 1,
-            1 => 3,
-            2 => 4,
-            3 => 5,
-            4 => 6,
-            5 => 8,
-            6 => 10,
-            7 => 12,
-            8 => 14,
-            _ => 14 + param_row.saturating_sub(8),
-        }
+        self.source_display_rows(self.ui.cursor_track)
+            .iter()
+            .enumerate()
+            .find_map(|(display_idx, (_, maybe_row))| (*maybe_row == Some(param_row)).then_some(display_idx))
+            .unwrap_or(0)
     }
 
     pub(super) fn source_param_row_for_display(&self, display_row: usize) -> Option<usize> {
-        match display_row {
-            1 => Some(0),
-            3 => Some(1),
-            4 => Some(2),
-            5 => Some(3),
-            6 => Some(4),
-            8 => Some(5),
-            10 => Some(6),
-            12 => Some(7),
-            14 => Some(8),
-            _ => None,
-        }
+        self.source_display_rows(self.ui.cursor_track)
+            .get(display_row)
+            .and_then(|(_, maybe_row)| *maybe_row)
     }
 
     fn adjust_instrument_param(&self, direction: f32) {
@@ -712,7 +911,7 @@ impl App {
 
     fn adjust_source_param(&self, direction: f32) {
         let track = self.ui.cursor_track;
-        let source_indices = self.source_param_indices(track);
+        let source_indices = self.source_param_actual_indices(track);
         let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
             return;
         };
@@ -735,6 +934,9 @@ impl App {
     pub(super) fn send_instrument_param(&self, track: usize, param_idx: usize, value: f32) {
         let slot = &self.state.pattern.instrument_slots[track];
         let idx = slot.resolve_node_idx(param_idx);
+        if crate::voice_modulator::is_bar_resync_param(idx as u32) {
+            self.state.schedule_mod_resync();
+        }
         let Some(engine_id) = self.graph.track_engine_ids.get(track).and_then(|id| *id) else {
             return;
         };
@@ -841,7 +1043,7 @@ impl App {
 
     fn toggle_source_boolean(&self) {
         let track = self.ui.cursor_track;
-        let source_indices = self.source_param_indices(track);
+        let source_indices = self.source_param_actual_indices(track);
         let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
             return;
         };

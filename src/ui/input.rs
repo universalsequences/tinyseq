@@ -177,6 +177,8 @@ impl App {
                     for tph in &self.state.transport.track_playheads {
                         tph.store(0, Ordering::Relaxed);
                     }
+                } else {
+                    self.state.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 return;
             }
@@ -490,9 +492,12 @@ impl App {
 
         // Play button: click toggles playback
         if rect_contains(l.info_bar, col, row) {
+            let was_playing = self.state.is_playing();
             self.state.toggle_play();
             if !self.state.is_playing() {
                 self.state.transport.playhead.store(0, Ordering::Relaxed);
+            } else if !was_playing {
+                self.state.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
@@ -760,7 +765,7 @@ impl App {
                                 self.ui.dropdown_cursor = 0;
                                 self.ui.input_mode = InputMode::Dropdown;
                                 let actual_idx =
-                                    self.source_param_indices(self.ui.cursor_track)[row_idx];
+                                    self.source_param_actual_indices(self.ui.cursor_track)[row_idx];
                                 let slot =
                                     &self.state.pattern.instrument_slots[self.ui.cursor_track];
                                 let val = slot.defaults.get(actual_idx);
@@ -1118,7 +1123,7 @@ impl App {
                     self.mark_track_sound_dirty(track);
                 } else if self.ui.effect_tab == EffectTab::Sources {
                     let track = self.ui.cursor_track;
-                    let source_indices = self.source_param_indices(track);
+                    let source_indices = self.source_param_actual_indices(track);
                     let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
                         return;
                     };

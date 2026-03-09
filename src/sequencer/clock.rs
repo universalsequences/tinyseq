@@ -127,6 +127,7 @@ impl SequencerClock {
 
         let mut triggers = Vec::new();
         let mut last_global_16th = (self.total_beats / 0.25) as u32;
+        let mut last_bar = (self.total_beats / 4.0) as u32;
 
         for offset in 0..nframes {
             self.total_beats += beats_per_sample;
@@ -135,6 +136,21 @@ impl SequencerClock {
             if global_16th != last_global_16th {
                 state.transport.playhead.store(global_16th, Ordering::Relaxed);
                 last_global_16th = global_16th;
+            }
+
+            let bar = (self.total_beats / 4.0) as u32;
+            if bar != last_bar {
+                last_bar = bar;
+                if state
+                    .transport
+                    .pending_mod_resync
+                    .swap(false, Ordering::Relaxed)
+                {
+                    state
+                        .transport
+                        .mod_reset_counter
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             for t in 0..num_tracks {

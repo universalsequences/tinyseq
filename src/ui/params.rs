@@ -269,7 +269,7 @@ impl App {
         }
         if self.ui.effect_tab == EffectTab::Sources {
             if let Some(desc) = self.current_instrument_descriptor() {
-                let source_indices = self.source_param_indices(self.ui.cursor_track);
+                let source_indices = self.source_param_actual_indices(self.ui.cursor_track);
                 if let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) {
                     if let Some(param) = desc.params.get(param_idx) {
                         if let crate::effects::ParamKind::Enum { ref labels } = param.kind {
@@ -343,7 +343,7 @@ impl App {
         }
         if self.ui.effect_tab == EffectTab::Sources {
             let val = self.ui.dropdown_cursor as f32;
-            let source_indices = self.source_param_indices(self.ui.cursor_track);
+            let source_indices = self.source_param_actual_indices(self.ui.cursor_track);
             let Some(&param_idx) = source_indices.get(self.ui.source_param_cursor) else {
                 return;
             };

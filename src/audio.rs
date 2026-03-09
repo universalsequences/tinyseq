@@ -109,6 +109,7 @@ struct AudioCallbackData {
     gate_off_state: Vec<GateOffTracker>,
     sample_rate: f64,
     last_bpm: u32,
+    last_mod_reset_counter: u32,
     voice_pools: Vec<VoicePool>,
     custom_engine_pools: Vec<CustomEnginePool>,
     keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
@@ -1106,6 +1107,49 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 }
             }
         }
+        for engine in &data.state.runtime.engine_modulator_node_ids {
+            for node in engine {
+                let logical_id = node.load(Ordering::Relaxed);
+                if logical_id != 0 {
+                    unsafe {
+                        params_push_wrapper(
+                            data.lg.0,
+                            ParamMsg {
+                                idx: crate::voice_modulator::PARAM_BPM as u64,
+                                logical_id: logical_id as u64,
+                                fvalue: bpm_f,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mod_reset_counter = data
+        .state
+        .transport
+        .mod_reset_counter
+        .load(Ordering::Relaxed);
+    if mod_reset_counter != data.last_mod_reset_counter {
+        data.last_mod_reset_counter = mod_reset_counter;
+        for engine in &data.state.runtime.engine_modulator_node_ids {
+            for node in engine {
+                let logical_id = node.load(Ordering::Relaxed);
+                if logical_id != 0 {
+                    unsafe {
+                        params_push_wrapper(
+                            data.lg.0,
+                            ParamMsg {
+                                idx: crate::voice_modulator::PARAM_RESET_COUNTER as u64,
+                                logical_id: logical_id as u64,
+                                fvalue: mod_reset_counter as f32,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Process clock triggers (each trigger is now per-track)
@@ -1317,6 +1361,7 @@ pub fn build_output_stream(
         gate_off_state,
         sample_rate: sample_rate as f64,
         last_bpm: 0,
+        last_mod_reset_counter: 0,
         voice_pools,
         custom_engine_pools,
         keyboard_rx,

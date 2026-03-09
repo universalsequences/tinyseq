@@ -2,40 +2,87 @@ use std::os::raw::{c_int, c_void};
 
 use crate::audiograph::NodeVTable;
 use crate::effects::{ParamDescriptor, ParamKind, ParamScaling};
+use crate::sequencer::SYNC_RESOLUTIONS;
 
-// Inputs: gate, pitch_hz, velocity, trigger
-// Outputs: mod1, mod2, mod3, mod4, mod5, mod6
 pub const NUM_OUTPUTS: usize = 6;
 pub const MOD_PARAM_BASE: u32 = 1_000_000;
+
+pub const PARAM_BPM: usize = 11;
+pub const PARAM_RESET_COUNTER: usize = 12;
 
 const IDX_LFO1_PHASE: usize = 0;
 const IDX_LFO2_PHASE: usize = 1;
 const IDX_LFO3_PHASE: usize = 2;
 const IDX_ENV2: usize = 3;
-const IDX_RAND_HOLD: usize = 4;
+const IDX_RAND_PHASE: usize = 4;
 const IDX_DRIFT: usize = 5;
 const IDX_PREV_GATE: usize = 6;
 const IDX_RNG: usize = 7;
-const IDX_RAND_SMOOTH: usize = 8;
+const IDX_RAND_HOLD: usize = 8;
+const IDX_RAND_SMOOTH: usize = 9;
+const IDX_LAST_RESET_COUNTER: usize = 10;
+const IDX_SAMPLE_RATE: usize = 48;
 
-const PARAM_LFO1_RATE_HZ: usize = 9;
-const PARAM_LFO2_RATE_HZ: usize = 10;
-const PARAM_LFO3_RATE_HZ: usize = 11;
-const PARAM_ENV_ATTACK_MS: usize = 12;
-const PARAM_ENV_DECAY_MS: usize = 13;
-const PARAM_ENV_SUSTAIN: usize = 14;
-const PARAM_ENV_RELEASE_MS: usize = 15;
-const PARAM_RAND_SLEW: usize = 16;
-const PARAM_DRIFT_RATE: usize = 17;
-const PARAM_MOD1_DEPTH: usize = 18;
-const PARAM_MOD2_DEPTH: usize = 19;
-const PARAM_MOD3_DEPTH: usize = 20;
-const PARAM_MOD4_DEPTH: usize = 21;
-const PARAM_MOD5_DEPTH: usize = 22;
-const PARAM_MOD6_DEPTH: usize = 23;
+pub const PARAM_LFO1_RATE_HZ: usize = 13;
+pub const PARAM_LFO1_SYNC: usize = 14;
+pub const PARAM_LFO1_DIV: usize = 15;
+pub const PARAM_LFO1_SHAPE: usize = 16;
+pub const PARAM_LFO1_PW: usize = 17;
+pub const PARAM_LFO1_RETRIGGER: usize = 18;
+pub const PARAM_LFO2_RATE_HZ: usize = 19;
+pub const PARAM_LFO2_SYNC: usize = 20;
+pub const PARAM_LFO2_DIV: usize = 21;
+pub const PARAM_LFO2_SHAPE: usize = 22;
+pub const PARAM_LFO2_PW: usize = 23;
+pub const PARAM_LFO2_RETRIGGER: usize = 24;
+pub const PARAM_LFO3_RATE_HZ: usize = 25;
+pub const PARAM_LFO3_SYNC: usize = 26;
+pub const PARAM_LFO3_DIV: usize = 27;
+pub const PARAM_LFO3_SHAPE: usize = 28;
+pub const PARAM_LFO3_PW: usize = 29;
+pub const PARAM_LFO3_RETRIGGER: usize = 30;
+pub const PARAM_ENV_ATTACK_MS: usize = 31;
+pub const PARAM_ENV_DECAY_MS: usize = 32;
+pub const PARAM_ENV_SUSTAIN: usize = 33;
+pub const PARAM_ENV_RELEASE_MS: usize = 34;
+pub const PARAM_RAND_RATE_HZ: usize = 35;
+pub const PARAM_RAND_SYNC: usize = 36;
+pub const PARAM_RAND_DIV: usize = 37;
+pub const PARAM_RAND_SLEW: usize = 38;
+pub const PARAM_DRIFT_RATE: usize = 39;
+pub const PARAM_DRIFT_SYNC: usize = 40;
+pub const PARAM_DRIFT_DIV: usize = 41;
+pub const PARAM_MOD1_DEPTH: usize = 42;
+pub const PARAM_MOD2_DEPTH: usize = 43;
+pub const PARAM_MOD3_DEPTH: usize = 44;
+pub const PARAM_MOD4_DEPTH: usize = 45;
+pub const PARAM_MOD5_DEPTH: usize = 46;
+pub const PARAM_MOD6_DEPTH: usize = 47;
 
-pub const PARAM_COUNT: usize = 15;
-pub const STATE_SIZE: usize = 24;
+pub const PARAM_COUNT: usize = 37;
+pub const STATE_SIZE: usize = 49;
+
+const SHAPE_TRIANGLE: usize = 0;
+const SHAPE_SINE: usize = 1;
+const SHAPE_PULSE: usize = 2;
+const SHAPE_SAW: usize = 3;
+
+fn sync_labels() -> Vec<String> {
+    SYNC_RESOLUTIONS
+        .iter()
+        .skip(1)
+        .map(|(_, label)| (*label).to_string())
+        .collect()
+}
+
+fn shape_labels() -> Vec<String> {
+    vec![
+        "triangle".to_string(),
+        "sine".to_string(),
+        "pulse".to_string(),
+        "sawtooth".to_string(),
+    ]
+}
 
 fn next_rand(state: &mut u32) -> f32 {
     *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -47,16 +94,66 @@ fn triangle(phase: f32) -> f32 {
     1.0 - 4.0 * (phase - 0.5).abs()
 }
 
+fn shape_value(shape: usize, phase: f32, pulse_width: f32) -> f32 {
+    match shape {
+        SHAPE_SINE => (std::f32::consts::TAU * phase).sin(),
+        SHAPE_PULSE => {
+            if phase < pulse_width.clamp(0.05, 0.95) {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        SHAPE_SAW => phase * 2.0 - 1.0,
+        _ => triangle(phase),
+    }
+}
+
+fn synced_rate_hz(div_idx: usize, bpm: f32) -> f32 {
+    let idx = div_idx.clamp(0, SYNC_RESOLUTIONS.len().saturating_sub(2));
+    let beats = SYNC_RESOLUTIONS[idx + 1].0 as f32;
+    (bpm / 60.0) / beats.max(0.0001)
+}
+
 unsafe fn init_param_defaults(s: *mut f32) {
+    *s.add(PARAM_BPM) = 120.0;
+    *s.add(PARAM_RESET_COUNTER) = 0.0;
+
     *s.add(PARAM_LFO1_RATE_HZ) = 5.0;
+    *s.add(PARAM_LFO1_SYNC) = 0.0;
+    *s.add(PARAM_LFO1_DIV) = 2.0;
+    *s.add(PARAM_LFO1_SHAPE) = SHAPE_TRIANGLE as f32;
+    *s.add(PARAM_LFO1_PW) = 0.5;
+    *s.add(PARAM_LFO1_RETRIGGER) = 1.0;
+
     *s.add(PARAM_LFO2_RATE_HZ) = 1.7;
+    *s.add(PARAM_LFO2_SYNC) = 0.0;
+    *s.add(PARAM_LFO2_DIV) = 3.0;
+    *s.add(PARAM_LFO2_SHAPE) = SHAPE_TRIANGLE as f32;
+    *s.add(PARAM_LFO2_PW) = 0.5;
+    *s.add(PARAM_LFO2_RETRIGGER) = 0.0;
+
     *s.add(PARAM_LFO3_RATE_HZ) = 0.37;
+    *s.add(PARAM_LFO3_SYNC) = 0.0;
+    *s.add(PARAM_LFO3_DIV) = 4.0;
+    *s.add(PARAM_LFO3_SHAPE) = SHAPE_TRIANGLE as f32;
+    *s.add(PARAM_LFO3_PW) = 0.5;
+    *s.add(PARAM_LFO3_RETRIGGER) = 0.0;
+
     *s.add(PARAM_ENV_ATTACK_MS) = 6.0;
     *s.add(PARAM_ENV_DECAY_MS) = 180.0;
     *s.add(PARAM_ENV_SUSTAIN) = 0.55;
     *s.add(PARAM_ENV_RELEASE_MS) = 240.0;
+
+    *s.add(PARAM_RAND_RATE_HZ) = 3.0;
+    *s.add(PARAM_RAND_SYNC) = 0.0;
+    *s.add(PARAM_RAND_DIV) = 4.0;
     *s.add(PARAM_RAND_SLEW) = 0.0;
+
     *s.add(PARAM_DRIFT_RATE) = 0.00035;
+    *s.add(PARAM_DRIFT_SYNC) = 0.0;
+    *s.add(PARAM_DRIFT_DIV) = 5.0;
+
     *s.add(PARAM_MOD1_DEPTH) = 1.0;
     *s.add(PARAM_MOD2_DEPTH) = 1.0;
     *s.add(PARAM_MOD3_DEPTH) = 1.0;
@@ -65,253 +162,121 @@ unsafe fn init_param_defaults(s: *mut f32) {
     *s.add(PARAM_MOD6_DEPTH) = 1.0;
 }
 
+fn push_param(
+    out: &mut Vec<ParamDescriptor>,
+    name: &str,
+    min: f32,
+    max: f32,
+    default: f32,
+    kind: ParamKind,
+    scaling: ParamScaling,
+    idx: usize,
+) {
+    out.push(ParamDescriptor {
+        name: name.to_string(),
+        min,
+        max,
+        default,
+        kind,
+        scaling,
+        node_param_idx: MOD_PARAM_BASE + idx as u32,
+    });
+}
+
 pub fn param_descriptors() -> Vec<ParamDescriptor> {
-    vec![
-        ParamDescriptor {
-            name: "mod_lfo1_rate".to_string(),
-            min: 0.05,
-            max: 20.0,
-            default: 5.0,
-            kind: ParamKind::Continuous { unit: Some("Hz".to_string()) },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO1_RATE_HZ as u32,
-        },
-        ParamDescriptor {
-            name: "mod_lfo2_rate".to_string(),
-            min: 0.05,
-            max: 20.0,
-            default: 1.7,
-            kind: ParamKind::Continuous { unit: Some("Hz".to_string()) },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO2_RATE_HZ as u32,
-        },
-        ParamDescriptor {
-            name: "mod_lfo3_rate".to_string(),
-            min: 0.01,
-            max: 8.0,
-            default: 0.37,
-            kind: ParamKind::Continuous { unit: Some("Hz".to_string()) },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO3_RATE_HZ as u32,
-        },
-        ParamDescriptor {
-            name: "mod_env_attack".to_string(),
-            min: 1.0,
-            max: 2000.0,
-            default: 6.0,
-            kind: ParamKind::Continuous { unit: Some("ms".to_string()) },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_ATTACK_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod_env_decay".to_string(),
-            min: 5.0,
-            max: 4000.0,
-            default: 180.0,
-            kind: ParamKind::Continuous { unit: Some("ms".to_string()) },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_DECAY_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod_rand_slew".to_string(),
-            min: 0.0,
-            max: 0.999,
-            default: 0.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_RAND_SLEW as u32,
-        },
-        ParamDescriptor {
-            name: "mod_env_sustain".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 0.55,
-            kind: ParamKind::Continuous {
-                unit: Some("%".to_string()),
-            },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_SUSTAIN as u32,
-        },
-        ParamDescriptor {
-            name: "mod_env_release".to_string(),
-            min: 5.0,
-            max: 4000.0,
-            default: 240.0,
-            kind: ParamKind::Continuous {
-                unit: Some("ms".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_RELEASE_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod_drift_rate".to_string(),
-            min: 0.00001,
-            max: 0.01,
-            default: 0.00035,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_DRIFT_RATE as u32,
-        },
-        ParamDescriptor {
-            name: "mod1_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD1_DEPTH as u32,
-        },
-        ParamDescriptor {
-            name: "mod2_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD2_DEPTH as u32,
-        },
-        ParamDescriptor {
-            name: "mod3_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD3_DEPTH as u32,
-        },
-        ParamDescriptor {
-            name: "mod4_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD4_DEPTH as u32,
-        },
-        ParamDescriptor {
-            name: "mod5_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD5_DEPTH as u32,
-        },
-        ParamDescriptor {
-            name: "mod6_depth".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_MOD6_DEPTH as u32,
-        },
-    ]
+    let mut out = Vec::new();
+    let sync_div_labels = sync_labels();
+    let shape_labels = shape_labels();
+
+    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, prefix, rate_default, div_default, retrig_default) in &[
+        (PARAM_LFO1_RATE_HZ, PARAM_LFO1_SYNC, PARAM_LFO1_DIV, PARAM_LFO1_SHAPE, PARAM_LFO1_PW, PARAM_LFO1_RETRIGGER, "mod_lfo1", 5.0, 2.0, 1.0),
+        (PARAM_LFO2_RATE_HZ, PARAM_LFO2_SYNC, PARAM_LFO2_DIV, PARAM_LFO2_SHAPE, PARAM_LFO2_PW, PARAM_LFO2_RETRIGGER, "mod_lfo2", 1.7, 3.0, 0.0),
+        (PARAM_LFO3_RATE_HZ, PARAM_LFO3_SYNC, PARAM_LFO3_DIV, PARAM_LFO3_SHAPE, PARAM_LFO3_PW, PARAM_LFO3_RETRIGGER, "mod_lfo3", 0.37, 4.0, 0.0),
+    ] {
+        push_param(&mut out, &format!("{prefix}_rate"), 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
+        push_param(&mut out, &format!("{prefix}_sync"), 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
+        push_param(&mut out, &format!("{prefix}_div"), 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
+        push_param(&mut out, &format!("{prefix}_shape"), 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
+        push_param(&mut out, &format!("{prefix}_pw"), 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
+        push_param(&mut out, &format!("{prefix}_retrigger"), 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+    }
+
+    push_param(&mut out, "mod_env_attack", 1.0, 2000.0, 6.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_ATTACK_MS);
+    push_param(&mut out, "mod_env_decay", 5.0, 4000.0, 180.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_DECAY_MS);
+    push_param(&mut out, "mod_env_sustain", 0.0, 1.0, 0.55, ParamKind::Continuous { unit: Some("%".to_string()) }, ParamScaling::Linear, PARAM_ENV_SUSTAIN);
+    push_param(&mut out, "mod_env_release", 5.0, 4000.0, 240.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_RELEASE_MS);
+
+    push_param(&mut out, "mod_rand_rate", 0.05, 20.0, 3.0, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_RAND_RATE_HZ);
+    push_param(&mut out, "mod_rand_sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_RAND_SYNC);
+    push_param(&mut out, "mod_rand_div", 0.0, (sync_div_labels.len() - 1) as f32, 4.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_RAND_DIV);
+    push_param(&mut out, "mod_rand_slew", 0.0, 0.999, 0.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, PARAM_RAND_SLEW);
+
+    push_param(&mut out, "mod_drift_rate", 0.00001, 0.01, 0.00035, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_DRIFT_RATE);
+    push_param(&mut out, "mod_drift_sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_DRIFT_SYNC);
+    push_param(&mut out, "mod_drift_div", 0.0, (sync_div_labels.len() - 1) as f32, 5.0, ParamKind::Enum { labels: sync_div_labels }, ParamScaling::Linear, PARAM_DRIFT_DIV);
+
+    for (name, idx) in [
+        ("mod1_depth", PARAM_MOD1_DEPTH),
+        ("mod2_depth", PARAM_MOD2_DEPTH),
+        ("mod3_depth", PARAM_MOD3_DEPTH),
+        ("mod4_depth", PARAM_MOD4_DEPTH),
+        ("mod5_depth", PARAM_MOD5_DEPTH),
+        ("mod6_depth", PARAM_MOD6_DEPTH),
+    ] {
+        push_param(&mut out, name, 0.0, 1.0, 1.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, idx);
+    }
+
+    out
 }
 
 pub fn ui_param_descriptors() -> Vec<ParamDescriptor> {
-    vec![
-        ParamDescriptor {
-            name: "mod1 lfo rate".to_string(),
-            min: 0.05,
-            max: 20.0,
-            default: 5.0,
-            kind: ParamKind::Continuous {
-                unit: Some("Hz".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO1_RATE_HZ as u32,
-        },
-        ParamDescriptor {
-            name: "mod2 env attack".to_string(),
-            min: 1.0,
-            max: 2000.0,
-            default: 6.0,
-            kind: ParamKind::Continuous {
-                unit: Some("ms".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_ATTACK_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod2 env decay".to_string(),
-            min: 5.0,
-            max: 4000.0,
-            default: 180.0,
-            kind: ParamKind::Continuous {
-                unit: Some("ms".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_DECAY_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod2 env sustain".to_string(),
-            min: 0.0,
-            max: 1.0,
-            default: 0.55,
-            kind: ParamKind::Continuous {
-                unit: Some("%".to_string()),
-            },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_SUSTAIN as u32,
-        },
-        ParamDescriptor {
-            name: "mod2 env release".to_string(),
-            min: 5.0,
-            max: 4000.0,
-            default: 240.0,
-            kind: ParamKind::Continuous {
-                unit: Some("ms".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_ENV_RELEASE_MS as u32,
-        },
-        ParamDescriptor {
-            name: "mod3 rand slew".to_string(),
-            min: 0.0,
-            max: 0.999,
-            default: 0.0,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Linear,
-            node_param_idx: MOD_PARAM_BASE + PARAM_RAND_SLEW as u32,
-        },
-        ParamDescriptor {
-            name: "mod4 drift rate".to_string(),
-            min: 0.00001,
-            max: 0.01,
-            default: 0.00035,
-            kind: ParamKind::Continuous { unit: None },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_DRIFT_RATE as u32,
-        },
-        ParamDescriptor {
-            name: "mod5 lfo 2 rate".to_string(),
-            min: 0.05,
-            max: 20.0,
-            default: 1.7,
-            kind: ParamKind::Continuous {
-                unit: Some("Hz".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO2_RATE_HZ as u32,
-        },
-        ParamDescriptor {
-            name: "mod6 lfo 3 rate".to_string(),
-            min: 0.01,
-            max: 8.0,
-            default: 0.37,
-            kind: ParamKind::Continuous {
-                unit: Some("Hz".to_string()),
-            },
-            scaling: ParamScaling::Exponential,
-            node_param_idx: MOD_PARAM_BASE + PARAM_LFO3_RATE_HZ as u32,
-        },
-    ]
+    let mut out = Vec::new();
+    let sync_div_labels = sync_labels();
+    let shape_labels = shape_labels();
+
+    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, rate_default, div_default, retrig_default) in &[
+        (PARAM_LFO1_RATE_HZ, PARAM_LFO1_SYNC, PARAM_LFO1_DIV, PARAM_LFO1_SHAPE, PARAM_LFO1_PW, PARAM_LFO1_RETRIGGER, 5.0, 2.0, 1.0),
+    ] {
+        push_param(&mut out, "rate", 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
+        push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
+        push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
+        push_param(&mut out, "shape", 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
+        push_param(&mut out, "pulse width", 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
+        push_param(&mut out, "retrigger", 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+    }
+
+    push_param(&mut out, "attack", 1.0, 2000.0, 6.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_ATTACK_MS);
+    push_param(&mut out, "decay", 5.0, 4000.0, 180.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_DECAY_MS);
+    push_param(&mut out, "sustain", 0.0, 1.0, 0.55, ParamKind::Continuous { unit: Some("%".to_string()) }, ParamScaling::Linear, PARAM_ENV_SUSTAIN);
+    push_param(&mut out, "release", 5.0, 4000.0, 240.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_RELEASE_MS);
+
+    push_param(&mut out, "rate", 0.05, 20.0, 3.0, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_RAND_RATE_HZ);
+    push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_RAND_SYNC);
+    push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, 4.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_RAND_DIV);
+    push_param(&mut out, "slew", 0.0, 0.999, 0.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, PARAM_RAND_SLEW);
+
+    push_param(&mut out, "rate", 0.00001, 0.01, 0.00035, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_DRIFT_RATE);
+    push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_DRIFT_SYNC);
+    push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, 5.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_DRIFT_DIV);
+
+    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, rate_default, div_default, retrig_default) in &[
+        (PARAM_LFO2_RATE_HZ, PARAM_LFO2_SYNC, PARAM_LFO2_DIV, PARAM_LFO2_SHAPE, PARAM_LFO2_PW, PARAM_LFO2_RETRIGGER, 1.7, 3.0, 0.0),
+        (PARAM_LFO3_RATE_HZ, PARAM_LFO3_SYNC, PARAM_LFO3_DIV, PARAM_LFO3_SHAPE, PARAM_LFO3_PW, PARAM_LFO3_RETRIGGER, 0.37, 4.0, 0.0),
+    ] {
+        push_param(&mut out, "rate", 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
+        push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
+        push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
+        push_param(&mut out, "shape", 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
+        push_param(&mut out, "pulse width", 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
+        push_param(&mut out, "retrigger", 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+    }
+
+    out
 }
 
 unsafe extern "C" fn voice_modulator_init(
     state: *mut c_void,
-    _sample_rate: c_int,
+    sample_rate: c_int,
     _max_block: c_int,
     _initial_state: *const c_void,
 ) {
@@ -320,6 +285,7 @@ unsafe extern "C" fn voice_modulator_init(
         *s.add(i) = 0.0;
     }
     *s.add(IDX_RNG) = 0x1234_5678u32 as f32;
+    *s.add(IDX_SAMPLE_RATE) = sample_rate as f32;
     init_param_defaults(s);
 }
 
@@ -334,7 +300,6 @@ unsafe extern "C" fn voice_modulator_process(
     let s = state as *mut f32;
 
     let gate_in = *inp.add(0);
-    let pitch_in = *inp.add(1);
     let velocity_in = *inp.add(2);
     let trigger_in = *inp.add(3);
 
@@ -344,26 +309,61 @@ unsafe extern "C" fn voice_modulator_process(
     let out_mod4 = *out.add(3);
     let out_mod5 = *out.add(4);
     let out_mod6 = *out.add(5);
+
     let mut lfo1_phase = *s.add(IDX_LFO1_PHASE);
     let mut lfo2_phase = *s.add(IDX_LFO2_PHASE);
     let mut lfo3_phase = *s.add(IDX_LFO3_PHASE);
     let mut env2 = *s.add(IDX_ENV2);
-    let mut rand_hold = *s.add(IDX_RAND_HOLD);
+    let mut rand_phase = *s.add(IDX_RAND_PHASE);
     let mut drift = *s.add(IDX_DRIFT);
     let mut prev_gate = *s.add(IDX_PREV_GATE);
     let mut rng_state = *s.add(IDX_RNG) as u32;
+    let mut rand_hold = *s.add(IDX_RAND_HOLD);
     let mut rand_smooth = *s.add(IDX_RAND_SMOOTH);
+    let mut last_reset_counter = *s.add(IDX_LAST_RESET_COUNTER);
 
-    let sample_rate = 44_100.0f32;
-    let lfo1_rate = (*s.add(PARAM_LFO1_RATE_HZ)).clamp(0.05, 20.0);
-    let lfo2_rate = (*s.add(PARAM_LFO2_RATE_HZ)).clamp(0.05, 20.0);
-    let lfo3_rate = (*s.add(PARAM_LFO3_RATE_HZ)).clamp(0.01, 8.0);
-    let env_attack_ms = (*s.add(PARAM_ENV_ATTACK_MS)).clamp(1.0, 2000.0);
-    let env_decay_ms = (*s.add(PARAM_ENV_DECAY_MS)).clamp(5.0, 4000.0);
+    let sample_rate = (*s.add(IDX_SAMPLE_RATE)).max(1.0);
+    let bpm = (*s.add(PARAM_BPM)).clamp(20.0, 400.0);
+    let reset_counter = *s.add(PARAM_RESET_COUNTER);
+
+    if reset_counter != last_reset_counter {
+        lfo1_phase = 0.0;
+        lfo2_phase = 0.0;
+        lfo3_phase = 0.0;
+        rand_phase = 0.0;
+        rand_hold = 0.0;
+        rand_smooth = 0.0;
+        drift = 0.0;
+        last_reset_counter = reset_counter;
+    }
+
+    let lfo1_rate = if *s.add(PARAM_LFO1_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO1_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO1_RATE_HZ)).clamp(0.01, 20.0) };
+    let lfo2_rate = if *s.add(PARAM_LFO2_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO2_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO2_RATE_HZ)).clamp(0.01, 20.0) };
+    let lfo3_rate = if *s.add(PARAM_LFO3_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO3_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO3_RATE_HZ)).clamp(0.01, 20.0) };
+    let rand_rate = if *s.add(PARAM_RAND_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_RAND_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_RAND_RATE_HZ)).clamp(0.01, 20.0) };
+    let drift_rate = if *s.add(PARAM_DRIFT_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_DRIFT_DIV)).round() as usize, bpm) * 0.2 } else { (*s.add(PARAM_DRIFT_RATE)).clamp(0.00001, 0.01) * sample_rate };
+
+    let lfo1_inc = lfo1_rate / sample_rate;
+    let lfo2_inc = lfo2_rate / sample_rate;
+    let lfo3_inc = lfo3_rate / sample_rate;
+    let rand_inc = rand_rate / sample_rate;
+
+    let env_attack = 1.0 / ((*s.add(PARAM_ENV_ATTACK_MS)).clamp(1.0, 2000.0) * 0.001 * sample_rate);
+    let env_decay = 1.0 / ((*s.add(PARAM_ENV_DECAY_MS)).clamp(5.0, 4000.0) * 0.001 * sample_rate);
     let env_sustain = (*s.add(PARAM_ENV_SUSTAIN)).clamp(0.0, 1.0);
-    let env_release_ms = (*s.add(PARAM_ENV_RELEASE_MS)).clamp(5.0, 4000.0);
+    let env_release = 1.0 / ((*s.add(PARAM_ENV_RELEASE_MS)).clamp(5.0, 4000.0) * 0.001 * sample_rate);
     let rand_slew = (*s.add(PARAM_RAND_SLEW)).clamp(0.0, 0.999);
-    let drift_rate = (*s.add(PARAM_DRIFT_RATE)).clamp(0.00001, 0.01);
+
+    let lfo1_shape = (*s.add(PARAM_LFO1_SHAPE)).round() as usize;
+    let lfo2_shape = (*s.add(PARAM_LFO2_SHAPE)).round() as usize;
+    let lfo3_shape = (*s.add(PARAM_LFO3_SHAPE)).round() as usize;
+    let lfo1_pw = (*s.add(PARAM_LFO1_PW)).clamp(0.05, 0.95);
+    let lfo2_pw = (*s.add(PARAM_LFO2_PW)).clamp(0.05, 0.95);
+    let lfo3_pw = (*s.add(PARAM_LFO3_PW)).clamp(0.05, 0.95);
+    let lfo1_retrigger = *s.add(PARAM_LFO1_RETRIGGER) > 0.5;
+    let lfo2_retrigger = *s.add(PARAM_LFO2_RETRIGGER) > 0.5;
+    let lfo3_retrigger = *s.add(PARAM_LFO3_RETRIGGER) > 0.5;
+
     let mod1_depth = (*s.add(PARAM_MOD1_DEPTH)).clamp(0.0, 1.0);
     let mod2_depth = (*s.add(PARAM_MOD2_DEPTH)).clamp(0.0, 1.0);
     let mod3_depth = (*s.add(PARAM_MOD3_DEPTH)).clamp(0.0, 1.0);
@@ -371,30 +371,37 @@ unsafe extern "C" fn voice_modulator_process(
     let mod5_depth = (*s.add(PARAM_MOD5_DEPTH)).clamp(0.0, 1.0);
     let mod6_depth = (*s.add(PARAM_MOD6_DEPTH)).clamp(0.0, 1.0);
 
-    let lfo1_inc = lfo1_rate / sample_rate;
-    let lfo2_inc = lfo2_rate / sample_rate;
-    let lfo3_inc = lfo3_rate / sample_rate;
-    let env_attack = 1.0 / (env_attack_ms * 0.001 * sample_rate);
-    let env_decay = 1.0 / (env_decay_ms * 0.001 * sample_rate);
-    let env_release = 1.0 / (env_release_ms * 0.001 * sample_rate);
-
     for i in 0..nf {
         let gate = (*gate_in.add(i)).clamp(0.0, 1.0);
-        let _pitch = (*pitch_in.add(i)).max(20.0);
         let velocity = (*velocity_in.add(i)).clamp(0.0, 1.0);
         let trigger = (*trigger_in.add(i)).max(0.0);
 
         let gate_rising = gate > 0.5 && prev_gate <= 0.5;
         let note_on = gate_rising || trigger > 0.5;
-
         if note_on {
             env2 = 0.0;
             rand_hold = next_rand(&mut rng_state);
+            if lfo1_retrigger {
+                lfo1_phase = 0.0;
+            }
+            if lfo2_retrigger {
+                lfo2_phase = 0.0;
+            }
+            if lfo3_retrigger {
+                lfo3_phase = 0.0;
+            }
         }
 
         lfo1_phase = (lfo1_phase + lfo1_inc).fract();
         lfo2_phase = (lfo2_phase + lfo2_inc).fract();
         lfo3_phase = (lfo3_phase + lfo3_inc).fract();
+
+        let prev_rand_phase = rand_phase;
+        rand_phase = (rand_phase + rand_inc).fract();
+        if rand_phase < prev_rand_phase {
+            rand_hold = next_rand(&mut rng_state);
+        }
+        rand_smooth += (rand_hold - rand_smooth) * (1.0 - rand_slew);
 
         if gate > 0.5 {
             if env2 < 0.999 {
@@ -409,24 +416,16 @@ unsafe extern "C" fn voice_modulator_process(
         }
         env2 = env2.clamp(0.0, 1.0);
 
-        let drift_target = next_rand(&mut rng_state) * 0.7;
-        drift += (drift_target - drift) * drift_rate;
+        drift += (next_rand(&mut rng_state) * 0.08 - drift) * (drift_rate / sample_rate).clamp(0.0, 1.0);
         drift = drift.clamp(-1.0, 1.0);
-        rand_smooth += (rand_hold - rand_smooth) * (1.0 - rand_slew);
 
-        let mod1 = (triangle(lfo1_phase) * mod1_depth).clamp(-1.0, 1.0);
-        let mod2 = ((env2 * 2.0 - 1.0) * mod2_depth).clamp(-1.0, 1.0);
-        let mod3 = (rand_smooth * mod3_depth).clamp(-1.0, 1.0);
-        let mod4 = ((drift * (0.4 + velocity * 0.6)) * mod4_depth).clamp(-1.0, 1.0);
-        let mod5 = (triangle(lfo2_phase) * mod5_depth).clamp(-1.0, 1.0);
-        let mod6 = (triangle(lfo3_phase) * mod6_depth).clamp(-1.0, 1.0);
+        *out_mod1.add(i) = (shape_value(lfo1_shape, lfo1_phase, lfo1_pw) * mod1_depth).clamp(-1.0, 1.0);
+        *out_mod2.add(i) = ((env2 * 2.0 - 1.0) * mod2_depth).clamp(-1.0, 1.0);
+        *out_mod3.add(i) = (rand_smooth * mod3_depth).clamp(-1.0, 1.0);
+        *out_mod4.add(i) = ((drift * (0.4 + velocity * 0.6)) * mod4_depth).clamp(-1.0, 1.0);
+        *out_mod5.add(i) = (shape_value(lfo2_shape, lfo2_phase, lfo2_pw) * mod5_depth).clamp(-1.0, 1.0);
+        *out_mod6.add(i) = (shape_value(lfo3_shape, lfo3_phase, lfo3_pw) * mod6_depth).clamp(-1.0, 1.0);
 
-        *out_mod1.add(i) = mod1;
-        *out_mod2.add(i) = mod2;
-        *out_mod3.add(i) = mod3;
-        *out_mod4.add(i) = mod4;
-        *out_mod5.add(i) = mod5;
-        *out_mod6.add(i) = mod6;
         prev_gate = gate;
     }
 
@@ -434,11 +433,13 @@ unsafe extern "C" fn voice_modulator_process(
     *s.add(IDX_LFO2_PHASE) = lfo2_phase;
     *s.add(IDX_LFO3_PHASE) = lfo3_phase;
     *s.add(IDX_ENV2) = env2;
-    *s.add(IDX_RAND_HOLD) = rand_hold;
+    *s.add(IDX_RAND_PHASE) = rand_phase;
     *s.add(IDX_DRIFT) = drift;
     *s.add(IDX_PREV_GATE) = prev_gate;
     *s.add(IDX_RNG) = rng_state as f32;
+    *s.add(IDX_RAND_HOLD) = rand_hold;
     *s.add(IDX_RAND_SMOOTH) = rand_smooth;
+    *s.add(IDX_LAST_RESET_COUNTER) = last_reset_counter;
 }
 
 pub fn voice_modulator_vtable() -> NodeVTable {
@@ -448,4 +449,23 @@ pub fn voice_modulator_vtable() -> NodeVTable {
         reset: None,
         migrate: None,
     }
+}
+
+pub fn is_bar_resync_param(node_param_idx: u32) -> bool {
+    let timed_params = [
+        MOD_PARAM_BASE + PARAM_LFO1_SYNC as u32,
+        MOD_PARAM_BASE + PARAM_LFO1_DIV as u32,
+        MOD_PARAM_BASE + PARAM_LFO1_RETRIGGER as u32,
+        MOD_PARAM_BASE + PARAM_LFO2_SYNC as u32,
+        MOD_PARAM_BASE + PARAM_LFO2_DIV as u32,
+        MOD_PARAM_BASE + PARAM_LFO2_RETRIGGER as u32,
+        MOD_PARAM_BASE + PARAM_LFO3_SYNC as u32,
+        MOD_PARAM_BASE + PARAM_LFO3_DIV as u32,
+        MOD_PARAM_BASE + PARAM_LFO3_RETRIGGER as u32,
+        MOD_PARAM_BASE + PARAM_RAND_SYNC as u32,
+        MOD_PARAM_BASE + PARAM_RAND_DIV as u32,
+        MOD_PARAM_BASE + PARAM_DRIFT_SYNC as u32,
+        MOD_PARAM_BASE + PARAM_DRIFT_DIV as u32,
+    ];
+    timed_params.contains(&node_param_idx)
 }

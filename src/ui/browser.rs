@@ -561,6 +561,7 @@ impl App {
             preset.base_note_offset.to_bits(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.state.schedule_mod_resync();
         let engine_id = self.graph.track_engine_ids.get(track).and_then(|id| *id);
         self.set_track_sound_state(track, engine_id, Some(preset.name.clone()), false);
         self.editor.status_message =

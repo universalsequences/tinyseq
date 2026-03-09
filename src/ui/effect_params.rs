@@ -560,7 +560,7 @@ impl App {
                 self.mark_track_sound_dirty(drag.track);
             }
             ParamMouseDragTarget::SourceParam { row_idx } => {
-                let source_indices = self.source_param_indices(drag.track);
+                let source_indices = self.source_param_actual_indices(drag.track);
                 let Some(&param_idx) = source_indices.get(row_idx) else {
                     return;
                 };

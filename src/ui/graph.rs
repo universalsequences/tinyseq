@@ -845,7 +845,15 @@ impl GraphController<'_> {
             ms
         };
         let mod_source_labels: Vec<String> = std::iter::once("off".to_string())
-            .chain(sorted_modulators.iter().map(|m| m.name.clone()))
+            .chain(sorted_modulators.iter().map(|m| match m.slot {
+                1 => "LFO 1".to_string(),
+                2 => "ENV 1".to_string(),
+                3 => "RAND".to_string(),
+                4 => "DRIFT".to_string(),
+                5 => "LFO 2".to_string(),
+                6 => "LFO 3".to_string(),
+                _ => m.name.clone(),
+            }))
             .collect();
         let param_by_cell: std::collections::HashMap<usize, &crate::lisp_effect::DGenParam> =
             manifest.params.iter().map(|p| (p.cell_id, p)).collect();

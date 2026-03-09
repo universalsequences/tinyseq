@@ -474,7 +474,7 @@ pub(super) fn draw_effects_column(
             _ => return,
         };
         let track = app.ui.cursor_track;
-        let source_indices = app.source_param_indices(track);
+        let source_indices = app.source_param_actual_indices(track);
         let slot = &app.state.pattern.instrument_slots[track];
         let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
         let total_rows = app.source_row_count();
@@ -499,15 +499,10 @@ pub(super) fn draw_effects_column(
             let row_x = inner.x + column as u16 * (column_width + SYNTH_COLUMN_GAP);
             let row_area = Rect::new(row_x, row_y, column_width, 1);
 
-            let header = match display_row {
-                0 => Some("mod1 / LFO"),
-                2 => Some("mod2 / ENV"),
-                7 => Some("mod3 / RAND"),
-                9 => Some("mod4 / DRIFT"),
-                11 => Some("mod5 / LFO 2"),
-                13 => Some("mod6 / LFO 3"),
-                _ => None,
-            };
+            let header = app
+                .source_display_rows(track)
+                .get(display_row)
+                .and_then(|(header, _)| *header);
 
             if let Some(header) = header {
                 let line = Line::from(vec![Span::styled(

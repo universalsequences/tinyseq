@@ -291,6 +291,8 @@ pub struct TransportState {
     pub playhead: AtomicU32,
     pub playing: AtomicBool,
     pub bpm: AtomicU32,
+    pub mod_reset_counter: AtomicU32,
+    pub pending_mod_resync: AtomicBool,
     pub peak_l: AtomicU32,
     pub peak_r: AtomicU32,
     pub cpu_load_pct: AtomicU32,
@@ -369,6 +371,8 @@ impl SequencerState {
                 playhead: AtomicU32::new(0),
                 playing: AtomicBool::new(false),
                 bpm: AtomicU32::new(DEFAULT_BPM),
+                mod_reset_counter: AtomicU32::new(0),
+                pending_mod_resync: AtomicBool::new(false),
                 peak_l: AtomicU32::new(0.0_f32.to_bits()),
                 peak_r: AtomicU32::new(0.0_f32.to_bits()),
                 cpu_load_pct: AtomicU32::new(0.0_f32.to_bits()),
@@ -413,6 +417,13 @@ impl SequencerState {
     pub fn track_step(&self, track: usize) -> usize { self.transport.track_playheads[track].load(Ordering::Relaxed) as usize }
     pub fn is_playing(&self) -> bool { self.transport.playing.load(Ordering::Relaxed) }
     pub fn toggle_play(&self) { self.transport.playing.fetch_xor(true, Ordering::Relaxed); }
+    pub fn schedule_mod_resync(&self) {
+        if self.is_playing() {
+            self.transport.pending_mod_resync.store(true, Ordering::Relaxed);
+        } else {
+            self.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     pub fn switch_pattern(
         &self,
@@ -430,6 +441,7 @@ impl SequencerState {
         bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names, instrument_types);
         bank[new_idx].restore(self);
         self.pattern.current_pattern.store(new_idx as u32, Ordering::Relaxed);
+        self.schedule_mod_resync();
         Some(bank[new_idx].sample_ids.clone())
     }
 
@@ -469,6 +481,7 @@ impl SequencerState {
         bank[new_idx].restore(self);
         self.pattern.current_pattern.store(new_idx as u32, Ordering::Relaxed);
         self.pattern.num_patterns.store(bank.len() as u32, Ordering::Relaxed);
+        self.schedule_mod_resync();
         Some(bank[new_idx].sample_ids.clone())
     }
 
