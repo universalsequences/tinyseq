@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use super::data::{sync_beats, Trigger, MAX_STEPS, MAX_TRACKS, StepParam};
+use super::data::{sync_beats, StepParam, Trigger, MAX_STEPS, MAX_TRACKS};
 use super::state::SequencerState;
 
 fn ceil_to_grid(value: f64, grid: f64) -> f64 {
@@ -89,7 +89,11 @@ impl SequencerClock {
         };
     }
 
-    fn derive_local_step(tc: &TrackClockState, pos_in_cycle: f64, num_steps: usize) -> Option<usize> {
+    fn derive_local_step(
+        tc: &TrackClockState,
+        pos_in_cycle: f64,
+        num_steps: usize,
+    ) -> Option<usize> {
         if pos_in_cycle >= tc.boundaries[num_steps] {
             return None;
         }
@@ -134,7 +138,10 @@ impl SequencerClock {
 
             let global_16th = (self.total_beats / 0.25) as u32;
             if global_16th != last_global_16th {
-                state.transport.playhead.store(global_16th, Ordering::Relaxed);
+                state
+                    .transport
+                    .playhead
+                    .store(global_16th, Ordering::Relaxed);
                 last_global_16th = global_16th;
             }
 
@@ -176,7 +183,11 @@ impl SequencerClock {
 
                             state.transport.track_playheads[t].store(step_u32, Ordering::Relaxed);
 
-                            triggers.push(Trigger { track: t, step, offset });
+                            triggers.push(Trigger {
+                                track: t,
+                                step,
+                                offset,
+                            });
                         }
                     }
                     None => {
@@ -187,7 +198,10 @@ impl SequencerClock {
         }
 
         let phase_16th = (self.total_beats / 0.25).fract() as f32;
-        state.transport.playhead_phase.store(phase_16th.to_bits(), Ordering::Relaxed);
+        state
+            .transport
+            .playhead_phase
+            .store(phase_16th.to_bits(), Ordering::Relaxed);
 
         triggers
     }

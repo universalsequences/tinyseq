@@ -437,7 +437,11 @@ pub(super) fn draw_effects_column(
             let display_val = param_desc.format_value(display_stored);
             let norm = param_desc.normalize(display_stored);
             let fill = ((slider_width as f32 * norm).round() as usize).min(slider_width);
-            let bar = format!("{}{}", "─".repeat(fill), " ".repeat(slider_width.saturating_sub(fill)));
+            let bar = format!(
+                "{}{}",
+                "─".repeat(fill),
+                " ".repeat(slider_width.saturating_sub(fill))
+            );
             let label_style = if is_cursor_row {
                 Style::default().fg(Color::White)
             } else {
@@ -974,6 +978,52 @@ pub(super) fn draw_compiling_overlay(frame: &mut Frame, pending: &PendingCompile
 
     let block = Block::default()
         .title(" Compiling ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    if inner.height >= 2 && inner.width >= 4 {
+        let line = Line::from(Span::styled(
+            format!("  {spin} {name_display}  "),
+            Style::default().fg(Color::Yellow),
+        ));
+        let center_y = inner.y + inner.height / 2;
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, center_y, inner.width, 1),
+        );
+    }
+}
+
+pub(super) fn draw_project_loading_overlay(frame: &mut Frame, name: &str, tick: usize, area: Rect) {
+    const SPINNER: &[char] = &[
+        '\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{287F}', '\u{28BF}', '\u{28FB}', '\u{28FD}',
+        '\u{28FE}',
+    ];
+    let spin = SPINNER[tick / 2 % SPINNER.len()];
+    let name_display = if name.len() > 14 {
+        format!("{}...", &name[..11])
+    } else {
+        name.to_string()
+    };
+
+    let w = 20u16;
+    let h = 4u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let overlay = Rect::new(x, y, w, h);
+
+    let bg = Style::default().bg(Color::Rgb(20, 20, 20));
+    for row in 0..h {
+        frame.render_widget(
+            Paragraph::new(" ".repeat(w as usize)).style(bg),
+            Rect::new(x, y + row, w, 1),
+        );
+    }
+
+    let block = Block::default()
+        .title(" Opening ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::White));
     let inner = block.inner(overlay);

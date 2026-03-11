@@ -37,7 +37,13 @@ impl App {
                 .unwrap_or(false)
         };
 
-        let push_lfo = |out: &mut Vec<usize>, rate_idx: usize, sync_idx: usize, div_idx: usize, shape_idx: usize, pw_idx: usize, retrig_idx: usize| {
+        let push_lfo = |out: &mut Vec<usize>,
+                        rate_idx: usize,
+                        sync_idx: usize,
+                        div_idx: usize,
+                        shape_idx: usize,
+                        pw_idx: usize,
+                        retrig_idx: usize| {
             let rate_node = crate::voice_modulator::MOD_PARAM_BASE + rate_idx as u32;
             let sync_node = crate::voice_modulator::MOD_PARAM_BASE + sync_idx as u32;
             let div_node = crate::voice_modulator::MOD_PARAM_BASE + div_idx as u32;
@@ -45,7 +51,11 @@ impl App {
             let pw_node = crate::voice_modulator::MOD_PARAM_BASE + pw_idx as u32;
             let retrig_node = crate::voice_modulator::MOD_PARAM_BASE + retrig_idx as u32;
 
-            if let Some(idx) = if lfo_sync(sync_node) { find_idx_by_node(div_node) } else { find_idx_by_node(rate_node) } {
+            if let Some(idx) = if lfo_sync(sync_node) {
+                find_idx_by_node(div_node)
+            } else {
+                find_idx_by_node(rate_node)
+            } {
                 out.push(idx);
             }
             if let Some(idx) = find_idx_by_node(sync_node) {
@@ -80,33 +90,59 @@ impl App {
             crate::voice_modulator::PARAM_ENV_SUSTAIN,
             crate::voice_modulator::PARAM_ENV_RELEASE_MS,
         ] {
-            if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + idx_const as u32) {
+            if let Some(idx) =
+                find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + idx_const as u32)
+            {
                 out.push(idx);
             }
         }
 
-        if let Some(idx) = if lfo_sync(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32) {
-            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_DIV as u32)
+        if let Some(idx) = if lfo_sync(
+            crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32,
+        ) {
+            find_idx_by_node(
+                crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_RAND_DIV as u32,
+            )
         } else {
-            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32)
+            find_idx_by_node(
+                crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32,
+            )
         } {
             out.push(idx);
         }
-        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32) {
+        if let Some(idx) = find_idx_by_node(
+            crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SYNC as u32,
+        ) {
             out.push(idx);
         }
-        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SLEW as u32) {
+        if let Some(idx) = find_idx_by_node(
+            crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SLEW as u32,
+        ) {
             out.push(idx);
         }
 
-        if let Some(idx) = if lfo_sync(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_SYNC as u32) {
-            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_DIV as u32)
+        if let Some(idx) = if lfo_sync(
+            crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_DRIFT_SYNC as u32,
+        ) {
+            find_idx_by_node(
+                crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_DRIFT_DIV as u32,
+            )
         } else {
-            find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_RATE as u32)
+            find_idx_by_node(
+                crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_DRIFT_RATE as u32,
+            )
         } {
             out.push(idx);
         }
-        if let Some(idx) = find_idx_by_node(crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_SYNC as u32) {
+        if let Some(idx) = find_idx_by_node(
+            crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_DRIFT_SYNC as u32,
+        ) {
             out.push(idx);
         }
 
@@ -132,7 +168,10 @@ impl App {
         out
     }
 
-    pub(super) fn source_display_rows(&self, track: usize) -> Vec<(Option<&'static str>, Option<usize>)> {
+    pub(super) fn source_display_rows(
+        &self,
+        track: usize,
+    ) -> Vec<(Option<&'static str>, Option<usize>)> {
         let actual = self.source_param_actual_indices(track);
         let Some(desc) = self.graph.instrument_descriptors.get(track) else {
             return Vec::new();
@@ -151,28 +190,38 @@ impl App {
 
         let section_name = |idx: usize, desc: &EffectDescriptor| -> &'static str {
             let node_idx = desc.params[idx].node_param_idx;
-            if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO1_RATE_HZ as u32
-                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO1_RETRIGGER as u32)
+            if (crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_LFO1_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_LFO1_RETRIGGER as u32)
                 .contains(&node_idx)
             {
                 "LFO 1"
-            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_ENV_ATTACK_MS as u32
-                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_ENV_RELEASE_MS as u32)
+            } else if (crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_ENV_ATTACK_MS as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_ENV_RELEASE_MS as u32)
                 .contains(&node_idx)
             {
                 "ENV 1"
-            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32
-                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_RAND_SLEW as u32)
+            } else if (crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_RAND_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_RAND_SLEW as u32)
                 .contains(&node_idx)
             {
                 "RAND"
-            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_RATE as u32
-                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_DRIFT_DIV as u32)
+            } else if (crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_DRIFT_RATE as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_DRIFT_DIV as u32)
                 .contains(&node_idx)
             {
                 "DRIFT"
-            } else if (crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO2_RATE_HZ as u32
-                ..=crate::voice_modulator::MOD_PARAM_BASE + crate::voice_modulator::PARAM_LFO2_RETRIGGER as u32)
+            } else if (crate::voice_modulator::MOD_PARAM_BASE
+                + crate::voice_modulator::PARAM_LFO2_RATE_HZ as u32
+                ..=crate::voice_modulator::MOD_PARAM_BASE
+                    + crate::voice_modulator::PARAM_LFO2_RETRIGGER as u32)
                 .contains(&node_idx)
             {
                 "LFO 2"
@@ -185,7 +234,9 @@ impl App {
             let section_params: Vec<usize> = actual
                 .iter()
                 .enumerate()
-                .filter_map(|(row_idx, &actual_idx)| (section_name(actual_idx, desc) == section).then_some(row_idx))
+                .filter_map(|(row_idx, &actual_idx)| {
+                    (section_name(actual_idx, desc) == section).then_some(row_idx)
+                })
                 .collect();
             if section_params.is_empty() {
                 continue;
@@ -260,11 +311,14 @@ impl App {
     }
 
     pub(super) fn instrument_base_note_offset(&self, track: usize) -> f32 {
-        f32::from_bits(self.state.pattern.instrument_base_note_offsets[track].load(Ordering::Relaxed))
+        f32::from_bits(
+            self.state.pattern.instrument_base_note_offsets[track].load(Ordering::Relaxed),
+        )
     }
 
     pub(super) fn set_instrument_base_note_offset(&self, track: usize, value: f32) {
-        self.state.pattern.instrument_base_note_offsets[track].store(value.to_bits(), Ordering::Relaxed);
+        self.state.pattern.instrument_base_note_offsets[track]
+            .store(value.to_bits(), Ordering::Relaxed);
         self.mark_track_sound_dirty(track);
     }
 
@@ -486,9 +540,8 @@ impl App {
             KeyCode::Up => {
                 if shift {
                     if self.ui.instrument_param_cursor == 0 {
-                        let next =
-                            (self.instrument_base_note_offset(self.ui.cursor_track) + 1.0)
-                                .clamp(-48.0, 48.0);
+                        let next = (self.instrument_base_note_offset(self.ui.cursor_track) + 1.0)
+                            .clamp(-48.0, 48.0);
                         self.set_instrument_base_note_offset(self.ui.cursor_track, next);
                     } else {
                         self.adjust_instrument_param(1.0);
@@ -501,9 +554,8 @@ impl App {
             KeyCode::Down => {
                 if shift {
                     if self.ui.instrument_param_cursor == 0 {
-                        let next =
-                            (self.instrument_base_note_offset(self.ui.cursor_track) - 1.0)
-                                .clamp(-48.0, 48.0);
+                        let next = (self.instrument_base_note_offset(self.ui.cursor_track) - 1.0)
+                            .clamp(-48.0, 48.0);
                         self.set_instrument_base_note_offset(self.ui.cursor_track, next);
                     } else {
                         self.adjust_instrument_param(-1.0);
@@ -522,8 +574,7 @@ impl App {
                     self.ui.input_mode = InputMode::ValueEntry;
                 } else if let Some(desc) = self.current_instrument_descriptor() {
                     let synth_indices = self.synth_param_indices(self.ui.cursor_track);
-                    if let Some(&param_idx) =
-                        synth_indices.get(self.ui.instrument_param_cursor - 1)
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1)
                     {
                         let param = &desc.params[param_idx];
                         if param.is_boolean() {
@@ -546,8 +597,7 @@ impl App {
                     self.ui.input_mode = InputMode::ValueEntry;
                 } else if let Some(desc) = self.current_instrument_descriptor() {
                     let synth_indices = self.synth_param_indices(self.ui.cursor_track);
-                    if let Some(&param_idx) =
-                        synth_indices.get(self.ui.instrument_param_cursor - 1)
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1)
                     {
                         let param = &desc.params[param_idx];
                         if !param.is_boolean() {
@@ -803,7 +853,9 @@ impl App {
         let param_idx = *synth_indices.get(row_idx.checked_sub(1)?)?;
         let desc = self.graph.instrument_descriptors.get(track)?;
         let param_desc = desc.params.get(param_idx)?;
-        let stored = self.state.pattern.instrument_slots[track].defaults.get(param_idx);
+        let stored = self.state.pattern.instrument_slots[track]
+            .defaults
+            .get(param_idx);
         Some(param_desc.stored_to_user(stored))
     }
 
@@ -812,7 +864,9 @@ impl App {
         let param_idx = *mod_indices.get(row_idx)?;
         let desc = self.graph.instrument_descriptors.get(track)?;
         let param_desc = desc.params.get(param_idx)?;
-        let stored = self.state.pattern.instrument_slots[track].defaults.get(param_idx);
+        let stored = self.state.pattern.instrument_slots[track]
+            .defaults
+            .get(param_idx);
         Some(param_desc.stored_to_user(stored))
     }
 
@@ -821,7 +875,9 @@ impl App {
         let param_idx = *source_indices.get(row_idx)?;
         let desc = self.graph.instrument_descriptors.get(track)?;
         let param_desc = desc.params.get(param_idx)?;
-        let stored = self.state.pattern.instrument_slots[track].defaults.get(param_idx);
+        let stored = self.state.pattern.instrument_slots[track]
+            .defaults
+            .get(param_idx);
         Some(param_desc.stored_to_user(stored))
     }
 
@@ -837,7 +893,9 @@ impl App {
         self.source_display_rows(self.ui.cursor_track)
             .iter()
             .enumerate()
-            .find_map(|(display_idx, (_, maybe_row))| (*maybe_row == Some(param_row)).then_some(display_idx))
+            .find_map(|(display_idx, (_, maybe_row))| {
+                (*maybe_row == Some(param_row)).then_some(display_idx)
+            })
             .unwrap_or(0)
     }
 
@@ -984,7 +1042,8 @@ impl App {
             .graph
             .engine_node_ids
             .get(engine_id)
-            .and_then(|engine| engine.as_ref()) else {
+            .and_then(|engine| engine.as_ref())
+        else {
             return;
         };
         let is_mod_param = idx as u32 >= crate::voice_modulator::MOD_PARAM_BASE;

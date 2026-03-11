@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ mod effects_draw;
 mod graph;
 mod input;
 mod params;
+mod projects;
 mod synth;
 
 pub use browser::BrowserNode;
@@ -82,6 +84,23 @@ struct PendingCompile {
     tick: usize,
 }
 
+enum PendingProjectLoadPhase {
+    ClearExisting,
+    AddTrack(usize),
+    AddEffect { track_idx: usize, offset: usize },
+    BuildPattern(usize),
+    Finalize,
+}
+
+struct PendingProjectLoad {
+    name: String,
+    tick: usize,
+    project: crate::project::ProjectFile,
+    built_patterns: Vec<crate::sequencer::PatternSnapshot>,
+    fallback_samples: usize,
+    phase: PendingProjectLoadPhase,
+}
+
 pub struct EngineDescriptor {
     pub name: String,
     pub source: String,
@@ -144,6 +163,7 @@ pub struct ParamMouseDrag {
 pub struct EditorState {
     pending_editor: Option<PendingEditor>,
     pending_compile: Option<PendingCompile>,
+    pending_project_load: Option<PendingProjectLoad>,
     lisp_libs: Vec<LoadedDGenLib>,
     pub instrument_libs: Vec<LoadedDGenLib>,
     pub picker_cursor: usize,
@@ -194,8 +214,10 @@ pub enum InputMode {
     Dropdown,
     PatternSelect,
     PresetNameEntry,
+    ProjectNameEntry,
     EffectPicker,
     InstrumentPicker,
+    ProjectPicker,
     StepInsert,
     StepSelect,
     StepArm,
@@ -254,6 +276,7 @@ pub struct LayoutRects {
     pub pattern_buttons_area: ratatui::prelude::Rect,
     pub page_blocks_area: ratatui::prelude::Rect,
     pub sidebar_inner: ratatui::prelude::Rect,
+    pub piano_area: ratatui::prelude::Rect,
 }
 
 /// Per-track node IDs needed for graph rewiring.
@@ -311,6 +334,7 @@ pub struct UiState {
     pub piano_notes: Vec<(i32, Instant)>,
     pub piano_last_step: usize,
     pub piano_last_track: usize,
+    pub piano_lo: i32,
     pub follow_override_until: Option<Instant>,
     pub instrument_picker_cursor: usize,
     pub instrument_param_cursor: usize,
@@ -326,6 +350,9 @@ pub struct UiState {
 pub struct App {
     pub state: Arc<SequencerState>,
     pub tracks: Vec<String>,
+    pub sampler_paths: Vec<Option<PathBuf>>,
+    pub sample_path_registry: HashMap<String, PathBuf>,
+    pub current_project_name: Option<String>,
     pub ui: UiState,
     pub editor: EditorState,
     pub browser: BrowserState,
@@ -358,6 +385,9 @@ impl App {
         Self {
             state,
             tracks: Vec::new(),
+            sampler_paths: Vec::new(),
+            sample_path_registry: HashMap::new(),
+            current_project_name: None,
             ui: UiState {
                 cursor_step: 0,
                 cursor_track: 0,
@@ -394,6 +424,7 @@ impl App {
                 piano_notes: Vec::new(),
                 piano_last_step: usize::MAX,
                 piano_last_track: usize::MAX,
+                piano_lo: -12,
                 follow_override_until: None,
                 instrument_picker_cursor: 0,
                 instrument_param_cursor: 0,
@@ -408,6 +439,7 @@ impl App {
             editor: EditorState {
                 pending_editor: None,
                 pending_compile: None,
+                pending_project_load: None,
                 lisp_libs: Vec::new(),
                 instrument_libs: Vec::new(),
                 picker_cursor: 0,
@@ -555,5 +587,17 @@ impl App {
         if self.ui.cursor_step >= ns {
             self.ui.cursor_step = ns - 1;
         }
+    }
+
+    pub(super) fn register_sample_path(&mut self, sample_name: &str, path: PathBuf) {
+        self.sample_path_registry
+            .insert(sample_name.to_string(), path);
+    }
+
+    pub(super) fn sync_sampler_path_from_name(&mut self, track: usize, sample_name: &str) {
+        if track >= self.sampler_paths.len() {
+            return;
+        }
+        self.sampler_paths[track] = self.sample_path_registry.get(sample_name).cloned();
     }
 }

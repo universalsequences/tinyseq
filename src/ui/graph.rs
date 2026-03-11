@@ -89,6 +89,10 @@ impl GraphController<'_> {
                 sampler_ids: voices.sampler_ids,
             },
         });
+        let sample_path = wav_path.to_path_buf();
+        let sample_name = self.app.tracks[idx].clone();
+        self.app.sampler_paths.push(Some(sample_path.clone()));
+        self.app.register_sample_path(&sample_name, sample_path);
         Ok(idx)
     }
 
@@ -118,6 +122,7 @@ impl GraphController<'_> {
                 manifest,
             },
         });
+        self.app.sampler_paths.push(None);
         Ok(idx)
     }
 
@@ -165,7 +170,128 @@ impl GraphController<'_> {
             self.send_buffer_to_all_voices(track, *buffer_id);
             self.app.graph.track_buffer_ids[track] = *buffer_id;
             self.app.tracks[track] = name.clone();
+            self.app.sync_sampler_path_from_name(track, name);
         }
+    }
+
+    pub fn clear_all_tracks(&mut self) {
+        let _batch = GraphEditBatchGuard::new(self.app.graph.lg.0);
+
+        for track_idx in 0..self.app.tracks.len() {
+            for slot_idx in crate::effects::BUILTIN_SLOT_COUNT
+                ..self.app.state.pattern.effect_chains[track_idx].len()
+            {
+                let slot = &self.app.state.pattern.effect_chains[track_idx][slot_idx];
+                let node_id = slot.node_id.load(Ordering::Relaxed);
+                if node_id == 0 {
+                    continue;
+                }
+                let offset = slot_idx - crate::effects::BUILTIN_SLOT_COUNT;
+                let predecessor_id = self.find_custom_slot_predecessor(track_idx, offset);
+                let successor_id = self.find_custom_slot_successor(track_idx, offset);
+                unsafe {
+                    crate::audiograph::graph_disconnect(
+                        self.app.graph.lg.0,
+                        predecessor_id,
+                        0,
+                        node_id as i32,
+                        0,
+                    );
+                    crate::audiograph::graph_disconnect(
+                        self.app.graph.lg.0,
+                        node_id as i32,
+                        0,
+                        successor_id,
+                        0,
+                    );
+                    crate::audiograph::graph_connect(
+                        self.app.graph.lg.0,
+                        predecessor_id,
+                        0,
+                        successor_id,
+                        0,
+                    );
+                    crate::audiograph::delete_node(self.app.graph.lg.0, node_id as i32);
+                }
+            }
+        }
+
+        for engine in self.app.graph.engine_node_ids.iter_mut().flatten() {
+            for routes in &engine.route_gain_ids {
+                for &route_id in routes {
+                    unsafe {
+                        crate::audiograph::delete_node(self.app.graph.lg.0, route_id);
+                    }
+                }
+            }
+            for &node_id in &engine.synth_ids {
+                unsafe {
+                    crate::audiograph::delete_node(self.app.graph.lg.0, node_id);
+                }
+            }
+            for &node_id in &engine.modulator_ids {
+                unsafe {
+                    crate::audiograph::delete_node(self.app.graph.lg.0, node_id);
+                }
+            }
+            for &node_id in &engine.gatepitch_ids {
+                unsafe {
+                    crate::audiograph::delete_node(self.app.graph.lg.0, node_id);
+                }
+            }
+        }
+
+        for track in self.app.graph.track_node_ids.iter().rev() {
+            for &sampler_id in &track.sampler_ids {
+                unsafe {
+                    crate::audiograph::delete_node(self.app.graph.lg.0, sampler_id);
+                }
+            }
+            unsafe {
+                crate::audiograph::delete_node(self.app.graph.lg.0, track.send_id);
+                crate::audiograph::delete_node(self.app.graph.lg.0, track.delay_id);
+                crate::audiograph::delete_node(self.app.graph.lg.0, track.filter_id);
+                crate::audiograph::delete_node(self.app.graph.lg.0, track.voice_sum_id);
+            }
+        }
+
+        self.app.tracks.clear();
+        self.app.sampler_paths.clear();
+        self.app.graph.track_node_ids.clear();
+        self.app.graph.track_buffer_ids.clear();
+        self.app.graph.track_voice_lids.clear();
+        self.app.graph.track_instrument_types.clear();
+        self.app.graph.track_engine_ids.clear();
+        self.app.graph.track_synth_node_ids.clear();
+        self.app.graph.track_gatepitch_node_ids.clear();
+        self.app.graph.engine_node_ids.clear();
+        self.app.graph.effect_descriptors.clear();
+        self.app.graph.instrument_descriptors.clear();
+        self.app.graph.record_armed.clear();
+
+        self.app.ui.cursor_track = 0;
+        self.app.ui.cursor_step = 0;
+        self.app.ui.pattern_page = 0;
+        self.app.ui.focused_region = super::Region::Sidebar;
+        self.app.ui.sidebar_mode = super::SidebarMode::InstrumentPicker;
+
+        self.app
+            .state
+            .transport
+            .num_tracks
+            .store(0, Ordering::Release);
+        self.app
+            .state
+            .pattern
+            .current_pattern
+            .store(0, Ordering::Relaxed);
+        self.app
+            .state
+            .pattern
+            .num_patterns
+            .store(1, Ordering::Relaxed);
+        *self.app.state.pattern.pattern_bank.lock().unwrap() =
+            vec![crate::sequencer::PatternSnapshot::new_default(0, &[])];
     }
 
     pub(super) fn send_buffer_to_all_voices(&self, track: usize, buffer_id: i32) {
@@ -183,6 +309,34 @@ impl GraphController<'_> {
                 }
             }
         }
+    }
+
+    fn find_custom_slot_predecessor(&self, track: usize, offset: usize) -> i32 {
+        let chain = &self.app.state.pattern.effect_chains[track];
+        for i in (0..offset).rev() {
+            let idx = crate::effects::BUILTIN_SLOT_COUNT + i;
+            if idx < chain.len() {
+                let node_id = chain[idx].node_id.load(Ordering::Relaxed);
+                if node_id != 0 {
+                    return node_id as i32;
+                }
+            }
+        }
+        self.app.graph.track_node_ids[track].voice_sum_id
+    }
+
+    fn find_custom_slot_successor(&self, track: usize, offset: usize) -> i32 {
+        let chain = &self.app.state.pattern.effect_chains[track];
+        for i in (offset + 1)..crate::lisp_effect::MAX_CUSTOM_FX {
+            let idx = crate::effects::BUILTIN_SLOT_COUNT + i;
+            if idx < chain.len() {
+                let node_id = chain[idx].node_id.load(Ordering::Relaxed);
+                if node_id != 0 {
+                    return node_id as i32;
+                }
+            }
+        }
+        self.app.graph.track_node_ids[track].filter_id
     }
 
     fn create_track_shell(&mut self, name: &str) -> TrackShell {
@@ -494,7 +648,8 @@ impl GraphController<'_> {
         for (v, &lid) in voice_lids.iter().enumerate() {
             self.app.state.runtime.engine_voice_lids[engine_id][v].store(lid, Ordering::Release);
         }
-        self.app.state.runtime.engine_voice_counts[engine_id].store(MAX_VOICES as u32, Ordering::Release);
+        self.app.state.runtime.engine_voice_counts[engine_id]
+            .store(MAX_VOICES as u32, Ordering::Release);
         if let Some(engine) = &self.app.graph.engine_node_ids[engine_id] {
             for (v, &sid) in engine.synth_ids.iter().enumerate() {
                 self.app.state.runtime.engine_synth_node_ids[engine_id][v]
@@ -756,8 +911,9 @@ impl GraphController<'_> {
                 if let Some(sound) = self
                     .app
                     .state
-                    .pattern.track_sound_state
-            .lock()
+                    .pattern
+                    .track_sound_state
+                    .lock()
                     .unwrap()
                     .get_mut(idx)
                 {
@@ -783,12 +939,14 @@ impl GraphController<'_> {
                 engine_id,
                 manifest,
             } => {
-                self.app.state.runtime.track_engine_ids[idx].store(engine_id as u32, Ordering::Release);
+                self.app.state.runtime.track_engine_ids[idx]
+                    .store(engine_id as u32, Ordering::Release);
                 if let Some(sound) = self
                     .app
                     .state
-                    .pattern.track_sound_state
-            .lock()
+                    .pattern
+                    .track_sound_state
+                    .lock()
                     .unwrap()
                     .get_mut(idx)
                 {
@@ -825,7 +983,8 @@ impl GraphController<'_> {
 
         self.app
             .state
-            .transport.num_tracks
+            .transport
+            .num_tracks
             .store((idx + 1) as u32, Ordering::Release);
     }
 
@@ -879,12 +1038,18 @@ impl GraphController<'_> {
             });
             inst_desc.params.push(crate::effects::ParamDescriptor {
                 name: format!("mod {} amt", dest.name),
-                min: dest
-                    .depth_min
-                    .unwrap_or_else(|| param_by_cell.get(&dest.depth_cell_id).map(|p| p.min).unwrap_or(-1.0)),
-                max: dest
-                    .depth_max
-                    .unwrap_or_else(|| param_by_cell.get(&dest.depth_cell_id).map(|p| p.max).unwrap_or(1.0)),
+                min: dest.depth_min.unwrap_or_else(|| {
+                    param_by_cell
+                        .get(&dest.depth_cell_id)
+                        .map(|p| p.min)
+                        .unwrap_or(-1.0)
+                }),
+                max: dest.depth_max.unwrap_or_else(|| {
+                    param_by_cell
+                        .get(&dest.depth_cell_id)
+                        .map(|p| p.max)
+                        .unwrap_or(1.0)
+                }),
                 default: depth_default,
                 kind: crate::effects::ParamKind::Continuous {
                     unit: dest.unit.clone(),

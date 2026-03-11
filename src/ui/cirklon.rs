@@ -121,7 +121,7 @@ impl App {
                 }
             }
 
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            KeyCode::Char('+') => {
                 if !self.tracks.is_empty() {
                     let old_len = self.num_steps();
                     let new_len = self.state.duplicate_track_pattern(self.ui.cursor_track);
@@ -139,7 +139,7 @@ impl App {
                     self.clamp_cursor_to_steps();
                 }
             }
-            KeyCode::Char('-') => {
+            KeyCode::Char('_') => {
                 if !self.tracks.is_empty() {
                     let old_len = self.num_steps();
                     let new_len = self.state.halve_track_pattern(self.ui.cursor_track);
@@ -382,6 +382,28 @@ fn is_beat_group_odd(step: usize) -> bool {
     (step / 4) % 2 == 1
 }
 
+/// Pulsing background for the cursor column (slow sine wave).
+fn cursor_pulse_bg() -> Color {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let t = (ms as f64) / 700.0 * std::f64::consts::TAU;
+    let b = (55.0 + 25.0 * (0.5 + 0.5 * t.sin())) as u8;
+    Color::Rgb(b, b, b)
+}
+
+/// Pulsing foreground for the blinking cursor border.
+fn cursor_pulse_fg() -> Color {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let t = (ms as f64) / 700.0 * std::f64::consts::TAU;
+    let b = (110.0 + 110.0 * (0.5 + 0.5 * t.sin())) as u8;
+    Color::Rgb(b, b, b)
+}
+
 /// Background color for a step column. Alternates every 4 steps for beat grouping.
 fn step_bg(app: &App, step: usize, is_playing: bool, playhead: usize) -> Color {
     let is_cursor = step == app.ui.cursor_step;
@@ -389,11 +411,11 @@ fn step_bg(app: &App, step: usize, is_playing: bool, playhead: usize) -> Color {
     let is_ph = is_playing && step == playhead;
 
     if is_cursor {
-        Color::Rgb(80, 80, 80)
+        cursor_pulse_bg()
     } else if is_sel {
-        Color::Rgb(50, 50, 50)
+        Color::Rgb(20, 30, 60) // blue tint
     } else if is_ph {
-        Color::Rgb(50, 50, 50)
+        Color::Rgb(55, 42, 8) // amber tint
     } else if is_beat_group_odd(step) {
         Color::Rgb(22, 22, 22)
     } else {
@@ -515,7 +537,7 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                 let going_up = normalized >= 0.5;
 
                 let dim = step_dim_fg(step);
-                let active_fg = step_active_fg(step);
+                let active_fg = param_color(app.ui.active_param);
                 let (cell_text, fg_override) = if going_up {
                     if row < center {
                         let dist_from_center = center - row;
@@ -589,7 +611,7 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                 };
 
                 let fg = if active {
-                    step_active_fg(step)
+                    param_color(app.ui.active_param)
                 } else {
                     step_dim_fg(step)
                 };
@@ -597,6 +619,37 @@ fn draw_bars(frame: &mut Frame, app: &App, area: Rect) {
                 let cell_area = Rect::new(col_x, cell_y, COL_WIDTH, 1);
                 frame.render_widget(Paragraph::new(cell_text).style(style), cell_area);
             }
+        }
+    }
+
+    // Blinking cursor border overlay — drawn on top of bars
+    let cursor_step = app.ui.cursor_step;
+    if cursor_step >= page_start && cursor_step < page_end {
+        let col_x = area.x + x_offset + (cursor_step - page_start) as u16 * COL_WIDTH;
+        let fg = cursor_pulse_fg();
+        let bg = cursor_pulse_bg();
+        let border_style = Style::default().fg(fg).bg(bg);
+        // Top cap
+        frame.render_widget(
+            Paragraph::new("\u{2594}\u{2594}\u{2594}").style(border_style),
+            Rect::new(col_x, area.y, COL_WIDTH, 1),
+        );
+        // Bottom cap
+        frame.render_widget(
+            Paragraph::new("\u{2581}\u{2581}\u{2581}").style(border_style),
+            Rect::new(col_x, area.y + (BAR_HEIGHT - 1) as u16, COL_WIDTH, 1),
+        );
+        // Left/right │ for middle rows
+        for mid in 1..(BAR_HEIGHT as u16 - 1) {
+            let y = area.y + mid;
+            frame.render_widget(
+                Paragraph::new("\u{2502}").style(border_style),
+                Rect::new(col_x, y, 1, 1),
+            );
+            frame.render_widget(
+                Paragraph::new("\u{2502}").style(border_style),
+                Rect::new(col_x + 2, y, 1, 1),
+            );
         }
     }
 }
@@ -716,6 +769,7 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         let active = app.state.pattern.patterns[app.ui.cursor_track].is_active(step);
+        let chord_count = app.state.pattern.chord_data[app.ui.cursor_track].count(step);
         // Check all slots for p-locks
         let has_plock = app.state.pattern.effect_chains[app.ui.cursor_track]
             .iter()
@@ -723,15 +777,19 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
                 let np = slot.num_params.load(Ordering::Relaxed) as usize;
                 slot.plocks.step_has_any_plock(step, np)
             });
-        let ch = if active && has_plock {
-            " \u{25c6} " // ◆ diamond — active with p-lock
-        } else if active {
-            " \u{25a0} " // ■ filled square — active
+        // Symbol: circle base; append chord count digit when > 1
+        let base_sym = if has_plock { "\u{25c9}" } else { "\u{25cf}" }; // ◉ or ●
+        let ch: String = if !active {
+            " \u{00b7} ".to_string() // ·
+        } else if chord_count > 1 {
+            format!(" {}{}", base_sym, chord_count.min(9))
         } else {
-            " \u{00b7} " // · middle dot — inactive
+            format!(" {} ", base_sym)
         };
         let fg = if active && has_plock {
             Color::Cyan
+        } else if active && chord_count > 1 {
+            Color::Rgb(220, 160, 40) // amber for chords
         } else if active {
             step_active_fg(step)
         } else {
@@ -751,11 +809,17 @@ fn draw_trigger_row(frame: &mut Frame, app: &App, area: Rect) {
 
         let num = format!("{:>2} ", step + 1);
         let is_sel = app.has_selection() && is_in_selection(app, step);
-        let beat_bg = step_bg(app, step, false, 0); // just for beat-group shading
+        let beat_bg = if is_beat_group_odd(step) {
+            Color::Rgb(22, 22, 22)
+        } else {
+            Color::Reset
+        };
         let style = if step == app.ui.cursor_step {
-            Style::default().fg(Color::White).bg(Color::Rgb(80, 80, 80))
+            Style::default().fg(Color::White).bg(cursor_pulse_bg())
         } else if is_sel {
-            Style::default().fg(Color::Rgb(160, 160, 160)).bg(beat_bg)
+            Style::default()
+                .fg(Color::Rgb(160, 160, 160))
+                .bg(Color::Rgb(20, 30, 60))
         } else {
             Style::default().fg(step_num_fg(step)).bg(beat_bg)
         };
@@ -932,8 +996,12 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Store area for click detection
+    app.ui.layout.piano_area = area;
+
     let track = app.ui.cursor_track;
     let now = Instant::now();
+    let is_playing = app.state.is_playing();
 
     // Reset note state on track change
     if track != app.ui.piano_last_track {
@@ -942,16 +1010,36 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
         app.ui.piano_last_track = track;
     }
 
-    // Detect new step triggers and add notes with duration-based expiry
-    if app.state.is_playing() {
+    // Collect cursor step notes (for paused mode display and range calculation)
+    let cursor_step = app.ui.cursor_step;
+    let step_active = app.state.pattern.patterns[track].is_active(cursor_step);
+    let chord_count = app.state.pattern.chord_data[track].count(cursor_step);
+    let step_notes: Vec<i32> = if chord_count > 0 {
+        (0..chord_count)
+            .map(|n| {
+                app.state.pattern.chord_data[track]
+                    .get(cursor_step, n)
+                    .round() as i32
+            })
+            .collect()
+    } else if step_active {
+        let t = app.state.pattern.step_data[track]
+            .get(cursor_step, StepParam::Transpose)
+            .round() as i32;
+        vec![t]
+    } else {
+        vec![]
+    };
+
+    // Detect new step triggers (playing mode) and add notes with duration-based expiry
+    if is_playing {
         let ns = app.num_steps();
-        let step = app.state.track_step(app.ui.cursor_track) % ns;
+        let step = app.state.track_step(track) % ns;
 
         if step != app.ui.piano_last_step {
             app.ui.piano_last_step = step;
 
             if app.state.pattern.patterns[track].is_active(step) {
-                // Calculate note duration in wall-clock seconds
                 let bpm = app.state.transport.bpm.load(Ordering::Relaxed) as f64;
                 let secs_per_step = 60.0 / bpm / 4.0;
                 let dur = app.state.pattern.step_data[track].get(step, StepParam::Duration) as f64;
@@ -974,58 +1062,72 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     } else {
-        // Sequencer stopped — let notes expire naturally but don't add new ones
         app.ui.piano_last_step = usize::MAX;
     }
 
-    // Prune expired notes
     app.ui.piano_notes.retain(|(_, exp)| *exp > now);
 
-    // Build active note set: ringing sequencer notes + held keyboard notes
-    let mut active: Vec<i32> = app.ui.piano_notes.iter().map(|(s, _)| *s).collect();
-    for &(_, t, _, _) in &app.ui.held_notes {
-        active.push(t.round() as i32);
-    }
-
-    // 1 char per semitone, snap to full octaves, left-aligned
-    let octaves = ((area.width as i32) / 12).min(5);
+    // Key range: same in both playing and paused modes so highlighted keys always
+    // appear at the same positions (avoids apparent octave shift between modes).
+    let octaves = ((area.width as i32) / 12).min(5).max(2);
     let num_keys = octaves * 12;
-    if num_keys <= 0 {
-        return;
-    }
     let half = num_keys / 2;
     let lo = -((half / 12) * 12);
     let hi = lo + num_keys;
-    let x0 = area.x; // left-aligned with sequencer content
+    app.ui.piano_lo = lo;
 
+    let x0 = area.x;
     let buf = frame.buffer_mut();
 
     let white_bg = Color::Rgb(200, 200, 200);
     let black_bg = Color::Rgb(30, 30, 30);
-    let active_bg = Color::Cyan;
+    let step_note_bg = Color::Rgb(220, 160, 40); // amber: cursor step notes
+    let ringing_bg = Color::Cyan; // cyan: currently playing notes
+    let both_bg = Color::Rgb(100, 220, 140); // green: step note that is also ringing
     let gap_bg = Color::Rgb(50, 50, 50);
 
-    // Row 1 (back): All keys visible — white bright, black dark
+    // Build note sets
+    let ringing: Vec<i32> = app.ui.piano_notes.iter().map(|(s, _)| *s).collect();
+    let held: Vec<i32> = app
+        .ui
+        .held_notes
+        .iter()
+        .map(|&(_, t, _, _)| t.round() as i32)
+        .collect();
+
+    // Always overlay both: amber = cursor step, cyan = playing, green = both
+    let key_color = |s: i32, row: u8| -> Color {
+        let is_black = matches!(s.rem_euclid(12), 1 | 3 | 6 | 8 | 10);
+        let is_step = step_notes.contains(&s);
+        let is_ringing = ringing.contains(&s) || held.contains(&s);
+        if is_step && is_ringing {
+            both_bg
+        } else if is_step {
+            step_note_bg
+        } else if is_ringing {
+            ringing_bg
+        } else if is_black {
+            if row == 0 {
+                black_bg
+            } else {
+                gap_bg
+            }
+        } else {
+            white_bg
+        }
+    };
+
+    // Row 1 (back): all keys visible
     let y1 = area.y;
     for s in lo..hi {
         let x = x0 + (s - lo) as u16;
         if x >= area.x + area.width {
             break;
         }
-        let black = matches!(s.rem_euclid(12), 1 | 3 | 6 | 8 | 10);
-        let lit = active.contains(&s);
-
-        let bg = if lit {
-            active_bg
-        } else if black {
-            black_bg
-        } else {
-            white_bg
-        };
-        buf.set_string(x, y1, " ", Style::default().bg(bg));
+        buf.set_string(x, y1, " ", Style::default().bg(key_color(s, 0)));
     }
 
-    // Row 2 (front): White keys extend, black key positions become gaps
+    // Row 2 (front): white keys extend, black positions become gaps
     if area.height >= 2 {
         let y2 = area.y + 1;
         for s in lo..hi {
@@ -1033,17 +1135,7 @@ fn draw_piano_roll(frame: &mut Frame, app: &mut App, area: Rect) {
             if x >= area.x + area.width {
                 break;
             }
-            let black = matches!(s.rem_euclid(12), 1 | 3 | 6 | 8 | 10);
-            let lit = active.contains(&s);
-
-            let bg = if lit {
-                active_bg
-            } else if black {
-                gap_bg
-            } else {
-                white_bg
-            };
-            buf.set_string(x, y2, " ", Style::default().bg(bg));
+            buf.set_string(x, y2, " ", Style::default().bg(key_color(s, 1)));
         }
     }
 

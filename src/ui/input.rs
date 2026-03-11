@@ -24,6 +24,19 @@ enum EffectTabHit {
 
 impl App {
     pub fn handle_input(&mut self) -> std::io::Result<()> {
+        if self.editor.pending_project_load.is_some() {
+            let result = self.advance_project_load();
+            if let Err(error) = result {
+                self.editor.pending_project_load = None;
+                self.editor.status_message = Some((format!("Error: {error}"), Instant::now()));
+            }
+            if self.editor.pending_project_load.is_some() && event::poll(Duration::from_millis(33))?
+            {
+                let _ = event::read()?;
+            }
+            return Ok(());
+        }
+
         // Poll for async compilation result
         if let Some(ref pending) = self.editor.pending_compile {
             match pending.receiver.try_recv() {
@@ -129,10 +142,12 @@ impl App {
                         InputMode::Dropdown => self.handle_dropdown(key.code),
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
                         InputMode::PresetNameEntry => self.handle_preset_name_entry(key.code),
+                        InputMode::ProjectNameEntry => self.handle_project_name_entry(key.code),
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
                         InputMode::InstrumentPicker => {
                             self.handle_instrument_picker_overlay(key.code)
                         }
+                        InputMode::ProjectPicker => self.handle_project_picker(key.code),
                         InputMode::StepInsert => self.handle_step_insert(key.code, key.modifiers),
                         InputMode::StepSelect => self.handle_step_select(key.code, key.modifiers),
                         InputMode::StepArm => self.handle_step_arm(key.code, key.modifiers),
@@ -169,6 +184,36 @@ impl App {
                 self.ui.should_quit = true;
                 return;
             }
+            KeyCode::Char('s')
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.ui.focused_region != Region::Sidebar =>
+            {
+                if self.current_project_name.is_some() {
+                    if let Some(name) = self.current_project_name.clone() {
+                        match self.save_project_named(&name) {
+                            Ok(()) => {
+                                self.editor.status_message =
+                                    Some((format!("Saved project '{}'", name), Instant::now()));
+                            }
+                            Err(error) => {
+                                self.editor.status_message =
+                                    Some((format!("Error: {error}"), Instant::now()));
+                            }
+                        }
+                    }
+                } else {
+                    self.open_project_name_prompt();
+                }
+                return;
+            }
+            KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if !(self.ui.focused_region == Region::Sidebar
+                    && self.effective_sidebar_mode() == SidebarMode::Presets)
+                {
+                    self.open_project_picker();
+                    return;
+                }
+            }
             KeyCode::Char(' ') if self.ui.focused_region != Region::Sidebar => {
                 let was_playing = self.state.is_playing();
                 self.state.toggle_play();
@@ -178,7 +223,10 @@ impl App {
                         tph.store(0, Ordering::Relaxed);
                     }
                 } else {
-                    self.state.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
+                    self.state
+                        .transport
+                        .mod_reset_counter
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 return;
             }
@@ -341,22 +389,30 @@ impl App {
                     '[' => {
                         // Shift record quantize threshold earlier (compensate for more output latency)
                         let cur = f32::from_bits(
-                            self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
+                            self.state
+                                .transport
+                                .record_quantize_thresh
+                                .load(Ordering::Relaxed),
                         );
                         let new = (cur - 0.05).max(0.1);
                         self.state
-                            .transport.record_quantize_thresh
+                            .transport
+                            .record_quantize_thresh
                             .store(new.to_bits(), Ordering::Relaxed);
                         return;
                     }
                     ']' => {
                         // Shift record quantize threshold later
                         let cur = f32::from_bits(
-                            self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
+                            self.state
+                                .transport
+                                .record_quantize_thresh
+                                .load(Ordering::Relaxed),
                         );
                         let new = (cur + 0.05).min(0.9);
                         self.state
-                            .transport.record_quantize_thresh
+                            .transport
+                            .record_quantize_thresh
                             .store(new.to_bits(), Ordering::Relaxed);
                         return;
                     }
@@ -382,10 +438,14 @@ impl App {
                             // If we're past the quantize threshold within the current step,
                             // snap forward to the next step (the user is anticipating it).
                             let step = self.state.transport.playhead.load(Ordering::Relaxed);
-                            let phase =
-                                f32::from_bits(self.state.transport.playhead_phase.load(Ordering::Relaxed));
+                            let phase = f32::from_bits(
+                                self.state.transport.playhead_phase.load(Ordering::Relaxed),
+                            );
                             let thresh = f32::from_bits(
-                                self.state.transport.record_quantize_thresh.load(Ordering::Relaxed),
+                                self.state
+                                    .transport
+                                    .record_quantize_thresh
+                                    .load(Ordering::Relaxed),
                             );
                             let step_now = if phase >= thresh {
                                 step.wrapping_add(1) as usize
@@ -497,7 +557,10 @@ impl App {
             if !self.state.is_playing() {
                 self.state.transport.playhead.store(0, Ordering::Relaxed);
             } else if !was_playing {
-                self.state.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .transport
+                    .mod_reset_counter
+                    .fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
@@ -560,7 +623,8 @@ impl App {
                             }
                             self.clamp_cursor_to_steps();
                             // Adjust page if current page is now past the end
-                            let num_pats = self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
+                            let num_pats =
+                                self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
                             let max_page = num_pats.saturating_sub(1) / 10;
                             if self.ui.pattern_page > max_page {
                                 self.ui.pattern_page = max_page;
@@ -641,9 +705,10 @@ impl App {
                     super::TP_SWING => {
                         Some(self.state.pattern.track_params[self.ui.cursor_track].get_swing())
                     }
-                    super::TP_STEPS => {
-                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_num_steps() as f32)
-                    }
+                    super::TP_STEPS => Some(
+                        self.state.pattern.track_params[self.ui.cursor_track].get_num_steps()
+                            as f32,
+                    ),
                     super::TP_SEND => {
                         Some(self.state.pattern.track_params[self.ui.cursor_track].get_send())
                     }
@@ -732,8 +797,10 @@ impl App {
                                 self.ui.dropdown_open = true;
                                 self.ui.dropdown_cursor = 0;
                                 self.ui.input_mode = InputMode::Dropdown;
-                                let actual_idx = self.mod_param_indices(self.ui.cursor_track)[row_idx];
-                                let slot = &self.state.pattern.instrument_slots[self.ui.cursor_track];
+                                let actual_idx =
+                                    self.mod_param_indices(self.ui.cursor_track)[row_idx];
+                                let slot =
+                                    &self.state.pattern.instrument_slots[self.ui.cursor_track];
                                 let val = slot.defaults.get(actual_idx);
                                 self.ui.dropdown_cursor = val.round() as usize;
                                 self.ui.param_mouse_drag = None;
@@ -846,9 +913,65 @@ impl App {
             return;
         }
 
+        // Piano roll click: toggle chord notes on cursor step
+        if rect_contains(l.piano_area, col, row)
+            && row < l.piano_area.y + 2  // only key rows, not label/info rows
+            && !self.tracks.is_empty()
+        {
+            let semitone = self.ui.piano_lo + (col as i32 - l.piano_area.x as i32);
+            self.handle_piano_note_click(semitone);
+            self.ui.focused_region = Region::Cirklon;
+            return;
+        }
+
         // Catch-all: click anywhere in cirklon area focuses cirklon
         if rect_contains(l.cirklon_area, col, row) {
             self.ui.focused_region = Region::Cirklon;
+        }
+    }
+
+    fn handle_piano_note_click(&mut self, semitone: i32) {
+        use crate::sequencer::StepParam;
+        let track = self.ui.cursor_track;
+        let step = self.ui.cursor_step;
+        let is_active = self.state.pattern.patterns[track].is_active(step);
+        let chord_count = self.state.pattern.chord_data[track].count(step);
+
+        if !is_active {
+            // Activate the step and set this semitone as the Transpose value
+            self.state.pattern.patterns[track].set_step_active(step, true);
+            self.state.pattern.step_data[track].set(step, StepParam::Transpose, semitone as f32);
+            return;
+        }
+
+        if chord_count == 0 {
+            // Single-note step using Transpose
+            let current = self.state.pattern.step_data[track]
+                .get(step, StepParam::Transpose)
+                .round() as i32;
+            if semitone == current {
+                // Clicking the same note deactivates the step
+                self.state.pattern.patterns[track].set_step_active(step, false);
+            } else {
+                // Add a second note: migrate Transpose into chord_data, then add new note
+                self.state.pattern.chord_data[track].add_note(step, current as f32);
+                self.state.pattern.chord_data[track].add_note(step, semitone as f32);
+            }
+        } else {
+            // Step has chord data — toggle the clicked semitone
+            let added = self.state.pattern.chord_data[track].toggle_note(step, semitone as f32);
+            let new_count = self.state.pattern.chord_data[track].count(step);
+            if !added {
+                if new_count == 0 {
+                    // Removed last note: deactivate step
+                    self.state.pattern.patterns[track].set_step_active(step, false);
+                } else if new_count == 1 {
+                    // One note left: migrate back to Transpose, clear chord
+                    let remaining = self.state.pattern.chord_data[track].get(step, 0);
+                    self.state.pattern.step_data[track].set(step, StepParam::Transpose, remaining);
+                    self.state.pattern.chord_data[track].clear_step(step);
+                }
+            }
         }
     }
 
@@ -897,10 +1020,8 @@ impl App {
                 }
                 let max_scroll = self.mod_row_count().saturating_sub(visible);
                 if delta < 0 {
-                    self.ui.mod_scroll_offset = self
-                        .ui
-                        .mod_scroll_offset
-                        .saturating_sub((-delta) as usize);
+                    self.ui.mod_scroll_offset =
+                        self.ui.mod_scroll_offset.saturating_sub((-delta) as usize);
                 } else {
                     self.ui.mod_scroll_offset =
                         (self.ui.mod_scroll_offset + delta as usize).min(max_scroll);
@@ -1280,7 +1401,8 @@ impl App {
                 } else if let Ok(n) = self.ui.value_buffer.parse::<usize>() {
                     if n >= 1 {
                         let num_tracks = self.tracks.len();
-                        let num_patterns = self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
+                        let num_patterns =
+                            self.state.pattern.num_patterns.load(Ordering::Relaxed) as usize;
                         let idx = n - 1;
                         if idx < num_patterns {
                             if let Some(sample_ids) = self.state.switch_pattern(
@@ -1712,7 +1834,11 @@ impl App {
             self.state.pattern.step_data[track].set(local_step, StepParam::Transpose, first_note);
             // Set velocity and duration p-locks
             self.state.pattern.step_data[track].set(local_step, StepParam::Velocity, 1.0);
-            self.state.pattern.step_data[track].set(local_step, StepParam::Duration, duration_steps as f32);
+            self.state.pattern.step_data[track].set(
+                local_step,
+                StepParam::Duration,
+                duration_steps as f32,
+            );
         }
     }
 }

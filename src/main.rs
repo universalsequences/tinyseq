@@ -10,6 +10,7 @@ mod filter;
 mod gatepitch;
 #[allow(dead_code)]
 mod lisp_effect;
+mod project;
 #[allow(dead_code)]
 mod reverb;
 mod sampler;

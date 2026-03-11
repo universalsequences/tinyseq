@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::atomic::Ordering;
 
-use crate::effects::{EffectDescriptor, EffectSlotState, ParamKind, SyncDivision, BUILTIN_SLOT_COUNT};
+use crate::effects::{
+    EffectDescriptor, EffectSlotState, ParamKind, SyncDivision, BUILTIN_SLOT_COUNT,
+};
 use crate::reverb;
 
 use super::{App, EffectTab, InputMode, ParamMouseDragTarget};
@@ -24,7 +26,8 @@ impl App {
         }
         let slot_idx = self.selected_effect_slot()?;
         self.state
-            .pattern.effect_chains
+            .pattern
+            .effect_chains
             .get(self.ui.cursor_track)
             .and_then(|chain| chain.get(slot_idx))
     }
@@ -326,7 +329,13 @@ impl App {
         }
     }
 
-    pub(super) fn send_slot_param(&self, track: usize, slot_idx: usize, param_idx: usize, value: f32) {
+    pub(super) fn send_slot_param(
+        &self,
+        track: usize,
+        slot_idx: usize,
+        param_idx: usize,
+        value: f32,
+    ) {
         let chain = &self.state.pattern.effect_chains[track];
         if slot_idx >= chain.len() {
             return;
@@ -387,7 +396,8 @@ impl App {
         let track = self.ui.cursor_track;
         let slot = match self
             .state
-            .pattern.effect_chains
+            .pattern
+            .effect_chains
             .get(track)
             .and_then(|c| c.get(DELAY_SLOT))
         {
@@ -569,7 +579,10 @@ impl App {
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
-            ParamMouseDragTarget::EffectParam { slot_idx, param_idx } => {
+            ParamMouseDragTarget::EffectParam {
+                slot_idx,
+                param_idx,
+            } => {
                 let Some(desc) = self
                     .graph
                     .effect_descriptors
@@ -586,8 +599,9 @@ impl App {
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 let Some(slot) = self
                     .state
-                    .pattern.effect_chains
-            .get(drag.track)
+                    .pattern
+                    .effect_chains
+                    .get(drag.track)
                     .and_then(|c| c.get(slot_idx))
                 else {
                     return;
@@ -597,7 +611,10 @@ impl App {
             }
             ParamMouseDragTarget::ReverbParam { param_idx } => {
                 let sensitivity = 1.0 / 48.0;
-                self.set_reverb_param(param_idx, drag.start_display_value + dx as f32 * sensitivity);
+                self.set_reverb_param(
+                    param_idx,
+                    drag.start_display_value + dx as f32 * sensitivity,
+                );
             }
         }
     }

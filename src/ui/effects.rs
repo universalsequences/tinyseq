@@ -6,9 +6,7 @@ use crate::effects::{EffectDescriptor, BUILTIN_SLOT_COUNT};
 use crate::lisp_effect::{self, MAX_CUSTOM_FX};
 use crate::sequencer::InstrumentType;
 
-use super::{
-    App, CompileTarget, EffectTab, InputMode, PendingCompile, PendingEditor, Region,
-};
+use super::{App, CompileTarget, EffectTab, InputMode, PendingCompile, PendingEditor, Region};
 
 #[derive(Clone, Copy)]
 pub(super) enum OverlayPickerKind {
@@ -25,7 +23,8 @@ impl App {
                 .manifest
                 .clone();
             let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
-            let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+            let lib_ptr: *const lisp_effect::LoadedDGenLib =
+                &self.editor.instrument_libs[lib_index];
             return unsafe {
                 self.graph_controller()
                     .add_custom_track(name, cache_idx, &manifest, &*lib_ptr)
@@ -174,7 +173,8 @@ impl App {
 
         let slot = &self.state.pattern.effect_chains[track][slot_idx];
         slot.node_id.store(node_id as u32, Ordering::Relaxed);
-        slot.num_params.store(params.len() as u32, Ordering::Relaxed);
+        slot.num_params
+            .store(params.len() as u32, Ordering::Relaxed);
         for (i, p) in params.iter().enumerate() {
             slot.defaults.set(i, p.default);
             if i < slot.param_node_indices.len() {
@@ -280,6 +280,31 @@ impl App {
         }
     }
 
+    pub(super) fn load_saved_effect_to_slot_sync(
+        &mut self,
+        track: usize,
+        slot_idx: usize,
+        name: &str,
+    ) -> Result<(), String> {
+        let source = lisp_effect::load_effect_source(name).map_err(|e| e.to_string())?;
+        let result = lisp_effect::compile_and_load(&source, self.graph.sample_rate)?;
+        let (slot_id, pred, succ, existing) = self.resolve_custom_slot_wiring(track, slot_idx);
+        let node_id = unsafe {
+            lisp_effect::add_effect_to_chain_at(
+                self.graph.lg.0,
+                slot_id,
+                &result.manifest,
+                &result.lib,
+                pred,
+                succ,
+                existing,
+            )
+        }?;
+        self.apply_effect_to_slot(track, slot_idx, node_id, name, &result.manifest.params);
+        self.editor.lisp_libs.push(result.lib);
+        Ok(())
+    }
+
     pub(super) fn apply_compiled_instrument(
         &mut self,
         result: lisp_effect::CompileResult,
@@ -323,7 +348,8 @@ impl App {
 
         if let Some(r) = result {
             let is_existing_custom = self.ui.cursor_track < self.graph.track_instrument_types.len()
-                && self.graph.track_instrument_types[self.ui.cursor_track] == InstrumentType::Custom;
+                && self.graph.track_instrument_types[self.ui.cursor_track]
+                    == InstrumentType::Custom;
 
             if is_existing_custom {
                 let track = self.ui.cursor_track;
@@ -344,7 +370,14 @@ impl App {
                         if track < self.graph.track_engine_ids.len() {
                             self.graph.track_engine_ids[track] = Some(cache_idx);
                         }
-                        if let Some(sound) = self.state.pattern.track_sound_state.lock().unwrap().get_mut(track) {
+                        if let Some(sound) = self
+                            .state
+                            .pattern
+                            .track_sound_state
+                            .lock()
+                            .unwrap()
+                            .get_mut(track)
+                        {
                             sound.engine_id = Some(cache_idx);
                         }
                         self.editor.status_message =
@@ -362,7 +395,8 @@ impl App {
                     .manifest
                     .clone();
                 let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
-                let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+                let lib_ptr: *const lisp_effect::LoadedDGenLib =
+                    &self.editor.instrument_libs[lib_index];
                 match unsafe {
                     self.graph_controller()
                         .add_custom_track(&r.name, cache_idx, &manifest, &*lib_ptr)

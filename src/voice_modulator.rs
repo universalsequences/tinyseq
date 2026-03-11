@@ -194,32 +194,251 @@ pub fn param_descriptors() -> Vec<ParamDescriptor> {
     let sync_div_labels = sync_labels();
     let shape_labels = shape_labels();
 
-    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, prefix, rate_default, div_default, retrig_default) in &[
-        (PARAM_LFO1_RATE_HZ, PARAM_LFO1_SYNC, PARAM_LFO1_DIV, PARAM_LFO1_SHAPE, PARAM_LFO1_PW, PARAM_LFO1_RETRIGGER, "mod_lfo1", 5.0, 2.0, 1.0),
-        (PARAM_LFO2_RATE_HZ, PARAM_LFO2_SYNC, PARAM_LFO2_DIV, PARAM_LFO2_SHAPE, PARAM_LFO2_PW, PARAM_LFO2_RETRIGGER, "mod_lfo2", 1.7, 3.0, 0.0),
-        (PARAM_LFO3_RATE_HZ, PARAM_LFO3_SYNC, PARAM_LFO3_DIV, PARAM_LFO3_SHAPE, PARAM_LFO3_PW, PARAM_LFO3_RETRIGGER, "mod_lfo3", 0.37, 4.0, 0.0),
+    for &(
+        rate_idx,
+        sync_idx,
+        div_idx,
+        shape_idx,
+        pw_idx,
+        retrig_idx,
+        prefix,
+        rate_default,
+        div_default,
+        retrig_default,
+    ) in &[
+        (
+            PARAM_LFO1_RATE_HZ,
+            PARAM_LFO1_SYNC,
+            PARAM_LFO1_DIV,
+            PARAM_LFO1_SHAPE,
+            PARAM_LFO1_PW,
+            PARAM_LFO1_RETRIGGER,
+            "mod_lfo1",
+            5.0,
+            2.0,
+            1.0,
+        ),
+        (
+            PARAM_LFO2_RATE_HZ,
+            PARAM_LFO2_SYNC,
+            PARAM_LFO2_DIV,
+            PARAM_LFO2_SHAPE,
+            PARAM_LFO2_PW,
+            PARAM_LFO2_RETRIGGER,
+            "mod_lfo2",
+            1.7,
+            3.0,
+            0.0,
+        ),
+        (
+            PARAM_LFO3_RATE_HZ,
+            PARAM_LFO3_SYNC,
+            PARAM_LFO3_DIV,
+            PARAM_LFO3_SHAPE,
+            PARAM_LFO3_PW,
+            PARAM_LFO3_RETRIGGER,
+            "mod_lfo3",
+            0.37,
+            4.0,
+            0.0,
+        ),
     ] {
-        push_param(&mut out, &format!("{prefix}_rate"), 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
-        push_param(&mut out, &format!("{prefix}_sync"), 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
-        push_param(&mut out, &format!("{prefix}_div"), 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
-        push_param(&mut out, &format!("{prefix}_shape"), 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
-        push_param(&mut out, &format!("{prefix}_pw"), 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
-        push_param(&mut out, &format!("{prefix}_retrigger"), 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+        push_param(
+            &mut out,
+            &format!("{prefix}_rate"),
+            0.01,
+            20.0,
+            rate_default,
+            ParamKind::Continuous {
+                unit: Some("Hz".to_string()),
+            },
+            ParamScaling::Exponential,
+            rate_idx,
+        );
+        push_param(
+            &mut out,
+            &format!("{prefix}_sync"),
+            0.0,
+            1.0,
+            0.0,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            sync_idx,
+        );
+        push_param(
+            &mut out,
+            &format!("{prefix}_div"),
+            0.0,
+            (sync_div_labels.len() - 1) as f32,
+            div_default,
+            ParamKind::Enum {
+                labels: sync_div_labels.clone(),
+            },
+            ParamScaling::Linear,
+            div_idx,
+        );
+        push_param(
+            &mut out,
+            &format!("{prefix}_shape"),
+            0.0,
+            (shape_labels.len() - 1) as f32,
+            0.0,
+            ParamKind::Enum {
+                labels: shape_labels.clone(),
+            },
+            ParamScaling::Linear,
+            shape_idx,
+        );
+        push_param(
+            &mut out,
+            &format!("{prefix}_pw"),
+            0.05,
+            0.95,
+            0.5,
+            ParamKind::Continuous { unit: None },
+            ParamScaling::Linear,
+            pw_idx,
+        );
+        push_param(
+            &mut out,
+            &format!("{prefix}_retrigger"),
+            0.0,
+            1.0,
+            retrig_default,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            retrig_idx,
+        );
     }
 
-    push_param(&mut out, "mod_env_attack", 1.0, 2000.0, 6.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_ATTACK_MS);
-    push_param(&mut out, "mod_env_decay", 5.0, 4000.0, 180.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_DECAY_MS);
-    push_param(&mut out, "mod_env_sustain", 0.0, 1.0, 0.55, ParamKind::Continuous { unit: Some("%".to_string()) }, ParamScaling::Linear, PARAM_ENV_SUSTAIN);
-    push_param(&mut out, "mod_env_release", 5.0, 4000.0, 240.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_RELEASE_MS);
+    push_param(
+        &mut out,
+        "mod_env_attack",
+        1.0,
+        2000.0,
+        6.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_ATTACK_MS,
+    );
+    push_param(
+        &mut out,
+        "mod_env_decay",
+        5.0,
+        4000.0,
+        180.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_DECAY_MS,
+    );
+    push_param(
+        &mut out,
+        "mod_env_sustain",
+        0.0,
+        1.0,
+        0.55,
+        ParamKind::Continuous {
+            unit: Some("%".to_string()),
+        },
+        ParamScaling::Linear,
+        PARAM_ENV_SUSTAIN,
+    );
+    push_param(
+        &mut out,
+        "mod_env_release",
+        5.0,
+        4000.0,
+        240.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_RELEASE_MS,
+    );
 
-    push_param(&mut out, "mod_rand_rate", 0.05, 20.0, 3.0, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_RAND_RATE_HZ);
-    push_param(&mut out, "mod_rand_sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_RAND_SYNC);
-    push_param(&mut out, "mod_rand_div", 0.0, (sync_div_labels.len() - 1) as f32, 4.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_RAND_DIV);
-    push_param(&mut out, "mod_rand_slew", 0.0, 0.999, 0.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, PARAM_RAND_SLEW);
+    push_param(
+        &mut out,
+        "mod_rand_rate",
+        0.05,
+        20.0,
+        3.0,
+        ParamKind::Continuous {
+            unit: Some("Hz".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_RAND_RATE_HZ,
+    );
+    push_param(
+        &mut out,
+        "mod_rand_sync",
+        0.0,
+        1.0,
+        0.0,
+        ParamKind::Boolean,
+        ParamScaling::Linear,
+        PARAM_RAND_SYNC,
+    );
+    push_param(
+        &mut out,
+        "mod_rand_div",
+        0.0,
+        (sync_div_labels.len() - 1) as f32,
+        4.0,
+        ParamKind::Enum {
+            labels: sync_div_labels.clone(),
+        },
+        ParamScaling::Linear,
+        PARAM_RAND_DIV,
+    );
+    push_param(
+        &mut out,
+        "mod_rand_slew",
+        0.0,
+        0.999,
+        0.0,
+        ParamKind::Continuous { unit: None },
+        ParamScaling::Linear,
+        PARAM_RAND_SLEW,
+    );
 
-    push_param(&mut out, "mod_drift_rate", 0.00001, 0.01, 0.00035, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_DRIFT_RATE);
-    push_param(&mut out, "mod_drift_sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_DRIFT_SYNC);
-    push_param(&mut out, "mod_drift_div", 0.0, (sync_div_labels.len() - 1) as f32, 5.0, ParamKind::Enum { labels: sync_div_labels }, ParamScaling::Linear, PARAM_DRIFT_DIV);
+    push_param(
+        &mut out,
+        "mod_drift_rate",
+        0.00001,
+        0.01,
+        0.00035,
+        ParamKind::Continuous {
+            unit: Some("Hz".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_DRIFT_RATE,
+    );
+    push_param(
+        &mut out,
+        "mod_drift_sync",
+        0.0,
+        1.0,
+        0.0,
+        ParamKind::Boolean,
+        ParamScaling::Linear,
+        PARAM_DRIFT_SYNC,
+    );
+    push_param(
+        &mut out,
+        "mod_drift_div",
+        0.0,
+        (sync_div_labels.len() - 1) as f32,
+        5.0,
+        ParamKind::Enum {
+            labels: sync_div_labels,
+        },
+        ParamScaling::Linear,
+        PARAM_DRIFT_DIV,
+    );
 
     for (name, idx) in [
         ("mod1_depth", PARAM_MOD1_DEPTH),
@@ -229,7 +448,16 @@ pub fn param_descriptors() -> Vec<ParamDescriptor> {
         ("mod5_depth", PARAM_MOD5_DEPTH),
         ("mod6_depth", PARAM_MOD6_DEPTH),
     ] {
-        push_param(&mut out, name, 0.0, 1.0, 1.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, idx);
+        push_param(
+            &mut out,
+            name,
+            0.0,
+            1.0,
+            1.0,
+            ParamKind::Continuous { unit: None },
+            ParamScaling::Linear,
+            idx,
+        );
     }
 
     out
@@ -240,41 +468,324 @@ pub fn ui_param_descriptors() -> Vec<ParamDescriptor> {
     let sync_div_labels = sync_labels();
     let shape_labels = shape_labels();
 
-    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, rate_default, div_default, retrig_default) in &[
-        (PARAM_LFO1_RATE_HZ, PARAM_LFO1_SYNC, PARAM_LFO1_DIV, PARAM_LFO1_SHAPE, PARAM_LFO1_PW, PARAM_LFO1_RETRIGGER, 5.0, 2.0, 1.0),
-    ] {
-        push_param(&mut out, "rate", 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
-        push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
-        push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
-        push_param(&mut out, "shape", 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
-        push_param(&mut out, "pulse width", 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
-        push_param(&mut out, "retrigger", 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+    for &(
+        rate_idx,
+        sync_idx,
+        div_idx,
+        shape_idx,
+        pw_idx,
+        retrig_idx,
+        rate_default,
+        div_default,
+        retrig_default,
+    ) in &[(
+        PARAM_LFO1_RATE_HZ,
+        PARAM_LFO1_SYNC,
+        PARAM_LFO1_DIV,
+        PARAM_LFO1_SHAPE,
+        PARAM_LFO1_PW,
+        PARAM_LFO1_RETRIGGER,
+        5.0,
+        2.0,
+        1.0,
+    )] {
+        push_param(
+            &mut out,
+            "rate",
+            0.01,
+            20.0,
+            rate_default,
+            ParamKind::Continuous {
+                unit: Some("Hz".to_string()),
+            },
+            ParamScaling::Exponential,
+            rate_idx,
+        );
+        push_param(
+            &mut out,
+            "sync",
+            0.0,
+            1.0,
+            0.0,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            sync_idx,
+        );
+        push_param(
+            &mut out,
+            "division",
+            0.0,
+            (sync_div_labels.len() - 1) as f32,
+            div_default,
+            ParamKind::Enum {
+                labels: sync_div_labels.clone(),
+            },
+            ParamScaling::Linear,
+            div_idx,
+        );
+        push_param(
+            &mut out,
+            "shape",
+            0.0,
+            (shape_labels.len() - 1) as f32,
+            0.0,
+            ParamKind::Enum {
+                labels: shape_labels.clone(),
+            },
+            ParamScaling::Linear,
+            shape_idx,
+        );
+        push_param(
+            &mut out,
+            "pulse width",
+            0.05,
+            0.95,
+            0.5,
+            ParamKind::Continuous { unit: None },
+            ParamScaling::Linear,
+            pw_idx,
+        );
+        push_param(
+            &mut out,
+            "retrigger",
+            0.0,
+            1.0,
+            retrig_default,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            retrig_idx,
+        );
     }
 
-    push_param(&mut out, "attack", 1.0, 2000.0, 6.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_ATTACK_MS);
-    push_param(&mut out, "decay", 5.0, 4000.0, 180.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_DECAY_MS);
-    push_param(&mut out, "sustain", 0.0, 1.0, 0.55, ParamKind::Continuous { unit: Some("%".to_string()) }, ParamScaling::Linear, PARAM_ENV_SUSTAIN);
-    push_param(&mut out, "release", 5.0, 4000.0, 240.0, ParamKind::Continuous { unit: Some("ms".to_string()) }, ParamScaling::Exponential, PARAM_ENV_RELEASE_MS);
+    push_param(
+        &mut out,
+        "attack",
+        1.0,
+        2000.0,
+        6.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_ATTACK_MS,
+    );
+    push_param(
+        &mut out,
+        "decay",
+        5.0,
+        4000.0,
+        180.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_DECAY_MS,
+    );
+    push_param(
+        &mut out,
+        "sustain",
+        0.0,
+        1.0,
+        0.55,
+        ParamKind::Continuous {
+            unit: Some("%".to_string()),
+        },
+        ParamScaling::Linear,
+        PARAM_ENV_SUSTAIN,
+    );
+    push_param(
+        &mut out,
+        "release",
+        5.0,
+        4000.0,
+        240.0,
+        ParamKind::Continuous {
+            unit: Some("ms".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_ENV_RELEASE_MS,
+    );
 
-    push_param(&mut out, "rate", 0.05, 20.0, 3.0, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_RAND_RATE_HZ);
-    push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_RAND_SYNC);
-    push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, 4.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_RAND_DIV);
-    push_param(&mut out, "slew", 0.0, 0.999, 0.0, ParamKind::Continuous { unit: None }, ParamScaling::Linear, PARAM_RAND_SLEW);
+    push_param(
+        &mut out,
+        "rate",
+        0.05,
+        20.0,
+        3.0,
+        ParamKind::Continuous {
+            unit: Some("Hz".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_RAND_RATE_HZ,
+    );
+    push_param(
+        &mut out,
+        "sync",
+        0.0,
+        1.0,
+        0.0,
+        ParamKind::Boolean,
+        ParamScaling::Linear,
+        PARAM_RAND_SYNC,
+    );
+    push_param(
+        &mut out,
+        "division",
+        0.0,
+        (sync_div_labels.len() - 1) as f32,
+        4.0,
+        ParamKind::Enum {
+            labels: sync_div_labels.clone(),
+        },
+        ParamScaling::Linear,
+        PARAM_RAND_DIV,
+    );
+    push_param(
+        &mut out,
+        "slew",
+        0.0,
+        0.999,
+        0.0,
+        ParamKind::Continuous { unit: None },
+        ParamScaling::Linear,
+        PARAM_RAND_SLEW,
+    );
 
-    push_param(&mut out, "rate", 0.00001, 0.01, 0.00035, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, PARAM_DRIFT_RATE);
-    push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, PARAM_DRIFT_SYNC);
-    push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, 5.0, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, PARAM_DRIFT_DIV);
+    push_param(
+        &mut out,
+        "rate",
+        0.00001,
+        0.01,
+        0.00035,
+        ParamKind::Continuous {
+            unit: Some("Hz".to_string()),
+        },
+        ParamScaling::Exponential,
+        PARAM_DRIFT_RATE,
+    );
+    push_param(
+        &mut out,
+        "sync",
+        0.0,
+        1.0,
+        0.0,
+        ParamKind::Boolean,
+        ParamScaling::Linear,
+        PARAM_DRIFT_SYNC,
+    );
+    push_param(
+        &mut out,
+        "division",
+        0.0,
+        (sync_div_labels.len() - 1) as f32,
+        5.0,
+        ParamKind::Enum {
+            labels: sync_div_labels.clone(),
+        },
+        ParamScaling::Linear,
+        PARAM_DRIFT_DIV,
+    );
 
-    for &(rate_idx, sync_idx, div_idx, shape_idx, pw_idx, retrig_idx, rate_default, div_default, retrig_default) in &[
-        (PARAM_LFO2_RATE_HZ, PARAM_LFO2_SYNC, PARAM_LFO2_DIV, PARAM_LFO2_SHAPE, PARAM_LFO2_PW, PARAM_LFO2_RETRIGGER, 1.7, 3.0, 0.0),
-        (PARAM_LFO3_RATE_HZ, PARAM_LFO3_SYNC, PARAM_LFO3_DIV, PARAM_LFO3_SHAPE, PARAM_LFO3_PW, PARAM_LFO3_RETRIGGER, 0.37, 4.0, 0.0),
+    for &(
+        rate_idx,
+        sync_idx,
+        div_idx,
+        shape_idx,
+        pw_idx,
+        retrig_idx,
+        rate_default,
+        div_default,
+        retrig_default,
+    ) in &[
+        (
+            PARAM_LFO2_RATE_HZ,
+            PARAM_LFO2_SYNC,
+            PARAM_LFO2_DIV,
+            PARAM_LFO2_SHAPE,
+            PARAM_LFO2_PW,
+            PARAM_LFO2_RETRIGGER,
+            1.7,
+            3.0,
+            0.0,
+        ),
+        (
+            PARAM_LFO3_RATE_HZ,
+            PARAM_LFO3_SYNC,
+            PARAM_LFO3_DIV,
+            PARAM_LFO3_SHAPE,
+            PARAM_LFO3_PW,
+            PARAM_LFO3_RETRIGGER,
+            0.37,
+            4.0,
+            0.0,
+        ),
     ] {
-        push_param(&mut out, "rate", 0.01, 20.0, rate_default, ParamKind::Continuous { unit: Some("Hz".to_string()) }, ParamScaling::Exponential, rate_idx);
-        push_param(&mut out, "sync", 0.0, 1.0, 0.0, ParamKind::Boolean, ParamScaling::Linear, sync_idx);
-        push_param(&mut out, "division", 0.0, (sync_div_labels.len() - 1) as f32, div_default, ParamKind::Enum { labels: sync_div_labels.clone() }, ParamScaling::Linear, div_idx);
-        push_param(&mut out, "shape", 0.0, (shape_labels.len() - 1) as f32, 0.0, ParamKind::Enum { labels: shape_labels.clone() }, ParamScaling::Linear, shape_idx);
-        push_param(&mut out, "pulse width", 0.05, 0.95, 0.5, ParamKind::Continuous { unit: None }, ParamScaling::Linear, pw_idx);
-        push_param(&mut out, "retrigger", 0.0, 1.0, retrig_default, ParamKind::Boolean, ParamScaling::Linear, retrig_idx);
+        push_param(
+            &mut out,
+            "rate",
+            0.01,
+            20.0,
+            rate_default,
+            ParamKind::Continuous {
+                unit: Some("Hz".to_string()),
+            },
+            ParamScaling::Exponential,
+            rate_idx,
+        );
+        push_param(
+            &mut out,
+            "sync",
+            0.0,
+            1.0,
+            0.0,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            sync_idx,
+        );
+        push_param(
+            &mut out,
+            "division",
+            0.0,
+            (sync_div_labels.len() - 1) as f32,
+            div_default,
+            ParamKind::Enum {
+                labels: sync_div_labels.clone(),
+            },
+            ParamScaling::Linear,
+            div_idx,
+        );
+        push_param(
+            &mut out,
+            "shape",
+            0.0,
+            (shape_labels.len() - 1) as f32,
+            0.0,
+            ParamKind::Enum {
+                labels: shape_labels.clone(),
+            },
+            ParamScaling::Linear,
+            shape_idx,
+        );
+        push_param(
+            &mut out,
+            "pulse width",
+            0.05,
+            0.95,
+            0.5,
+            ParamKind::Continuous { unit: None },
+            ParamScaling::Linear,
+            pw_idx,
+        );
+        push_param(
+            &mut out,
+            "retrigger",
+            0.0,
+            1.0,
+            retrig_default,
+            ParamKind::Boolean,
+            ParamScaling::Linear,
+            retrig_idx,
+        );
     }
 
     out
@@ -346,11 +857,31 @@ unsafe extern "C" fn voice_modulator_process(
         last_reset_counter = reset_counter;
     }
 
-    let lfo1_rate = if *s.add(PARAM_LFO1_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO1_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO1_RATE_HZ)).clamp(0.01, 20.0) };
-    let lfo2_rate = if *s.add(PARAM_LFO2_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO2_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO2_RATE_HZ)).clamp(0.01, 20.0) };
-    let lfo3_rate = if *s.add(PARAM_LFO3_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_LFO3_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_LFO3_RATE_HZ)).clamp(0.01, 20.0) };
-    let rand_rate = if *s.add(PARAM_RAND_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_RAND_DIV)).round() as usize, bpm) } else { (*s.add(PARAM_RAND_RATE_HZ)).clamp(0.01, 20.0) };
-    let drift_rate = if *s.add(PARAM_DRIFT_SYNC) > 0.5 { synced_rate_hz((*s.add(PARAM_DRIFT_DIV)).round() as usize, bpm) * 0.2 } else { (*s.add(PARAM_DRIFT_RATE)).clamp(0.00001, 0.01) * sample_rate };
+    let lfo1_rate = if *s.add(PARAM_LFO1_SYNC) > 0.5 {
+        synced_rate_hz((*s.add(PARAM_LFO1_DIV)).round() as usize, bpm)
+    } else {
+        (*s.add(PARAM_LFO1_RATE_HZ)).clamp(0.01, 20.0)
+    };
+    let lfo2_rate = if *s.add(PARAM_LFO2_SYNC) > 0.5 {
+        synced_rate_hz((*s.add(PARAM_LFO2_DIV)).round() as usize, bpm)
+    } else {
+        (*s.add(PARAM_LFO2_RATE_HZ)).clamp(0.01, 20.0)
+    };
+    let lfo3_rate = if *s.add(PARAM_LFO3_SYNC) > 0.5 {
+        synced_rate_hz((*s.add(PARAM_LFO3_DIV)).round() as usize, bpm)
+    } else {
+        (*s.add(PARAM_LFO3_RATE_HZ)).clamp(0.01, 20.0)
+    };
+    let rand_rate = if *s.add(PARAM_RAND_SYNC) > 0.5 {
+        synced_rate_hz((*s.add(PARAM_RAND_DIV)).round() as usize, bpm)
+    } else {
+        (*s.add(PARAM_RAND_RATE_HZ)).clamp(0.01, 20.0)
+    };
+    let drift_rate = if *s.add(PARAM_DRIFT_SYNC) > 0.5 {
+        synced_rate_hz((*s.add(PARAM_DRIFT_DIV)).round() as usize, bpm) * 0.2
+    } else {
+        (*s.add(PARAM_DRIFT_RATE)).clamp(0.00001, 0.01) * sample_rate
+    };
 
     let lfo1_inc = lfo1_rate / sample_rate;
     let lfo2_inc = lfo2_rate / sample_rate;
@@ -360,7 +891,8 @@ unsafe extern "C" fn voice_modulator_process(
     let env_attack = 1.0 / ((*s.add(PARAM_ENV_ATTACK_MS)).clamp(1.0, 2000.0) * 0.001 * sample_rate);
     let env_decay = 1.0 / ((*s.add(PARAM_ENV_DECAY_MS)).clamp(5.0, 4000.0) * 0.001 * sample_rate);
     let env_sustain = (*s.add(PARAM_ENV_SUSTAIN)).clamp(0.0, 1.0);
-    let env_release = 1.0 / ((*s.add(PARAM_ENV_RELEASE_MS)).clamp(5.0, 4000.0) * 0.001 * sample_rate);
+    let env_release =
+        1.0 / ((*s.add(PARAM_ENV_RELEASE_MS)).clamp(5.0, 4000.0) * 0.001 * sample_rate);
     let rand_slew = (*s.add(PARAM_RAND_SLEW)).clamp(0.0, 0.999);
 
     let lfo1_shape = (*s.add(PARAM_LFO1_SHAPE)).round() as usize;
@@ -447,15 +979,19 @@ unsafe extern "C" fn voice_modulator_process(
         }
         env2 = env2.clamp(0.0, 1.0);
 
-        drift += (next_rand(&mut rng_state) * 0.08 - drift) * (drift_rate / sample_rate).clamp(0.0, 1.0);
+        drift +=
+            (next_rand(&mut rng_state) * 0.08 - drift) * (drift_rate / sample_rate).clamp(0.0, 1.0);
         drift = drift.clamp(-1.0, 1.0);
 
-        *out_mod1.add(i) = (shape_value(lfo1_shape, lfo1_phase, lfo1_pw) * mod1_depth).clamp(-1.0, 1.0);
+        *out_mod1.add(i) =
+            (shape_value(lfo1_shape, lfo1_phase, lfo1_pw) * mod1_depth).clamp(-1.0, 1.0);
         *out_mod2.add(i) = ((env2 * 2.0 - 1.0) * mod2_depth).clamp(-1.0, 1.0);
         *out_mod3.add(i) = (rand_smooth * mod3_depth).clamp(-1.0, 1.0);
         *out_mod4.add(i) = ((drift * (0.4 + velocity * 0.6)) * mod4_depth).clamp(-1.0, 1.0);
-        *out_mod5.add(i) = (shape_value(lfo2_shape, lfo2_phase, lfo2_pw) * mod5_depth).clamp(-1.0, 1.0);
-        *out_mod6.add(i) = (shape_value(lfo3_shape, lfo3_phase, lfo3_pw) * mod6_depth).clamp(-1.0, 1.0);
+        *out_mod5.add(i) =
+            (shape_value(lfo2_shape, lfo2_phase, lfo2_pw) * mod5_depth).clamp(-1.0, 1.0);
+        *out_mod6.add(i) =
+            (shape_value(lfo3_shape, lfo3_phase, lfo3_pw) * mod6_depth).clamp(-1.0, 1.0);
 
         prev_gate = gate;
     }

@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::voice::MAX_VOICES;
 
 pub const MAX_TRACKS: usize = 64;
-pub const MAX_STEPS: usize = 64;
+pub const MAX_STEPS: usize = 256;
 pub const STEPS_PER_PAGE: usize = 16;
 pub const NUM_PARAMS: usize = 8;
 pub const DEFAULT_BPM: u32 = 120;
+pub const TRACK_PATTERN_WORDS: usize = MAX_STEPS / 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InstrumentType {
@@ -360,32 +361,56 @@ impl StepData {
 }
 
 pub struct TrackPattern {
-    bits: AtomicU64,
+    bits: [AtomicU64; TRACK_PATTERN_WORDS],
 }
 
 impl TrackPattern {
     pub fn new() -> Self {
         Self {
-            bits: AtomicU64::new(0),
+            bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     pub fn toggle_step(&self, step: usize) {
         assert!(step < MAX_STEPS);
-        self.bits.fetch_xor(1 << step, Ordering::Relaxed);
+        let word = step / 64;
+        let bit = step % 64;
+        self.bits[word].fetch_xor(1u64 << bit, Ordering::Relaxed);
     }
 
     pub fn is_active(&self, step: usize) -> bool {
         assert!(step < MAX_STEPS);
-        (self.bits.load(Ordering::Relaxed) >> step) & 1 == 1
+        let word = step / 64;
+        let bit = step % 64;
+        (self.bits[word].load(Ordering::Relaxed) >> bit) & 1 == 1
     }
 
-    pub fn load_bits(&self) -> u64 {
-        self.bits.load(Ordering::Relaxed)
+    pub fn load_bits(&self) -> [u64; TRACK_PATTERN_WORDS] {
+        std::array::from_fn(|idx| self.bits[idx].load(Ordering::Relaxed))
     }
 
-    pub fn store_bits(&self, bits: u64) {
-        self.bits.store(bits, Ordering::Relaxed);
+    pub fn store_bits(&self, bits: [u64; TRACK_PATTERN_WORDS]) {
+        for (idx, word) in bits.into_iter().enumerate() {
+            self.bits[idx].store(word, Ordering::Relaxed);
+        }
+    }
+
+    pub fn clear_step(&self, step: usize) {
+        assert!(step < MAX_STEPS);
+        let word = step / 64;
+        let bit = step % 64;
+        self.bits[word].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+    }
+
+    pub fn set_step_active(&self, step: usize, active: bool) {
+        assert!(step < MAX_STEPS);
+        let word = step / 64;
+        let bit = step % 64;
+        if active {
+            self.bits[word].fetch_or(1u64 << bit, Ordering::Relaxed);
+        } else {
+            self.bits[word].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+        }
     }
 }
 
@@ -414,22 +439,59 @@ impl TrackParams {
         }
     }
 
-    pub fn get_attack_ms(&self) -> f32 { f32::from_bits(self.attack_ms.load(Ordering::Relaxed)) }
-    pub fn set_attack_ms(&self, val: f32) { self.attack_ms.store(val.clamp(0.0, 500.0).to_bits(), Ordering::Relaxed); }
-    pub fn get_release_ms(&self) -> f32 { f32::from_bits(self.release_ms.load(Ordering::Relaxed)) }
-    pub fn set_release_ms(&self, val: f32) { self.release_ms.store(val.clamp(0.0, 2000.0).to_bits(), Ordering::Relaxed); }
-    pub fn get_swing(&self) -> f32 { f32::from_bits(self.swing.load(Ordering::Relaxed)) }
-    pub fn set_swing(&self, val: f32) { self.swing.store(val.clamp(50.0, 75.0).to_bits(), Ordering::Relaxed); }
-    pub fn is_gate_on(&self) -> bool { self.gate.load(Ordering::Relaxed) }
-    pub fn toggle_gate(&self) { self.gate.fetch_xor(true, Ordering::Relaxed); }
-    pub fn get_num_steps(&self) -> usize { self.num_steps.load(Ordering::Relaxed) as usize }
-    pub fn set_num_steps(&self, val: usize) { self.num_steps.store(val.clamp(1, MAX_STEPS) as u32, Ordering::Relaxed); }
-    pub fn get_send(&self) -> f32 { f32::from_bits(self.send.load(Ordering::Relaxed)) }
-    pub fn set_send(&self, val: f32) { self.send.store(val.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed); }
-    pub fn is_polyphonic(&self) -> bool { self.polyphonic.load(Ordering::Relaxed) }
-    pub fn toggle_polyphonic(&self) { self.polyphonic.fetch_xor(true, Ordering::Relaxed); }
-    pub fn get_timebase(&self) -> Timebase { Timebase::from_index(self.timebase.load(Ordering::Relaxed)) }
-    pub fn set_timebase(&self, tb: Timebase) { self.timebase.store(tb as u32, Ordering::Relaxed); }
+    pub fn get_attack_ms(&self) -> f32 {
+        f32::from_bits(self.attack_ms.load(Ordering::Relaxed))
+    }
+    pub fn set_attack_ms(&self, val: f32) {
+        self.attack_ms
+            .store(val.clamp(0.0, 500.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn get_release_ms(&self) -> f32 {
+        f32::from_bits(self.release_ms.load(Ordering::Relaxed))
+    }
+    pub fn set_release_ms(&self, val: f32) {
+        self.release_ms
+            .store(val.clamp(0.0, 2000.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn get_swing(&self) -> f32 {
+        f32::from_bits(self.swing.load(Ordering::Relaxed))
+    }
+    pub fn set_swing(&self, val: f32) {
+        self.swing
+            .store(val.clamp(50.0, 75.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn is_gate_on(&self) -> bool {
+        self.gate.load(Ordering::Relaxed)
+    }
+    pub fn toggle_gate(&self) {
+        self.gate.fetch_xor(true, Ordering::Relaxed);
+    }
+    pub fn get_num_steps(&self) -> usize {
+        self.num_steps.load(Ordering::Relaxed) as usize
+    }
+    pub fn set_num_steps(&self, val: usize) {
+        self.num_steps
+            .store(val.clamp(1, MAX_STEPS) as u32, Ordering::Relaxed);
+    }
+    pub fn get_send(&self) -> f32 {
+        f32::from_bits(self.send.load(Ordering::Relaxed))
+    }
+    pub fn set_send(&self, val: f32) {
+        self.send
+            .store(val.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn is_polyphonic(&self) -> bool {
+        self.polyphonic.load(Ordering::Relaxed)
+    }
+    pub fn toggle_polyphonic(&self) {
+        self.polyphonic.fetch_xor(true, Ordering::Relaxed);
+    }
+    pub fn get_timebase(&self) -> Timebase {
+        Timebase::from_index(self.timebase.load(Ordering::Relaxed))
+    }
+    pub fn set_timebase(&self, tb: Timebase) {
+        self.timebase.store(tb as u32, Ordering::Relaxed);
+    }
     pub fn next_timebase(&self) {
         let cur = self.timebase.load(Ordering::Relaxed);
         let next = (cur + 1) % Timebase::COUNT as u32;
@@ -437,7 +499,11 @@ impl TrackParams {
     }
     pub fn prev_timebase(&self) {
         let cur = self.timebase.load(Ordering::Relaxed);
-        let next = if cur == 0 { Timebase::COUNT as u32 - 1 } else { cur - 1 };
+        let next = if cur == 0 {
+            Timebase::COUNT as u32 - 1
+        } else {
+            cur - 1
+        };
         self.timebase.store(next, Ordering::Relaxed);
     }
 }
@@ -489,18 +555,43 @@ impl ChordData {
         }
     }
 
-    pub fn count(&self, step: usize) -> usize { self.counts[step].load(Ordering::Relaxed) as usize }
-    pub fn get(&self, step: usize, n: usize) -> f32 { f32::from_bits(self.transposes[step * MAX_VOICES + n].load(Ordering::Relaxed)) }
+    pub fn count(&self, step: usize) -> usize {
+        self.counts[step].load(Ordering::Relaxed) as usize
+    }
+    pub fn get(&self, step: usize, n: usize) -> f32 {
+        f32::from_bits(self.transposes[step * MAX_VOICES + n].load(Ordering::Relaxed))
+    }
 
     pub fn add_note(&self, step: usize, transpose: f32) -> bool {
         let c = self.counts[step].load(Ordering::Relaxed) as usize;
-        if c >= MAX_VOICES { return false; }
+        if c >= MAX_VOICES {
+            return false;
+        }
         self.transposes[step * MAX_VOICES + c].store(transpose.to_bits(), Ordering::Relaxed);
         self.counts[step].store((c + 1) as u32, Ordering::Relaxed);
         true
     }
 
-    pub fn clear_step(&self, step: usize) { self.counts[step].store(0, Ordering::Relaxed); }
+    pub fn clear_step(&self, step: usize) {
+        self.counts[step].store(0, Ordering::Relaxed);
+    }
+
+    /// Toggle a note: remove if present, add if absent. Returns true if added.
+    pub fn toggle_note(&self, step: usize, transpose: f32) -> bool {
+        let c = self.counts[step].load(Ordering::Relaxed) as usize;
+        let bits = transpose.to_bits();
+        for i in 0..c {
+            if self.transposes[step * MAX_VOICES + i].load(Ordering::Relaxed) == bits {
+                for j in i..(c - 1) {
+                    let next = self.transposes[step * MAX_VOICES + j + 1].load(Ordering::Relaxed);
+                    self.transposes[step * MAX_VOICES + j].store(next, Ordering::Relaxed);
+                }
+                self.counts[step].store((c - 1) as u32, Ordering::Relaxed);
+                return false;
+            }
+        }
+        self.add_note(step, transpose)
+    }
 
     pub fn copy_step(&self, src: usize, dst: usize) {
         let c = self.counts[src].load(Ordering::Relaxed);
@@ -544,7 +635,9 @@ impl ChordSnapshot {
     }
 
     pub fn new_default() -> Self {
-        Self { steps: (0..MAX_STEPS).map(|_| Vec::new()).collect() }
+        Self {
+            steps: (0..MAX_STEPS).map(|_| Vec::new()).collect(),
+        }
     }
 }
 
@@ -567,23 +660,41 @@ pub struct TimebasePLockData {
 
 impl TimebasePLockData {
     pub fn new() -> Self {
-        Self { overrides: std::array::from_fn(|_| AtomicU32::new(u32::MAX)) }
+        Self {
+            overrides: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+        }
     }
 
     pub fn get(&self, step: usize) -> Option<Timebase> {
         let v = self.overrides[step].load(Ordering::Relaxed);
-        if v == u32::MAX { None } else { Some(Timebase::from_index(v)) }
+        if v == u32::MAX {
+            None
+        } else {
+            Some(Timebase::from_index(v))
+        }
     }
 
-    pub fn set(&self, step: usize, tb: Timebase) { self.overrides[step].store(tb as u32, Ordering::Relaxed); }
-    pub fn clear(&self, step: usize) { self.overrides[step].store(u32::MAX, Ordering::Relaxed); }
-    pub fn has_plock(&self, step: usize) -> bool { self.overrides[step].load(Ordering::Relaxed) != u32::MAX }
-    pub fn resolve(&self, step: usize, default: Timebase) -> Timebase { self.get(step).unwrap_or(default) }
+    pub fn set(&self, step: usize, tb: Timebase) {
+        self.overrides[step].store(tb as u32, Ordering::Relaxed);
+    }
+    pub fn clear(&self, step: usize) {
+        self.overrides[step].store(u32::MAX, Ordering::Relaxed);
+    }
+    pub fn has_plock(&self, step: usize) -> bool {
+        self.overrides[step].load(Ordering::Relaxed) != u32::MAX
+    }
+    pub fn resolve(&self, step: usize, default: Timebase) -> Timebase {
+        self.get(step).unwrap_or(default)
+    }
 
     pub fn snapshot(&self) -> [Option<u32>; MAX_STEPS] {
         std::array::from_fn(|i| {
             let v = self.overrides[i].load(Ordering::Relaxed);
-            if v == u32::MAX { None } else { Some(v) }
+            if v == u32::MAX {
+                None
+            } else {
+                Some(v)
+            }
         })
     }
 

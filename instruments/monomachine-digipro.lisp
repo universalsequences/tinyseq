@@ -106,10 +106,10 @@
                    (* (noise) noise_level 0.35)))
 (def crushed (mix dens_layer (crush dens_layer (+ 8 (* alias 248))) alias))
 (def comb_amt_ctl (clip (+ comb_amt (* mod4 0.1) (* (mod_unipolar mod2) 0.1)) 0 1))
-(def comb_time_ctl (clip (+ comb_time (* mod3 14) (* (mod_unipolar mod1) 8)) 1 2205))
+(def comb_time_ctl (clip comb_time 1 2205))
 (def combed (+ crushed (* (delay crushed comb_time_ctl) comb_amt_ctl)))
 (def driven (tanh (* combed drive)))
 (def digi_cutoff
-  (clip (+ (mod cutoff) (* pitch keytrack) (* filt_env filter_env_amt) (* mod3 420) (* (mod_unipolar mod4) 300)) 80 11000))
+  (clip (+ (mod cutoff) (* pitch keytrack) (* filt_env filter_env_amt)) 80 11000))
 (def filtered (biquad driven digi_cutoff resonance 1 0))
 (out (* filtered amp_env velocity gain) 1 @name audio)

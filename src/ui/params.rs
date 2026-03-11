@@ -190,7 +190,8 @@ impl App {
             if let Some(desc) = self.current_instrument_descriptor() {
                 if self.ui.instrument_param_cursor > 0 {
                     let synth_indices = self.synth_param_indices(self.ui.cursor_track);
-                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1) {
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1)
+                    {
                         if let crate::effects::ParamKind::Enum { ref labels } =
                             desc.params[param_idx].kind
                         {
@@ -243,7 +244,8 @@ impl App {
             if let Some(desc) = self.current_instrument_descriptor() {
                 if self.ui.instrument_param_cursor > 0 {
                     let synth_indices = self.synth_param_indices(self.ui.cursor_track);
-                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1) {
+                    if let Some(&param_idx) = synth_indices.get(self.ui.instrument_param_cursor - 1)
+                    {
                         if let crate::effects::ParamKind::Enum { ref labels } =
                             desc.params[param_idx].kind
                         {

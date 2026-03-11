@@ -465,7 +465,8 @@ impl App {
 
     fn current_track_sound_state(&self) -> crate::sequencer::TrackSoundState {
         self.state
-            .pattern.track_sound_state
+            .pattern
+            .track_sound_state
             .lock()
             .unwrap()
             .get(self.ui.cursor_track)
@@ -480,7 +481,14 @@ impl App {
         loaded_preset: Option<String>,
         dirty: bool,
     ) {
-        if let Some(meta) = self.state.pattern.track_sound_state.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self
+            .state
+            .pattern
+            .track_sound_state
+            .lock()
+            .unwrap()
+            .get_mut(track)
+        {
             meta.engine_id = engine_id;
             meta.loaded_preset = loaded_preset;
             meta.dirty = dirty;
@@ -488,7 +496,14 @@ impl App {
     }
 
     pub(super) fn mark_track_sound_dirty(&self, track: usize) {
-        if let Some(meta) = self.state.pattern.track_sound_state.lock().unwrap().get_mut(track) {
+        if let Some(meta) = self
+            .state
+            .pattern
+            .track_sound_state
+            .lock()
+            .unwrap()
+            .get_mut(track)
+        {
             meta.dirty = true;
         }
     }
@@ -703,6 +718,10 @@ impl App {
                             .send_buffer_to_all_voices(track, new_buffer_id);
                         self.graph.track_buffer_ids[track] = new_buffer_id;
                         self.tracks[track] = new_name.clone();
+                        self.register_sample_path(&new_name, path.to_path_buf());
+                        if track < self.sampler_paths.len() {
+                            self.sampler_paths[track] = Some(path.to_path_buf());
+                        }
                         self.editor.status_message =
                             Some((format!("Swapped: {}", new_name), Instant::now()));
                     }

@@ -7,7 +7,10 @@ use crate::sequencer::StepParam;
 
 use super::browser::draw_sidebar;
 use super::cirklon::draw_cirklon_region;
-use super::effects_draw::{draw_compiling_overlay, draw_effect_picker, draw_instrument_picker};
+use super::effects_draw::{
+    draw_compiling_overlay, draw_effect_picker, draw_instrument_picker,
+    draw_project_loading_overlay,
+};
 use super::params::draw_params_region;
 use super::{App, InputMode, Region, SidebarMode};
 
@@ -15,8 +18,14 @@ pub(super) fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
-pub(super) fn param_color(_param: StepParam) -> Color {
-    Color::White
+pub(super) fn param_color(param: StepParam) -> Color {
+    match param {
+        StepParam::Duration => Color::Rgb(80, 150, 230), // steel blue
+        StepParam::Velocity => Color::Rgb(220, 160, 40), // amber
+        StepParam::Transpose => Color::Rgb(160, 100, 220), // violet
+        StepParam::Sync => Color::Rgb(60, 190, 150),     // teal
+        _ => Color::White,
+    }
 }
 
 pub(super) fn is_in_selection(app: &App, step: usize) -> bool {
@@ -79,10 +88,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.ui.input_mode == InputMode::PresetNameEntry {
         draw_preset_name_prompt(frame, app, area);
     }
+    if app.ui.input_mode == InputMode::ProjectNameEntry {
+        draw_project_name_prompt(frame, app, area);
+    }
+    if app.ui.input_mode == InputMode::ProjectPicker {
+        draw_project_picker(frame, app, area);
+    }
 
     // Draw compiling overlay
     if let Some(ref pending) = app.editor.pending_compile {
         draw_compiling_overlay(frame, pending, area);
+    }
+    if let Some(ref pending) = app.editor.pending_project_load {
+        draw_project_loading_overlay(frame, &pending.name, pending.tick, area);
     }
 }
 
@@ -137,7 +155,8 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
         let tp = &app.state.pattern.track_params[track];
         let default_tb = tp.get_timebase();
         let current_step = app.state.track_step(track);
-        let resolved_tb = app.state.pattern.timebase_plocks[track].resolve(current_step, default_tb);
+        let resolved_tb =
+            app.state.pattern.timebase_plocks[track].resolve(current_step, default_tb);
         spans.push(Span::styled(
             format!("  {:<3}", resolved_tb.label()),
             Style::default().fg(Color::Yellow),
@@ -155,7 +174,12 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("  Oct:{}", app.ui.keyboard_octave / 12),
             Style::default().fg(Color::Cyan),
         ));
-        let thresh = f32::from_bits(app.state.transport.record_quantize_thresh.load(Ordering::Relaxed));
+        let thresh = f32::from_bits(
+            app.state
+                .transport
+                .record_quantize_thresh
+                .load(Ordering::Relaxed),
+        );
         spans.push(Span::styled(
             format!("  Q:{:.0}%", thresh * 100.0),
             Style::default().fg(Color::Magenta),
@@ -442,6 +466,14 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_preset_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    draw_name_prompt(frame, app, area, " Save Preset ");
+}
+
+fn draw_project_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    draw_name_prompt(frame, app, area, " Save Project ");
+}
+
+fn draw_name_prompt(frame: &mut Frame, app: &App, area: Rect, title: &str) {
     let width = 40.min(area.width.saturating_sub(4));
     let height = 3;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -449,7 +481,7 @@ fn draw_preset_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let rect = Rect::new(x, y, width, height);
     frame.render_widget(Clear, rect);
     let block = Block::default()
-        .title(" Save Preset ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::White));
     let inner = block.inner(rect);
@@ -459,4 +491,50 @@ fn draw_preset_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
         inner,
     );
+}
+
+fn draw_project_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let width = 48.min(area.width.saturating_sub(4));
+    let height = 14.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" Open Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 2 {
+        return;
+    }
+
+    let filter = format!("> {}█", app.editor.picker_filter);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().fg(Color::White)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let items = app.filtered_project_items();
+    let max_rows = inner.height.saturating_sub(1) as usize;
+    let start = if app.editor.picker_cursor >= max_rows {
+        app.editor.picker_cursor + 1 - max_rows
+    } else {
+        0
+    };
+    for (row, item_idx) in (start..items.len()).enumerate() {
+        if row >= max_rows {
+            break;
+        }
+        let style = if item_idx == app.editor.picker_cursor {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(format!("  {}", items[item_idx])).style(style),
+            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+        );
+    }
 }

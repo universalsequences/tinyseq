@@ -5,9 +5,9 @@ use crate::effects::{EffectDescriptor, EffectSlotSnapshot, EffectSlotState, MAX_
 use crate::voice::MAX_VOICES;
 
 use super::data::{
-    ChordData, ChordSnapshot, DEFAULT_BPM, InstrumentType, MAX_STEPS, MAX_TRACKS, NUM_PARAMS,
-    StepData, StepParam, Timebase, TimebasePLockData, TrackParams, TrackParamsSnapshot,
-    TrackPattern, TrackSoundState,
+    ChordData, ChordSnapshot, InstrumentType, StepData, StepParam, Timebase, TimebasePLockData,
+    TrackParams, TrackParamsSnapshot, TrackPattern, TrackSoundState, DEFAULT_BPM, MAX_STEPS,
+    MAX_TRACKS, NUM_PARAMS, TRACK_PATTERN_WORDS,
 };
 
 #[derive(Clone)]
@@ -27,7 +27,7 @@ struct StepSnapshot {
 
 #[derive(Clone)]
 pub struct PatternSnapshot {
-    pub track_bits: Vec<u64>,
+    pub track_bits: Vec<[u64; TRACK_PATTERN_WORDS]>,
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<TrackParamsSnapshot>,
     pub effect_slots: Vec<Vec<EffectSlotSnapshot>>,
@@ -91,7 +91,9 @@ impl PatternSnapshot {
                 .map(EffectSlotSnapshot::capture)
                 .collect();
             effect_slots.push(chain);
-            instrument_slots.push(EffectSlotSnapshot::capture(&state.pattern.instrument_slots[t]));
+            instrument_slots.push(EffectSlotSnapshot::capture(
+                &state.pattern.instrument_slots[t],
+            ));
             instrument_base_note_offsets.push(f32::from_bits(
                 state.pattern.instrument_base_note_offsets[t].load(Ordering::Relaxed),
             ));
@@ -104,12 +106,24 @@ impl PatternSnapshot {
             };
             sound_states.push(sound);
 
-            let buf_id = if t < track_buffer_ids.len() { track_buffer_ids[t] } else { -1 };
-            let name = if t < track_names.len() { track_names[t].clone() } else { String::new() };
+            let buf_id = if t < track_buffer_ids.len() {
+                track_buffer_ids[t]
+            } else {
+                -1
+            };
+            let name = if t < track_names.len() {
+                track_names[t].clone()
+            } else {
+                String::new()
+            };
             sample_ids.push((buf_id, name));
             chord_snapshots.push(ChordSnapshot::capture(&state.pattern.chord_data[t]));
             timebase_plock_snapshots.push(state.pattern.timebase_plocks[t].snapshot());
-            inst_types.push(if t < instrument_types.len() { instrument_types[t] } else { InstrumentType::Sampler });
+            inst_types.push(if t < instrument_types.len() {
+                instrument_types[t]
+            } else {
+                InstrumentType::Sampler
+            });
         }
 
         Self {
@@ -214,10 +228,11 @@ impl PatternSnapshot {
     }
 
     fn push_default_track(&mut self, t: usize, slot_descriptors: &[Vec<EffectDescriptor>]) {
-        self.track_bits.push(0u64);
+        self.track_bits.push([0u64; TRACK_PATTERN_WORDS]);
         self.step_data.push(Self::default_step_data());
         self.track_params.push(TrackParamsSnapshot::default());
-        self.effect_slots.push(Self::default_effect_slots(t, slot_descriptors));
+        self.effect_slots
+            .push(Self::default_effect_slots(t, slot_descriptors));
         self.instrument_slots.push(Self::default_instrument_slot());
         self.instrument_base_note_offsets.push(0.0);
         self.track_sound_states.push(TrackSoundState::default());
@@ -412,16 +427,30 @@ impl SequencerState {
         }
     }
 
-    pub fn active_track_count(&self) -> usize { self.transport.num_tracks.load(Ordering::Acquire) as usize }
-    pub fn current_step(&self) -> usize { self.transport.playhead.load(Ordering::Relaxed) as usize }
-    pub fn track_step(&self, track: usize) -> usize { self.transport.track_playheads[track].load(Ordering::Relaxed) as usize }
-    pub fn is_playing(&self) -> bool { self.transport.playing.load(Ordering::Relaxed) }
-    pub fn toggle_play(&self) { self.transport.playing.fetch_xor(true, Ordering::Relaxed); }
+    pub fn active_track_count(&self) -> usize {
+        self.transport.num_tracks.load(Ordering::Acquire) as usize
+    }
+    pub fn current_step(&self) -> usize {
+        self.transport.playhead.load(Ordering::Relaxed) as usize
+    }
+    pub fn track_step(&self, track: usize) -> usize {
+        self.transport.track_playheads[track].load(Ordering::Relaxed) as usize
+    }
+    pub fn is_playing(&self) -> bool {
+        self.transport.playing.load(Ordering::Relaxed)
+    }
+    pub fn toggle_play(&self) {
+        self.transport.playing.fetch_xor(true, Ordering::Relaxed);
+    }
     pub fn schedule_mod_resync(&self) {
         if self.is_playing() {
-            self.transport.pending_mod_resync.store(true, Ordering::Relaxed);
+            self.transport
+                .pending_mod_resync
+                .store(true, Ordering::Relaxed);
         } else {
-            self.transport.mod_reset_counter.fetch_add(1, Ordering::Relaxed);
+            self.transport
+                .mod_reset_counter
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -440,7 +469,9 @@ impl SequencerState {
         }
         bank[cur] = PatternSnapshot::capture(self, num_tracks, buffer_ids, names, instrument_types);
         bank[new_idx].restore(self);
-        self.pattern.current_pattern.store(new_idx as u32, Ordering::Relaxed);
+        self.pattern
+            .current_pattern
+            .store(new_idx as u32, Ordering::Relaxed);
         self.schedule_mod_resync();
         Some(bank[new_idx].sample_ids.clone())
     }
@@ -458,8 +489,12 @@ impl SequencerState {
         let cloned = bank[cur].clone();
         bank.push(cloned);
         let new_idx = bank.len() - 1;
-        self.pattern.current_pattern.store(new_idx as u32, Ordering::Relaxed);
-        self.pattern.num_patterns.store(bank.len() as u32, Ordering::Relaxed);
+        self.pattern
+            .current_pattern
+            .store(new_idx as u32, Ordering::Relaxed);
+        self.pattern
+            .num_patterns
+            .store(bank.len() as u32, Ordering::Relaxed);
         new_idx
     }
 
@@ -479,8 +514,12 @@ impl SequencerState {
         bank.remove(cur);
         let new_idx = cur.min(bank.len() - 1);
         bank[new_idx].restore(self);
-        self.pattern.current_pattern.store(new_idx as u32, Ordering::Relaxed);
-        self.pattern.num_patterns.store(bank.len() as u32, Ordering::Relaxed);
+        self.pattern
+            .current_pattern
+            .store(new_idx as u32, Ordering::Relaxed);
+        self.pattern
+            .num_patterns
+            .store(bank.len() as u32, Ordering::Relaxed);
         self.schedule_mod_resync();
         Some(bank[new_idx].sample_ids.clone())
     }
@@ -531,7 +570,9 @@ impl SequencerState {
             chord,
             timebase: self.pattern.timebase_plocks[track].get(step),
             effect_plocks,
-            instrument_plocks: StepSlotPlocks { params: instrument_plocks },
+            instrument_plocks: StepSlotPlocks {
+                params: instrument_plocks,
+            },
         }
     }
 
@@ -540,9 +581,7 @@ impl SequencerState {
             self.pattern.step_data[track].set(step, param, param.default_value());
         }
 
-        let mut bits = self.pattern.patterns[track].load_bits();
-        bits &= !(1u64 << step);
-        self.pattern.patterns[track].store_bits(bits);
+        self.pattern.patterns[track].clear_step(step);
 
         self.pattern.chord_data[track].clear_step(step);
         self.pattern.timebase_plocks[track].clear(step);
@@ -552,7 +591,9 @@ impl SequencerState {
         }
 
         for param_idx in 0..MAX_SLOT_PARAMS {
-            self.pattern.instrument_slots[track].plocks.clear_param(step, param_idx);
+            self.pattern.instrument_slots[track]
+                .plocks
+                .clear_param(step, param_idx);
         }
     }
 
@@ -561,9 +602,7 @@ impl SequencerState {
             self.pattern.step_data[track].set(step, param, snapshot.params[param.index()]);
         }
 
-        let mut bits = self.pattern.patterns[track].load_bits();
-        if snapshot.active { bits |= 1u64 << step; } else { bits &= !(1u64 << step); }
-        self.pattern.patterns[track].store_bits(bits);
+        self.pattern.patterns[track].set_step_active(step, snapshot.active);
 
         self.pattern.chord_data[track].clear_step(step);
         for &transpose in &snapshot.chord {
@@ -579,7 +618,10 @@ impl SequencerState {
             let saved = snapshot.effect_plocks.get(slot_idx);
             let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
             for param_idx in 0..num_params {
-                let val = saved.and_then(|plocks| plocks.params.get(param_idx)).copied().flatten();
+                let val = saved
+                    .and_then(|plocks| plocks.params.get(param_idx))
+                    .copied()
+                    .flatten();
                 match val {
                     Some(val) => slot.plocks.set(step, param_idx, val),
                     None => slot.plocks.clear_param(step, param_idx),
@@ -590,7 +632,13 @@ impl SequencerState {
         let instrument_slot = &self.pattern.instrument_slots[track];
         let instrument_param_count = instrument_slot.num_params.load(Ordering::Relaxed) as usize;
         for param_idx in 0..instrument_param_count {
-            match snapshot.instrument_plocks.params.get(param_idx).copied().flatten() {
+            match snapshot
+                .instrument_plocks
+                .params
+                .get(param_idx)
+                .copied()
+                .flatten()
+            {
                 Some(val) => instrument_slot.plocks.set(step, param_idx, val),
                 None => instrument_slot.plocks.clear_param(step, param_idx),
             }
@@ -598,13 +646,19 @@ impl SequencerState {
     }
 
     pub fn move_step_range(&self, track: usize, lo: usize, hi: usize, new_lo: usize) {
-        if lo > hi || hi >= MAX_STEPS { return; }
+        if lo > hi || hi >= MAX_STEPS {
+            return;
+        }
 
         let count = hi - lo + 1;
         let new_hi = new_lo + count - 1;
-        if new_lo == lo || new_hi >= MAX_STEPS { return; }
+        if new_lo == lo || new_hi >= MAX_STEPS {
+            return;
+        }
 
-        let snapshots: Vec<_> = (lo..=hi).map(|step| self.capture_step_snapshot(track, step)).collect();
+        let snapshots: Vec<_> = (lo..=hi)
+            .map(|step| self.capture_step_snapshot(track, step))
+            .collect();
 
         for step in lo..=hi {
             if step < new_lo || step > new_hi {
@@ -620,15 +674,15 @@ impl SequencerState {
     pub fn duplicate_track_pattern(&self, track: usize) -> usize {
         let num_steps = self.pattern.track_params[track].get_num_steps();
         let new_len = (num_steps * 2).min(MAX_STEPS);
-        if new_len == num_steps { return num_steps; }
+        if new_len == num_steps {
+            return num_steps;
+        }
 
-        let bits = self.pattern.patterns[track].load_bits();
-        let mut new_bits = bits;
         for step in num_steps..new_len {
             let src = step - num_steps;
-            if (bits >> src) & 1 == 1 { new_bits |= 1u64 << step; } else { new_bits &= !(1u64 << step); }
+            let active = self.pattern.patterns[track].is_active(src);
+            self.pattern.patterns[track].set_step_active(step, active);
         }
-        self.pattern.patterns[track].store_bits(new_bits);
 
         for step in num_steps..new_len {
             let src = step - num_steps;
@@ -671,7 +725,9 @@ impl SequencerState {
     pub fn halve_track_pattern(&self, track: usize) -> usize {
         let num_steps = self.pattern.track_params[track].get_num_steps();
         let new_len = (num_steps / 2).max(1);
-        if new_len == num_steps { return num_steps; }
+        if new_len == num_steps {
+            return num_steps;
+        }
         self.pattern.track_params[track].set_num_steps(new_len);
         new_len
     }
@@ -727,16 +783,34 @@ mod tests {
         assert_eq!(state.pattern.chord_data[0].get(2, 0), 0.0);
         assert_eq!(state.pattern.chord_data[0].get(2, 1), 4.0);
         assert_eq!(state.pattern.chord_data[0].get(2, 2), 7.0);
-        assert_eq!(state.pattern.timebase_plocks[0].get(2), Some(Timebase::Eighth));
-        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(2, 2), Some(440.0));
-        assert_eq!(state.pattern.instrument_slots[0].plocks.get(2, 0), Some(0.75));
+        assert_eq!(
+            state.pattern.timebase_plocks[0].get(2),
+            Some(Timebase::Eighth)
+        );
+        assert_eq!(
+            state.pattern.effect_chains[0][0].plocks.get(2, 2),
+            Some(440.0)
+        );
+        assert_eq!(
+            state.pattern.instrument_slots[0].plocks.get(2, 0),
+            Some(0.75)
+        );
 
         assert!(state.pattern.patterns[0].is_active(3));
         assert_eq!(state.pattern.step_data[0].get(3, StepParam::Velocity), 0.3);
         assert_eq!(state.pattern.chord_data[0].count(3), 1);
         assert_eq!(state.pattern.chord_data[0].get(3, 0), 12.0);
-        assert_eq!(state.pattern.timebase_plocks[0].get(3), Some(Timebase::QuarterTriplet));
-        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(3, 2), Some(880.0));
-        assert_eq!(state.pattern.instrument_slots[0].plocks.get(3, 0), Some(0.25));
+        assert_eq!(
+            state.pattern.timebase_plocks[0].get(3),
+            Some(Timebase::QuarterTriplet)
+        );
+        assert_eq!(
+            state.pattern.effect_chains[0][0].plocks.get(3, 2),
+            Some(880.0)
+        );
+        assert_eq!(
+            state.pattern.instrument_slots[0].plocks.get(3, 0),
+            Some(0.25)
+        );
     }
 }

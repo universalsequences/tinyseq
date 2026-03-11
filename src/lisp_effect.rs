@@ -417,11 +417,7 @@ pub fn parse_manifest(json: &str) -> Result<DGenManifest, String> {
         })
         .unwrap_or_default();
 
-    let n_inputs = inputs
-        .iter()
-        .map(|inp| inp.channel + 1)
-        .max()
-        .unwrap_or(1);
+    let n_inputs = inputs.iter().map(|inp| inp.channel + 1).max().unwrap_or(1);
     let n_outputs = v["outputs"].as_array().map(|a| a.len()).unwrap_or(0).max(1);
 
     let tensor_init_data = v["tensorInitData"]

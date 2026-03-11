@@ -651,7 +651,8 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let sd = &data.state.pattern.step_data[track_idx];
     let tp = &data.state.pattern.track_params[track_idx];
     let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
-    let is_custom = data.state.runtime.instrument_type_flags[track_idx].load(Ordering::Relaxed) == 1;
+    let is_custom =
+        data.state.runtime.instrument_type_flags[track_idx].load(Ordering::Relaxed) == 1;
     let sampler_lid = data.state.runtime.sampler_lids[track_idx].load(Ordering::Acquire);
     if !is_custom && sampler_lid == 0 {
         return;
@@ -671,8 +672,9 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let release_samples = release_ms * data.sample_rate as f32 / 1000.0;
     let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
     let velocity = sd.get(step, StepParam::Velocity);
-    let base_note_offset =
-        f32::from_bits(data.state.pattern.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed));
+    let base_note_offset = f32::from_bits(
+        data.state.pattern.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed),
+    );
 
     // Sync polyphonic setting from track params
     let track_polyphonic = tp.is_polyphonic();
@@ -701,10 +703,11 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                 let lid = allocation.logical_id;
                 let fingerprint =
                     instrument_sound_fingerprint(&data.state, track_idx, engine_id, Some(step));
-                let synth_id =
-                    data.state.runtime.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
-                let modulator_id =
-                    data.state.runtime.engine_modulator_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+                let synth_id = data.state.runtime.engine_synth_node_ids[engine_id][voice_idx]
+                    .load(Ordering::Relaxed);
+                let modulator_id = data.state.runtime.engine_modulator_node_ids[engine_id]
+                    [voice_idx]
+                    .load(Ordering::Relaxed);
                 if lid == 0 || synth_id == 0 || modulator_id == 0 {
                     continue;
                 }
@@ -802,10 +805,10 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
             let lid = allocation.logical_id;
             let fingerprint =
                 instrument_sound_fingerprint(&data.state, track_idx, engine_id, Some(step));
-            let synth_id =
-                data.state.runtime.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
-            let modulator_id =
-                data.state.runtime.engine_modulator_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+            let synth_id = data.state.runtime.engine_synth_node_ids[engine_id][voice_idx]
+                .load(Ordering::Relaxed);
+            let modulator_id = data.state.runtime.engine_modulator_node_ids[engine_id][voice_idx]
+                .load(Ordering::Relaxed);
             if lid == 0 || synth_id == 0 || modulator_id == 0 {
                 return;
             }
@@ -940,10 +943,12 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
 
         if let Some(engine_id) = track_engine_id(&data.state, t) {
             let pool = &mut data.custom_engine_pools[engine_id];
-            let vc = data.state.runtime.engine_voice_counts[engine_id].load(Ordering::Acquire) as usize;
+            let vc =
+                data.state.runtime.engine_voice_counts[engine_id].load(Ordering::Acquire) as usize;
             if pool.num_voices < vc {
                 for v in pool.num_voices..vc.min(MAX_VOICES) {
-                    let lid = data.state.runtime.engine_voice_lids[engine_id][v].load(Ordering::Acquire);
+                    let lid =
+                        data.state.runtime.engine_voice_lids[engine_id][v].load(Ordering::Acquire);
                     if lid != 0 {
                         pool.add_voice(lid);
                     }
@@ -957,7 +962,8 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         if kt.track >= num_tracks {
             continue;
         }
-        let is_custom = data.state.runtime.instrument_type_flags[kt.track].load(Ordering::Relaxed) == 1;
+        let is_custom =
+            data.state.runtime.instrument_type_flags[kt.track].load(Ordering::Relaxed) == 1;
         let track_polyphonic = data.state.pattern.track_params[kt.track].is_polyphonic();
         data.voice_pools[kt.track].polyphonic = track_polyphonic;
         let base_note_offset = f32::from_bits(
@@ -1021,10 +1027,11 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 let voice_lid = allocation.logical_id;
                 let fingerprint =
                     instrument_sound_fingerprint(&data.state, kt.track, engine_id, None);
-                let synth_id =
-                    data.state.runtime.engine_synth_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
-                let modulator_id =
-                    data.state.runtime.engine_modulator_node_ids[engine_id][voice_idx].load(Ordering::Relaxed);
+                let synth_id = data.state.runtime.engine_synth_node_ids[engine_id][voice_idx]
+                    .load(Ordering::Relaxed);
+                let modulator_id = data.state.runtime.engine_modulator_node_ids[engine_id]
+                    [voice_idx]
+                    .load(Ordering::Relaxed);
                 if voice_lid == 0 || synth_id == 0 || modulator_id == 0 {
                     continue;
                 }
@@ -1209,7 +1216,8 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 let transpose = sd.get(cs.step, StepParam::Transpose);
                 let voice = data.voice_pools[track_idx].allocate_voice(transpose);
                 let voice_lid = voice.logical_id;
-                let sampler_lid = data.state.runtime.sampler_lids[track_idx].load(Ordering::Acquire);
+                let sampler_lid =
+                    data.state.runtime.sampler_lids[track_idx].load(Ordering::Acquire);
                 let lid = if voice_lid != 0 {
                     voice_lid
                 } else {
@@ -1270,8 +1278,14 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
             }
         }
     }
-    data.state.transport.peak_l.store(peak_l.to_bits(), Ordering::Relaxed);
-    data.state.transport.peak_r.store(peak_r.to_bits(), Ordering::Relaxed);
+    data.state
+        .transport
+        .peak_l
+        .store(peak_l.to_bits(), Ordering::Relaxed);
+    data.state
+        .transport
+        .peak_r
+        .store(peak_r.to_bits(), Ordering::Relaxed);
 
     if nframes > 0 {
         let elapsed_secs = callback_start.elapsed().as_secs_f32();
@@ -1281,14 +1295,16 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         } else {
             0.0
         };
-        let prev_load_pct = f32::from_bits(data.state.transport.cpu_load_pct.load(Ordering::Relaxed));
+        let prev_load_pct =
+            f32::from_bits(data.state.transport.cpu_load_pct.load(Ordering::Relaxed));
         let smoothed_load_pct = if prev_load_pct <= 0.0 {
             raw_load_pct
         } else {
             prev_load_pct * 0.97 + raw_load_pct * 0.03
         };
         data.state
-            .transport.cpu_load_pct
+            .transport
+            .cpu_load_pct
             .store(smoothed_load_pct.to_bits(), Ordering::Relaxed);
     }
 }
