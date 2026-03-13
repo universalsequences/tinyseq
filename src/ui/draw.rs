@@ -22,6 +22,7 @@ pub(super) fn param_color(param: StepParam) -> Color {
     match param {
         StepParam::Duration => Color::Rgb(80, 150, 230), // steel blue
         StepParam::Velocity => Color::Rgb(220, 160, 40), // amber
+        StepParam::AuxA => Color::Rgb(200, 80, 120),     // rose
         StepParam::Transpose => Color::Rgb(160, 100, 220), // violet
         StepParam::Sync => Color::Rgb(60, 190, 150),     // teal
         _ => Color::White,
@@ -61,19 +62,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // Split middle row horizontally: Cirklon | Sidebar
+    // Split middle row horizontally: Sidebar | Cirklon
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(40),    // Cirklon
             Constraint::Length(30), // Sidebar
+            Constraint::Min(40),    // Cirklon
         ])
         .split(chunks[1]);
 
     app.ui.layout.info_bar = chunks[0];
     draw_global_info(frame, app, chunks[0]);
-    draw_cirklon_region(frame, app, mid_chunks[0]);
-    draw_sidebar(frame, app, mid_chunks[1]);
+    draw_sidebar(frame, app, mid_chunks[0]);
+    draw_cirklon_region(frame, app, mid_chunks[1]);
     draw_params_region(frame, app, chunks[2]);
     draw_help_bar(frame, app, chunks[3]);
     draw_stereo_meter(frame, app, area);
@@ -91,6 +92,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.ui.input_mode == InputMode::ProjectNameEntry {
         draw_project_name_prompt(frame, app, area);
     }
+    if app.ui.input_mode == InputMode::WavExportNameEntry {
+        draw_wav_export_prompt(frame, app, area);
+    }
     if app.ui.input_mode == InputMode::ProjectPicker {
         draw_project_picker(frame, app, area);
     }
@@ -107,6 +111,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     use super::PatternBtn;
     const AUDIO_STATUS_WIDTH: u16 = 31;
+    let chrome_bg = Color::Rgb(48, 48, 54);
+    let chrome_bg_dim = Color::Rgb(34, 34, 38);
+    let chrome_fg = Color::Rgb(235, 235, 240);
+    let muted_fg = Color::Rgb(150, 150, 158);
+    let accent = Color::Rgb(245, 194, 104);
 
     // ── Play button (3 chars) ──
     let play_label = if app.state.is_playing() {
@@ -115,12 +124,9 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
         " \u{23f8} "
     };
     let play_style = if app.state.is_playing() {
-        Style::default().fg(Color::Black).bg(Color::Green).bold()
+        Style::default().fg(Color::Black).bg(accent).bold()
     } else {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(60, 60, 60))
-            .bold()
+        Style::default().fg(muted_fg).bg(chrome_bg).bold()
     };
     let play_rect = Rect::new(area.x, area.y, 3, 1);
     app.ui.layout.info_bar = play_rect; // play button rect
@@ -133,10 +139,7 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     let rec_style = if app.ui.recording {
         Style::default().fg(Color::White).bg(Color::Red).bold()
     } else {
-        Style::default()
-            .fg(Color::DarkGray)
-            .bg(Color::Rgb(40, 40, 40))
-            .bold()
+        Style::default().fg(muted_fg).bg(chrome_bg_dim).bold()
     };
     let rec_rect = Rect::new(area.x + 3, area.y, 5, 1);
     app.ui.layout.rec_button = rec_rect;
@@ -146,8 +149,8 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     let bpm = app.state.transport.bpm.load(Ordering::Relaxed);
 
     let mut spans = vec![Span::styled(
-        format!("  {} BPM", bpm),
-        Style::default().fg(Color::White).bg(Color::DarkGray).bold(),
+        format!(" {:>3} BPM ", bpm),
+        Style::default().fg(chrome_fg).bg(chrome_bg).bold(),
     )];
 
     if !app.tracks.is_empty() {
@@ -158,20 +161,20 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
         let resolved_tb =
             app.state.pattern.timebase_plocks[track].resolve(current_step, default_tb);
         spans.push(Span::styled(
-            format!("  {:<3}", resolved_tb.label()),
-            Style::default().fg(Color::Yellow),
+            format!(" {} ", resolved_tb.label()),
+            Style::default().fg(accent).bold(),
         ));
 
         let sample_name = &app.tracks[app.ui.cursor_track];
         spans.push(Span::styled(
-            format!("  {}", sample_name),
-            Style::default().fg(Color::White),
+            format!(" {} ", sample_name),
+            Style::default().fg(chrome_fg),
         ));
     }
 
     if app.any_track_armed() {
         spans.push(Span::styled(
-            format!("  Oct:{}", app.ui.keyboard_octave / 12),
+            format!(" Oct:{} ", app.ui.keyboard_octave / 12),
             Style::default().fg(Color::Cyan),
         ));
         let thresh = f32::from_bits(
@@ -181,16 +184,16 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
                 .load(Ordering::Relaxed),
         );
         spans.push(Span::styled(
-            format!("  Q:{:.0}%", thresh * 100.0),
-            Style::default().fg(Color::Magenta),
+            format!(" Quant:{:.0}% ", thresh * 100.0),
+            Style::default().fg(Color::Rgb(181, 132, 255)),
         ));
     }
 
     if let Some((ref msg, ref when)) = app.editor.status_message {
         if when.elapsed() < Duration::from_secs(3) {
             spans.push(Span::styled(
-                format!("  {}", msg),
-                Style::default().fg(Color::Yellow),
+                format!(" {}", msg),
+                Style::default().fg(accent),
             ));
         }
     }
@@ -213,21 +216,22 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let page_start = app.ui.pattern_page * 10;
     let page_end = (page_start + 10).min(num_pats);
+    let active_style = Style::default().fg(Color::Black).bg(accent).bold();
+    let inactive_style = Style::default().fg(chrome_fg).bg(chrome_bg);
+    let nav_style = Style::default().fg(muted_fg).bg(chrome_bg_dim);
+    let util_style = Style::default().fg(chrome_fg).bg(chrome_bg_dim);
 
     let mut btn_layout: Vec<(u16, u16, PatternBtn)> = Vec::new();
     let mut x = area.x; // flush left, aligned with play button
 
     // Prev-page indicator
     if page_start > 0 {
-        let span = Span::styled(" \u{25c0} ", Style::default().fg(Color::DarkGray));
+        let span = Span::styled(" \u{25c0} ", nav_style);
         frame.render_widget(Paragraph::new(span), Rect::new(x, row1_y, 3, 1));
         btn_layout.push((x, x + 3, PatternBtn::PrevPage));
         x += 4;
     }
-
     // Pattern number buttons
-    let active_style = Style::default().fg(Color::Black).bg(Color::Yellow).bold();
-    let inactive_style = Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 60));
 
     for i in page_start..page_end {
         let label = format!(" {} ", i + 1); // 1-indexed display
@@ -247,25 +251,23 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Next-page indicator
     if page_end < num_pats {
-        let span = Span::styled(" \u{25b6} ", Style::default().fg(Color::DarkGray));
+        let span = Span::styled(" … ", nav_style);
         frame.render_widget(Paragraph::new(span), Rect::new(x, row1_y, 3, 1));
         btn_layout.push((x, x + 3, PatternBtn::NextPage));
         x += 4;
     }
 
     // Clone button [+]
-    let clone_style = Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 40));
     frame.render_widget(
-        Paragraph::new(Span::styled(" + ", clone_style)),
+        Paragraph::new(Span::styled(" + ", util_style)),
         Rect::new(x, row1_y, 3, 1),
     );
     btn_layout.push((x, x + 3, PatternBtn::Clone));
     x += 4;
 
     // Delete button [-]
-    let delete_style = Style::default().fg(Color::Red).bg(Color::Rgb(40, 40, 40));
     frame.render_widget(
-        Paragraph::new(Span::styled(" - ", delete_style)),
+        Paragraph::new(Span::styled(" - ", util_style)),
         Rect::new(x, row1_y, 3, 1),
     );
     btn_layout.push((x, x + 3, PatternBtn::Delete));
@@ -273,17 +275,19 @@ fn draw_global_info(frame: &mut Frame, app: &mut App, area: Rect) {
     app.ui.pattern_btn_layout = btn_layout;
 }
 
-fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_stereo_meter(frame: &mut Frame, app: &mut App, area: Rect) {
     let meter_width = 20u16;
     let cpu_width = 9u16;
     let gap_width = 1u16;
+    let rec_width = 2u16;
     let meter_height = 2u16;
-    let total_width = meter_width + gap_width + cpu_width;
+    let total_width = meter_width + gap_width + cpu_width + gap_width + rec_width;
     if area.width < total_width + 2 || area.height < meter_height {
         return;
     }
 
-    let cpu_x = area.x + area.width - cpu_width - 1;
+    let rec_x = area.x + area.width - rec_width - 1;
+    let cpu_x = rec_x - gap_width - cpu_width;
     let x = cpu_x - gap_width - meter_width;
     let y = area.y;
 
@@ -362,6 +366,18 @@ fn draw_stereo_meter(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(cpu_value),
         Rect::new(cpu_x, y + 1, cpu_width, 1),
     );
+
+    let rec_color = if app.ui.master_recording {
+        Color::Red
+    } else {
+        Color::Rgb(90, 40, 40)
+    };
+    let rec_rect = Rect::new(rec_x, y, rec_width, meter_height);
+    frame.render_widget(
+        Paragraph::new(Span::styled("●", Style::default().fg(rec_color).bold())),
+        rec_rect,
+    );
+    app.ui.layout.master_rec_button = rec_rect;
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -471,6 +487,10 @@ fn draw_preset_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_project_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
     draw_name_prompt(frame, app, area, " Save Project ");
+}
+
+fn draw_wav_export_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    draw_name_prompt(frame, app, area, " Save Recording ");
 }
 
 fn draw_name_prompt(frame: &mut Frame, app: &App, area: Rect, title: &str) {

@@ -5,3 +5,4 @@ samples/
 audiograph/*.o
 audiograph/tests/test_capacity_growth
 audiograph/tests/test_custom_engine_growth
+recordings/

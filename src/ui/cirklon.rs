@@ -10,6 +10,48 @@ use crate::sequencer::{StepParam, STEPS_PER_PAGE};
 use super::draw::{is_in_selection, param_color, region_border_style};
 use super::{App, InputMode, Region, BAR_HEIGHT, COL_WIDTH};
 
+pub(super) struct TrackListRowLayout {
+    pub name_x: u16,
+    pub name_width: u16,
+    pub volume_x: u16,
+    pub volume_width: u16,
+    pub volume_inner_x: u16,
+    pub volume_inner_width: u16,
+    pub db_x: u16,
+    pub arm_x: u16,
+}
+
+pub(super) fn track_list_row_layout(area: Rect) -> TrackListRowLayout {
+    let arm_width = 2u16;
+    let db_width = 5u16;
+    let volume_inner_width = area.width.saturating_sub(20).clamp(9, 15);
+    let volume_width = volume_inner_width + 2;
+    let reserved = 3 + volume_width + 1 + db_width + 1 + arm_width;
+    let name_width = area.width.saturating_sub(reserved).max(3);
+    let name_x = area.x;
+    let volume_x = name_x + name_width + 1;
+    let db_x = volume_x + volume_width + 1;
+    let arm_x = db_x + db_width + 1;
+    TrackListRowLayout {
+        name_x,
+        name_width,
+        volume_x,
+        volume_width,
+        volume_inner_x: volume_x + 1,
+        volume_inner_width,
+        db_x,
+        arm_x,
+    }
+}
+
+fn gain_db_label(volume: f32) -> String {
+    if volume <= 0.0001 {
+        "-inf".to_string()
+    } else {
+        format!("{:+}dB", (20.0 * volume.log10()).round() as i32)
+    }
+}
+
 // ── App impl: cirklon input ──
 
 impl App {
@@ -47,7 +89,11 @@ impl App {
             }
 
             KeyCode::Left => {
-                if self.ui.selection_anchor.is_some() {
+                if !self.ui.visual_steps.is_empty() {
+                    let mut steps: Vec<usize> = self.ui.visual_steps.iter().copied().collect();
+                    steps.sort();
+                    self.state.rotate_steps(self.ui.cursor_track, &steps, -1);
+                } else if self.ui.selection_anchor.is_some() {
                     self.shift_selection(-1);
                 } else if self.ui.cursor_step > 0 {
                     self.ui.cursor_step -= 1;
@@ -56,7 +102,11 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if self.ui.selection_anchor.is_some() {
+                if !self.ui.visual_steps.is_empty() {
+                    let mut steps: Vec<usize> = self.ui.visual_steps.iter().copied().collect();
+                    steps.sort();
+                    self.state.rotate_steps(self.ui.cursor_track, &steps, 1);
+                } else if self.ui.selection_anchor.is_some() {
                     self.shift_selection(1);
                 } else {
                     self.ui.cursor_step = (self.ui.cursor_step + 1) % ns;
@@ -78,6 +128,7 @@ impl App {
                 } else if !self.tracks.is_empty() {
                     self.ui.cursor_track = self.tracks.len() - 1;
                 }
+                self.ui.track_selection_anchor = None;
                 self.clamp_cursor_to_steps();
                 self.browser.sync_to_track(
                     &self.tracks,
@@ -90,6 +141,7 @@ impl App {
                 if !self.tracks.is_empty() {
                     self.ui.cursor_track = (self.ui.cursor_track + 1) % self.tracks.len();
                 }
+                self.ui.track_selection_anchor = None;
                 self.clamp_cursor_to_steps();
                 self.browser.sync_to_track(
                     &self.tracks,
@@ -111,13 +163,17 @@ impl App {
             KeyCode::Backspace | KeyCode::Delete => {
                 if !self.tracks.is_empty() {
                     let track = self.ui.cursor_track;
-                    for step in self.selected_steps() {
-                        if self.state.pattern.patterns[track].is_active(step) {
-                            self.state.toggle_step_and_clear_plocks(track, step);
+                    if self.has_selection() {
+                        // With selection: clear all selected steps completely (including plocks)
+                        for step in self.selected_steps() {
+                            self.state.clear_step_payload(track, step);
                         }
+                        self.ui.selection_anchor = None;
+                        self.ui.visual_steps.clear();
+                    } else {
+                        // No selection: just deactivate cursor step, no plock clear
+                        self.state.pattern.patterns[track].clear_step(self.ui.cursor_step);
                     }
-                    self.ui.selection_anchor = None;
-                    self.ui.visual_steps.clear();
                 }
             }
 
@@ -241,18 +297,18 @@ pub(super) fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) 
         return;
     }
 
-    // Horizontal split: track list | sequencer content
+    // Horizontal split: sequencer content | track list
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(10), // Track list column
             Constraint::Min(0),     // Sequencer content
+            Constraint::Length(35), // Track list + mixer column
         ])
         .split(inner);
 
-    app.ui.layout.track_list = h_chunks[0];
+    app.ui.layout.track_list = h_chunks[1];
 
-    draw_track_list(frame, app, h_chunks[0]);
+    draw_track_list(frame, app, h_chunks[1]);
 
     // Sequencer content vertical layout
     let seq_chunks = Layout::default()
@@ -266,7 +322,7 @@ pub(super) fn draw_cirklon_region(frame: &mut Frame, app: &mut App, area: Rect) 
             Constraint::Length(1),                 // spacer
             Constraint::Length(3),                 // piano keyboard
         ])
-        .split(h_chunks[1]);
+        .split(h_chunks[0]);
 
     app.ui.layout.param_tabs = seq_chunks[0];
     app.ui.layout.bars = seq_chunks[1];
@@ -296,7 +352,14 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
             break;
         }
         let y = area.y + i as u16;
+        let layout = track_list_row_layout(area);
         let is_selected = i == app.ui.cursor_track;
+        let in_track_selection = if app.has_track_selection() {
+            let (lo, hi) = app.track_selected_range();
+            i >= lo && i <= hi
+        } else {
+            false
+        };
         let sanitized: String = name
             .chars()
             .filter(|c| {
@@ -304,25 +367,41 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect();
         let trimmed = sanitized.trim_start();
-        let truncated: String = trimmed.chars().take(2).collect();
 
-        // Arm indicator: 2-char block for visibility, clickable
+        // Arm indicator: large record dot, closer to a mixer/DAW affordance
         let armed = i < app.graph.record_armed.len() && app.graph.record_armed[i];
-        let arm_sym = if armed {
-            "\u{2588}\u{2588}"
-        } else {
-            "\u{2591}\u{2591}"
-        }; // "██" vs "░░"
+        let arm_sym = if armed { "\u{25cf}" } else { "\u{25cf}" };
         let arm_style = if armed {
-            Style::default().fg(Color::Red)
+            Style::default().fg(Color::Red).bold()
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Rgb(70, 70, 70))
         };
 
-        let label = format!("{} {:<2} ", i + 1, truncated);
+        let prefix = format!("{:>2} ", i + 1);
+        let available_name = layout
+            .name_width
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) as u16)
+            as usize;
+        let truncated: String = trimmed.chars().take(available_name).collect();
+        let label = format!("{prefix}{truncated:<width$}", width = available_name);
+        let tp = &app.state.pattern.track_params[i];
+        let volume = tp.get_volume().clamp(0.0, 1.0);
+        let filled = (volume * layout.volume_inner_width as f32).round() as usize;
+        let filled = filled.min(layout.volume_inner_width as usize);
+        let vol_bar = format!(
+            "[{}{}]",
+            "\u{2501}".repeat(filled),
+            " ".repeat(layout.volume_inner_width as usize - filled)
+        );
+        let db_label = format!("{:>5}", gain_db_label(volume));
 
         let style = if is_selected {
             Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        } else if in_track_selection {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(170, 145, 70))
+                .bold()
         } else {
             // Flash decay: read value, decay by 30 per frame, interpolate gray(90)→white(255)
             let flash = app.state.transport.trigger_flash[i].load(Ordering::Relaxed);
@@ -334,12 +413,42 @@ fn draw_track_list(frame: &mut Frame, app: &App, area: Rect) {
         };
 
         // Write directly to buffer using set_string for proper unicode width handling
+        let clip = |s: &str, max_width: u16| -> String {
+            let mut out = String::new();
+            let mut width = 0u16;
+            for ch in s.chars() {
+                let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if width + ch_w > max_width {
+                    break;
+                }
+                out.push(ch);
+                width += ch_w;
+            }
+            out
+        };
+
         let buf = frame.buffer_mut();
-        let mut x = area.x;
-        buf.set_string(x, y, &label, style);
-        x += UnicodeWidthStr::width(label.as_str()) as u16;
-        buf.set_string(x, y, arm_sym, arm_style);
-        x += UnicodeWidthStr::width(arm_sym) as u16;
+        buf.set_string(area.x, y, " ".repeat(area.width as usize), style);
+        buf.set_string(layout.name_x, y, clip(&label, layout.name_width), style);
+        let vol_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        } else if in_track_selection {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(170, 145, 70))
+                .bold()
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        buf.set_string(
+            layout.volume_x,
+            y,
+            clip(&vol_bar, layout.volume_width),
+            vol_style,
+        );
+        buf.set_string(layout.db_x, y, clip(&db_label, 5), style);
+        buf.set_string(layout.arm_x, y, arm_sym, arm_style);
+        let x = layout.arm_x + UnicodeWidthStr::width(arm_sym) as u16;
         // Fill remaining with spaces in label style
         let remaining = (area.x + area.width).saturating_sub(x) as usize;
         if remaining > 0 {

@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use eseqlisp::Editor as LispEditor;
 use eseqlisp::vm::format_lisp_value;
 
 use super::{App, HookCallback, HookUnit, PendingHookInvocation, SequencerHook};
@@ -29,6 +30,11 @@ impl App {
     pub fn tick_control_hooks(&mut self) {
         self.enqueue_due_hooks();
         self.run_pending_hooks();
+    }
+
+    pub fn tick_control_hooks_with_editor(&mut self, editor: &mut LispEditor) {
+        self.enqueue_due_hooks();
+        self.run_pending_hooks_with_editor(editor);
     }
 
     pub fn register_control_hook(
@@ -131,6 +137,49 @@ impl App {
                 Err(error) => {
                     self.editor.status_message = Some((
                         format!("Hook #{} error: {error}", invocation.hook_id),
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn run_pending_hooks_with_editor(&mut self, editor: &mut LispEditor) {
+        for _ in 0..MAX_HOOKS_PER_TICK {
+            let Some(invocation) = self.editor.pending_hook_invocations.pop_front() else {
+                break;
+            };
+            let local_step = if invocation.track < self.tracks.len() {
+                let num_steps =
+                    self.state.pattern.track_params[invocation.track].get_num_steps().max(1);
+                (invocation.step_16th as usize) % num_steps
+            } else {
+                0
+            };
+
+            let runtime = editor.runtime_mut();
+            let _ = runtime.eval_str(&format!("(__host-set-current-track {})", invocation.track + 1));
+            let _ = runtime.eval_str(&format!("(__host-set-current-step {})", local_step + 1));
+
+            match runtime.eval_str(&invocation.code) {
+                Ok(Some(value)) => {
+                    if let Some(status) = runtime.take_status_message() {
+                        self.editor.status_message = Some((status, Instant::now()));
+                    } else {
+                        self.editor.status_message = Some((
+                            format!("Hook #{} => {}", invocation.hook_id, format_lisp_value(&value)),
+                            Instant::now(),
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    if let Some(status) = runtime.take_status_message() {
+                        self.editor.status_message = Some((status, Instant::now()));
+                    }
+                }
+                Err(error) => {
+                    self.editor.status_message = Some((
+                        format!("Hook #{} error: {error:?}", invocation.hook_id),
                         Instant::now(),
                     ));
                 }

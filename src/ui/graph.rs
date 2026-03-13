@@ -980,6 +980,8 @@ impl GraphController<'_> {
         for snap in bank.iter_mut() {
             snap.extend_to_tracks(idx + 1, &self.app.graph.effect_descriptors);
         }
+        drop(bank);
+        self.app.refresh_effect_sidechain_labels();
 
         self.app
             .state
@@ -1035,6 +1037,7 @@ impl GraphController<'_> {
                 },
                 scaling: crate::effects::ParamScaling::Linear,
                 node_param_idx: (lisp_effect::HEADER_SLOTS + dest.source_cell_id) as u32,
+                host_control: None,
             });
             inst_desc.params.push(crate::effects::ParamDescriptor {
                 name: format!("mod {} amt", dest.name),
@@ -1056,6 +1059,7 @@ impl GraphController<'_> {
                 },
                 scaling: crate::effects::ParamScaling::Linear,
                 node_param_idx: (lisp_effect::HEADER_SLOTS + dest.depth_cell_id) as u32,
+                host_control: None,
             });
         }
         let inst_slot = &self.app.state.pattern.instrument_slots[track];

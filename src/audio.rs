@@ -9,11 +9,14 @@ use std::time::Instant;
 use crate::audiograph::*;
 use crate::delay;
 use crate::gatepitch;
+use crate::recorder::MasterRecorder;
 use crate::sampler::{
     PARAM_ATTACK_SAMPLES, PARAM_GATE_MODE, PARAM_GATE_SAMPLES, PARAM_PLAYHEAD,
     PARAM_RELEASE_SAMPLES, PARAM_SPEED, PARAM_TRANSPOSE, PARAM_TRIGGER, PARAM_VELOCITY,
 };
-use crate::sequencer::{KeyboardTrigger, SequencerClock, SequencerState, StepParam, MAX_TRACKS};
+use crate::sequencer::{
+    KeyboardTrigger, SequencerClock, SequencerState, StepParam, SwingResolution, MAX_TRACKS,
+};
 use crate::voice::{VoicePool, MAX_VOICES};
 
 /// Per-track chop re-trigger state.
@@ -36,8 +39,39 @@ struct SwingPending {
     countdown: f64,
     /// The step that's pending.
     step: usize,
-    /// Whether there's a pending swing trigger.
-    active: bool,
+}
+
+struct SwingTracker {
+    pending: Vec<SwingPending>,
+}
+
+impl SwingTracker {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    fn schedule(&mut self, step: usize, delay_samples: f64) {
+        self.pending.push(SwingPending {
+            countdown: delay_samples,
+            step,
+        });
+    }
+
+    fn process(&mut self, nframes: usize) -> Vec<usize> {
+        let mut expired = Vec::new();
+        self.pending.retain_mut(|pending| {
+            pending.countdown -= nframes as f64;
+            if pending.countdown <= 0.0 {
+                expired.push(pending.step);
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
 }
 
 /// Pending gate-off events for custom instrument voices.
@@ -49,6 +83,22 @@ struct GateOffPending {
 /// Per-track gate-off queue for custom instruments.
 struct GateOffTracker {
     pending: Vec<GateOffPending>,
+}
+
+fn swing_bucket_index(cycle_start_beats: f64, resolution: SwingResolution) -> u64 {
+    const EPS: f64 = 1e-9;
+    ((cycle_start_beats + EPS) / resolution.step_beats()).floor() as u64
+}
+
+fn swing_delay_samples(
+    sample_rate: f64,
+    bpm: f64,
+    swing_pct: f32,
+    resolution: SwingResolution,
+) -> f64 {
+    let samples_per_quarter = sample_rate * 60.0 / bpm;
+    let resolution_samples = resolution.step_beats() * samples_per_quarter;
+    ((swing_pct as f64 / 100.0) - 0.5) * 2.0 * resolution_samples
 }
 
 impl GateOffTracker {
@@ -99,20 +149,33 @@ fn cancel_gate_off_for_lid(gate_off_state: &mut [GateOffTracker], lid: u64) {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ActiveKeyboardNote {
+    source_transpose: f32,
+    logical_id: u64,
+}
+
 struct AudioCallbackData {
     lg: LiveGraphPtr,
     clock: SequencerClock,
     state: Arc<SequencerState>,
     num_channels: usize,
     chop_state: Vec<ChopTracker>,
-    swing_state: Vec<SwingPending>,
+    swing_state: Vec<SwingTracker>,
     gate_off_state: Vec<GateOffTracker>,
     sample_rate: f64,
     last_bpm: u32,
     last_mod_reset_counter: u32,
     voice_pools: Vec<VoicePool>,
     custom_engine_pools: Vec<CustomEnginePool>,
+    active_keyboard_notes: [[Option<ActiveKeyboardNote>; MAX_VOICES]; MAX_TRACKS],
     keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
+    master_recorder: Arc<MasterRecorder>,
+    accumulator_states: [crate::accumulator::AccumulatorRuntimeState; MAX_TRACKS],
+    last_playing: bool,
+    last_pattern: u32,
+    /// Per-track flag set on pattern switch/play-start; each track clears its own flag at step 0.
+    pending_accum_reset: [bool; MAX_TRACKS],
 }
 
 struct CustomVoiceSlot {
@@ -234,20 +297,6 @@ impl CustomEnginePool {
         }
     }
 
-    fn release_voice_by_note(&mut self, track: usize, note: f32) -> Option<u64> {
-        for i in 0..self.num_voices {
-            let voice = &mut self.voices[i];
-            if voice.active
-                && voice.assigned_track == Some(track)
-                && (voice.note - note).abs() < 0.01
-            {
-                voice.active = false;
-                return Some(voice.logical_id);
-            }
-        }
-        None
-    }
-
     fn release_voice_by_logical_id(&mut self, logical_id: u64) {
         for i in 0..self.num_voices {
             if self.voices[i].logical_id == logical_id {
@@ -262,8 +311,8 @@ impl CustomEnginePool {
 unsafe fn send_trigger(
     lg: *mut LiveGraph,
     lid: u64,
-    sd: &crate::sequencer::StepData,
-    step: usize,
+    velocity: f32,
+    speed: f32,
     gate_samples: f32,
     attack_samples: f32,
     release_samples: f32,
@@ -275,7 +324,7 @@ unsafe fn send_trigger(
         ParamMsg {
             idx: PARAM_VELOCITY,
             logical_id: lid,
-            fvalue: sd.get(step, StepParam::Velocity),
+            fvalue: velocity,
         },
     );
     params_push_wrapper(
@@ -283,7 +332,7 @@ unsafe fn send_trigger(
         ParamMsg {
             idx: PARAM_SPEED,
             logical_id: lid,
-            fvalue: sd.get(step, StepParam::Speed),
+            fvalue: speed,
         },
     );
     params_push_wrapper(
@@ -485,6 +534,91 @@ fn custom_pitch_hz(transpose: f32, base_note_offset: f32) -> f32 {
     440.0 * 2f32.powf((transpose + base_note_offset) / 12.0)
 }
 
+fn resolve_live_keyboard_transpose(
+    state: &SequencerState,
+    accumulator_state: crate::accumulator::AccumulatorRuntimeState,
+    track_idx: usize,
+    raw_transpose: f32,
+) -> f32 {
+    let tp = &state.pattern.track_params[track_idx];
+    let accum_idx = tp.get_accumulator_idx();
+    let with_accumulator = match crate::accumulator::ACCUMULATOR_REGISTRY.get(accum_idx) {
+        Some(def) if def.name == "TransposeRamp" => raw_transpose + accumulator_state.value,
+        _ => raw_transpose,
+    };
+    let fts = tp.get_fts_scale();
+    if fts > 0 {
+        crate::scale::quantize_transpose(with_accumulator, fts)
+    } else {
+        with_accumulator
+    }
+}
+
+fn clear_active_keyboard_note_by_lid(
+    active_notes: &mut [[Option<ActiveKeyboardNote>; MAX_VOICES]; MAX_TRACKS],
+    logical_id: u64,
+) {
+    for track_notes in active_notes.iter_mut() {
+        for slot in track_notes.iter_mut() {
+            if slot.is_some_and(|note| note.logical_id == logical_id) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+fn store_active_keyboard_note(
+    active_notes: &mut [[Option<ActiveKeyboardNote>; MAX_VOICES]; MAX_TRACKS],
+    track_idx: usize,
+    source_transpose: f32,
+    logical_id: u64,
+) {
+    clear_active_keyboard_note_by_lid(active_notes, logical_id);
+    let track_notes = &mut active_notes[track_idx];
+    if let Some(slot) = track_notes.iter_mut().find(|slot| {
+        slot.is_some_and(|note| (note.source_transpose - source_transpose).abs() < 0.01)
+    }) {
+        *slot = Some(ActiveKeyboardNote {
+            source_transpose,
+            logical_id,
+        });
+        return;
+    }
+    if let Some(slot) = track_notes.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(ActiveKeyboardNote {
+            source_transpose,
+            logical_id,
+        });
+        return;
+    }
+    track_notes[0] = Some(ActiveKeyboardNote {
+        source_transpose,
+        logical_id,
+    });
+}
+
+fn take_active_keyboard_note(
+    active_notes: &mut [[Option<ActiveKeyboardNote>; MAX_VOICES]; MAX_TRACKS],
+    track_idx: usize,
+    source_transpose: f32,
+) -> Option<ActiveKeyboardNote> {
+    let track_notes = &mut active_notes[track_idx];
+    for slot in track_notes.iter_mut() {
+        if slot.is_some_and(|note| (note.source_transpose - source_transpose).abs() < 0.01) {
+            return slot.take();
+        }
+    }
+    None
+}
+
+fn resolved_chord_transpose(
+    chord_transpose: f32,
+    step_transpose: f32,
+    resolved_transpose: f32,
+) -> f32 {
+    chord_transpose + (resolved_transpose - step_transpose)
+}
+
 fn track_engine_id(state: &SequencerState, track_idx: usize) -> Option<usize> {
     let engine_id = state.runtime.track_engine_ids[track_idx].load(Ordering::Relaxed);
     if engine_id == u32::MAX {
@@ -542,6 +676,9 @@ unsafe fn dispatch_effect_chain_for_track(
                 .get(step, param_idx)
                 .unwrap_or_else(|| slot.defaults.get(param_idx));
             let idx = slot.resolve_node_idx(param_idx);
+            if idx == u32::MAX as u64 {
+                continue;
+            }
             params_push_wrapper(
                 lg,
                 ParamMsg {
@@ -645,10 +782,58 @@ unsafe fn dispatch_instrument_defaults_to_voice(
     }
 }
 
-/// Fire a step trigger for a track (handles gate, chop setup, envelope params).
-/// Uses voice pool allocation for polyphonic playback.
+/// Build a ResolvedStep, apply the track's accumulator, then dispatch resulting actions.
 fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize) {
+    use crate::accumulator::{
+        apply_limit_mode, AccumMode, ActionBuffer, ResolvedStep, StepAction, ACCUMULATOR_REGISTRY,
+    };
     let sd = &data.state.pattern.step_data[track_idx];
+    let resolved = ResolvedStep::from_step_data(sd, step);
+    let tp = &data.state.pattern.track_params[track_idx];
+    let accum_idx = tp.get_accumulator_idx();
+
+    // Each track resets its own accumulator at its own step 0, independently.
+    if step == 0 && data.pending_accum_reset[track_idx] {
+        data.pending_accum_reset[track_idx] = false;
+        if let Some(def) = ACCUMULATOR_REGISTRY.get(accum_idx) {
+            data.accumulator_states[track_idx] = crate::accumulator::AccumulatorRuntimeState {
+                value: def.reset_value,
+                reversed: false,
+            };
+        }
+    }
+
+    let actions = if let Some(def) = ACCUMULATOR_REGISTRY.get(accum_idx) {
+        let rs = &mut data.accumulator_states[track_idx];
+        let (actions, raw_new) = (def.func)(resolved, resolved.aux_a, rs.value, rs.reversed);
+        let limit = tp.get_accum_limit();
+        let mode = AccumMode::from_u32(tp.get_accum_mode());
+        rs.value = apply_limit_mode(raw_new, limit, mode, &mut rs.reversed);
+        actions
+    } else {
+        ActionBuffer::just(StepAction::Play(resolved))
+    };
+    for action in actions.iter() {
+        match *action {
+            StepAction::Play(r) => fire_resolved(data, track_idx, step, r),
+            StepAction::SendToTrack { track, resolved: r } => {
+                if track < MAX_TRACKS {
+                    fire_resolved(data, track, step, r);
+                }
+            }
+            StepAction::Silence => {}
+        }
+    }
+}
+
+/// Fire a resolved step trigger for a track (handles gate, chop setup, envelope params).
+/// Uses voice pool allocation for polyphonic playback.
+fn fire_resolved(
+    data: &mut AudioCallbackData,
+    track_idx: usize,
+    step: usize,
+    resolved: crate::accumulator::ResolvedStep,
+) {
     let tp = &data.state.pattern.track_params[track_idx];
     let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
     let is_custom =
@@ -658,11 +843,10 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
         return;
     }
 
-    let chop = sd.get(step, StepParam::Chop).round() as u32;
+    let chop = resolved.chop.round() as u32;
     let chop = chop.max(1);
-    let dur = sd.get(step, StepParam::Duration);
 
-    let total_gate = (dur as f64 * samples_per_step) as f32;
+    let total_gate = (resolved.duration as f64 * samples_per_step) as f32;
     let chop_gate = total_gate / chop as f32;
 
     // Envelope params from track params
@@ -671,10 +855,24 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let attack_samples = attack_ms * data.sample_rate as f32 / 1000.0;
     let release_samples = release_ms * data.sample_rate as f32 / 1000.0;
     let gate_mode = if tp.is_gate_on() { 1.0 } else { 0.0 };
-    let velocity = sd.get(step, StepParam::Velocity);
+    let velocity = resolved.velocity;
     let base_note_offset = f32::from_bits(
         data.state.pattern.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed),
     );
+    let step_transpose = data.state.pattern.step_data[track_idx].get(step, StepParam::Transpose);
+
+    // Fit to Scale: quantize the final transpose to the nearest scale degree.
+    // Keep the pre-FTS value so chord notes can be individually quantized.
+    let fts = tp.get_fts_scale();
+    let pre_fts_transpose = resolved.transpose;
+    let resolved = if fts > 0 {
+        crate::accumulator::ResolvedStep {
+            transpose: crate::scale::quantize_transpose(resolved.transpose, fts),
+            ..resolved
+        }
+    } else {
+        resolved
+    };
 
     // Sync polyphonic setting from track params
     let track_polyphonic = tp.is_polyphonic();
@@ -689,7 +887,17 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
     let chord_count = data.state.pattern.chord_data[track_idx].count(step);
     if chord_count > 0 {
         for n in 0..chord_count {
-            let transpose = data.state.pattern.chord_data[track_idx].get(step, n);
+            // Apply accumulator offset using pre-FTS transpose, then FTS-quantize each note.
+            let raw = resolved_chord_transpose(
+                data.state.pattern.chord_data[track_idx].get(step, n),
+                step_transpose,
+                pre_fts_transpose,
+            );
+            let transpose = if fts > 0 {
+                crate::scale::quantize_transpose(raw, fts)
+            } else {
+                raw
+            };
             if is_custom {
                 let Some(engine_id) = engine_id else {
                     continue;
@@ -778,8 +986,8 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                     send_trigger(
                         data.lg.0,
                         lid,
-                        sd,
-                        step,
+                        velocity,
+                        resolved.speed,
                         chop_gate,
                         attack_samples,
                         release_samples,
@@ -790,8 +998,8 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
             }
         }
     } else {
-        // Single-note mode: use StepParam::Transpose
-        let transpose = sd.get(step, StepParam::Transpose);
+        // Single-note mode: use resolved transpose
+        let transpose = resolved.transpose;
         if is_custom {
             let Some(engine_id) = engine_id else {
                 return;
@@ -879,8 +1087,8 @@ fn fire_step_trigger(data: &mut AudioCallbackData, track_idx: usize, step: usize
                 send_trigger(
                     data.lg.0,
                     lid,
-                    sd,
-                    step,
+                    velocity,
+                    resolved.speed,
                     chop_gate,
                     attack_samples,
                     release_samples,
@@ -973,54 +1181,60 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
         if kt.note_off {
             // Note-off: find the voice playing this note and stop it
             if is_custom {
+                let Some(active_note) = take_active_keyboard_note(
+                    &mut data.active_keyboard_notes,
+                    kt.track,
+                    kt.transpose,
+                ) else {
+                    continue;
+                };
                 let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
                     continue;
                 };
                 let pool = &mut data.custom_engine_pools[engine_id];
-                if !track_polyphonic {
-                    if let Some(lid) = pool.release_voice_by_note(kt.track, kt.transpose) {
-                        unsafe {
-                            send_custom_note_off(data.lg.0, lid);
-                        }
-                    }
-                    continue;
-                }
-                if let Some(lid) = pool.release_voice_by_note(kt.track, kt.transpose) {
+                pool.release_voice_by_logical_id(active_note.logical_id);
+                if active_note.logical_id != 0 {
                     unsafe {
-                        send_custom_note_off(data.lg.0, lid);
+                        send_custom_note_off(data.lg.0, active_note.logical_id);
                     }
                 }
             } else {
-                let pool = &mut data.voice_pools[kt.track];
-                for v in 0..pool.num_voices {
-                    if pool.voices[v].active && (pool.voices[v].note - kt.transpose).abs() < 0.01 {
-                        let lid = pool.voices[v].logical_id;
-                        pool.voices[v].active = false;
-                        if lid != 0 {
-                            unsafe {
-                                params_push_wrapper(
-                                    data.lg.0,
-                                    ParamMsg {
-                                        idx: PARAM_GATE_SAMPLES,
-                                        logical_id: lid,
-                                        fvalue: 0.0,
-                                    },
-                                );
-                            }
+                if let Some(active_note) = take_active_keyboard_note(
+                    &mut data.active_keyboard_notes,
+                    kt.track,
+                    kt.transpose,
+                ) {
+                    let pool = &mut data.voice_pools[kt.track];
+                    pool.release_voice_by_logical_id(active_note.logical_id);
+                    if active_note.logical_id != 0 {
+                        unsafe {
+                            params_push_wrapper(
+                                data.lg.0,
+                                ParamMsg {
+                                    idx: PARAM_GATE_SAMPLES,
+                                    logical_id: active_note.logical_id,
+                                    fvalue: 0.0,
+                                },
+                            );
                         }
-                        break;
                     }
                 }
             }
         } else {
             // Note-on: allocate voice and trigger
+            let resolved_transpose = resolve_live_keyboard_transpose(
+                &data.state,
+                data.accumulator_states[kt.track],
+                kt.track,
+                kt.transpose,
+            );
             if is_custom {
                 let Some(engine_id) = track_engine_id(&data.state, kt.track) else {
                     continue;
                 };
                 let allocation = data.custom_engine_pools[engine_id].allocate_voice(
                     kt.track,
-                    kt.transpose,
+                    resolved_transpose,
                     track_polyphonic,
                 );
                 let voice_idx = allocation.voice_idx;
@@ -1035,7 +1249,7 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 if voice_lid == 0 || synth_id == 0 || modulator_id == 0 {
                     continue;
                 }
-                let pitch_hz = custom_pitch_hz(kt.transpose, base_note_offset);
+                let pitch_hz = custom_pitch_hz(resolved_transpose, base_note_offset);
                 cancel_gate_off_for_lid(&mut data.gate_off_state, voice_lid);
                 unsafe {
                     route_custom_voice_to_track(
@@ -1066,8 +1280,14 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 unsafe {
                     send_custom_trigger(data.lg.0, voice_lid, pitch_hz, kt.velocity);
                 }
+                store_active_keyboard_note(
+                    &mut data.active_keyboard_notes,
+                    kt.track,
+                    kt.transpose,
+                    voice_lid,
+                );
             } else {
-                let voice = data.voice_pools[kt.track].allocate_voice(kt.transpose);
+                let voice = data.voice_pools[kt.track].allocate_voice(resolved_transpose);
                 let voice_lid = voice.logical_id;
                 if voice_lid == 0 {
                     continue;
@@ -1080,19 +1300,36 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                     send_keyboard_trigger(
                         data.lg.0,
                         voice_lid,
-                        kt.transpose,
+                        resolved_transpose,
                         kt.velocity,
                         attack_samples,
                         release_samples,
                         gate_mode,
                     );
                 }
+                store_active_keyboard_note(
+                    &mut data.active_keyboard_notes,
+                    kt.track,
+                    kt.transpose,
+                    voice_lid,
+                );
             }
             data.state.transport.trigger_flash[kt.track].store(255, Ordering::Relaxed);
         }
     }
 
     let triggers = data.clock.process_block(nframes, &data.state);
+
+    // Schedule accumulator reset on play-start or pattern change; consumed at next step 0.
+    {
+        let playing = data.state.transport.playing.load(Ordering::Relaxed);
+        let pattern = data.state.pattern.current_pattern.load(Ordering::Relaxed);
+        if (!data.last_playing && playing) || data.last_pattern != pattern {
+            data.pending_accum_reset = [true; MAX_TRACKS];
+        }
+        data.last_playing = playing;
+        data.last_pattern = pattern;
+    }
 
     // Push BPM to all delay nodes only when it changes
     let bpm = data.state.transport.bpm.load(Ordering::Relaxed);
@@ -1169,19 +1406,17 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                 dispatch_effect_chain_for_track(data.lg.0, &data.state, track_idx, local_step);
             }
 
-            let samples_per_step = data.clock.samples_per_step_for_track(track_idx);
             let tp = &data.state.pattern.track_params[track_idx];
             let swing_pct = tp.get_swing();
-            let is_odd_step = local_step % 2 == 1;
+            let swing_resolution = tp.get_swing_resolution();
+            let swing_step = swing_bucket_index(trigger.cycle_start_beats, swing_resolution);
+            let is_odd_step = swing_step % 2 == 1;
 
             if is_odd_step && swing_pct > 50.0 {
-                // Delay this trigger by swing amount
-                let swing_delay = (swing_pct as f64 / 100.0 - 0.5) * samples_per_step;
-                data.swing_state[track_idx] = SwingPending {
-                    countdown: swing_delay,
-                    step: local_step,
-                    active: true,
-                };
+                let bpm = data.state.transport.bpm.load(Ordering::Relaxed) as f64;
+                let swing_delay =
+                    swing_delay_samples(data.sample_rate as f64, bpm, swing_pct, swing_resolution);
+                data.swing_state[track_idx].schedule(local_step, swing_delay);
             } else {
                 fire_step_trigger(data, track_idx, local_step);
             }
@@ -1190,14 +1425,9 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
 
     // Process pending swing triggers
     for track_idx in 0..num_tracks {
-        let sw = &mut data.swing_state[track_idx];
-        if sw.active {
-            sw.countdown -= nframes as f64;
-            if sw.countdown <= 0.0 {
-                sw.active = false;
-                let step = sw.step;
-                fire_step_trigger(data, track_idx, step);
-            }
+        let expired_steps = data.swing_state[track_idx].process(nframes);
+        for step in expired_steps {
+            fire_step_trigger(data, track_idx, step);
         }
     }
 
@@ -1227,8 +1457,8 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
                     send_trigger(
                         data.lg.0,
                         lid,
-                        sd,
-                        cs.step,
+                        sd.get(cs.step, StepParam::Velocity),
+                        sd.get(cs.step, StepParam::Speed),
                         cs.chop_gate,
                         attack_samples,
                         release_samples,
@@ -1261,6 +1491,8 @@ fn audio_callback(data: &mut AudioCallbackData, output: &mut [f32]) {
     unsafe {
         process_next_block(data.lg.0, output.as_mut_ptr(), nframes as i32);
     }
+
+    data.master_recorder.capture(output);
 
     // Scan interleaved output for peak levels
     let mut peak_l: f32 = 0.0;
@@ -1316,6 +1548,7 @@ pub fn build_output_stream(
     sample_rate: u32,
     num_channels: usize,
     block_size: usize,
+    master_recorder: Arc<MasterRecorder>,
     keyboard_rx: std::sync::mpsc::Receiver<KeyboardTrigger>,
 ) -> Result<Stream, String> {
     let clock = SequencerClock::new(sample_rate, state.transport.bpm.load(Ordering::Relaxed));
@@ -1330,13 +1563,7 @@ pub fn build_output_stream(
         })
         .collect();
 
-    let swing_state = (0..MAX_TRACKS)
-        .map(|_| SwingPending {
-            countdown: 0.0,
-            step: 0,
-            active: false,
-        })
-        .collect();
+    let swing_state = (0..MAX_TRACKS).map(|_| SwingTracker::new()).collect();
 
     // Initialize voice pools from state
     let mut voice_pools: Vec<VoicePool> = (0..MAX_TRACKS).map(|_| VoicePool::new()).collect();
@@ -1380,7 +1607,13 @@ pub fn build_output_stream(
         last_mod_reset_counter: 0,
         voice_pools,
         custom_engine_pools,
+        active_keyboard_notes: [[None; MAX_VOICES]; MAX_TRACKS],
         keyboard_rx,
+        master_recorder,
+        accumulator_states: [crate::accumulator::AccumulatorRuntimeState::default(); MAX_TRACKS],
+        last_playing: false,
+        last_pattern: u32::MAX,
+        pending_accum_reset: [false; MAX_TRACKS],
     };
 
     let host = cpal::default_host();
@@ -1429,8 +1662,12 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
-    use super::{instrument_sound_fingerprint, CustomEnginePool, GateOffTracker};
-    use crate::sequencer::SequencerState;
+    use super::{
+        instrument_sound_fingerprint, resolve_live_keyboard_transpose, resolved_chord_transpose,
+        swing_delay_samples, CustomEnginePool, GateOffTracker, SwingTracker,
+    };
+    use crate::accumulator::AccumulatorRuntimeState;
+    use crate::sequencer::{SequencerState, SwingResolution};
 
     #[test]
     fn custom_engine_pool_prefers_inactive_voices_before_stealing() {
@@ -1502,6 +1739,25 @@ mod tests {
     }
 
     #[test]
+    fn swing_delay_uses_full_pair_offset() {
+        let delay = swing_delay_samples(48_000.0, 120.0, 75.0, SwingResolution::Sixteenth);
+        assert_eq!(delay, 3_000.0);
+
+        let straight = swing_delay_samples(48_000.0, 120.0, 50.0, SwingResolution::Sixteenth);
+        assert_eq!(straight, 0.0);
+    }
+
+    #[test]
+    fn swing_tracker_keeps_multiple_pending_steps() {
+        let mut tracker = SwingTracker::new();
+        tracker.schedule(3, 100.0);
+        tracker.schedule(7, 200.0);
+
+        assert_eq!(tracker.process(100), vec![3]);
+        assert_eq!(tracker.process(100), vec![7]);
+    }
+
+    #[test]
     fn sound_fingerprint_changes_when_step_sound_changes() {
         let state = Arc::new(SequencerState::new(1, Vec::new()));
         state.runtime.track_engine_ids[0].store(2, Ordering::Relaxed);
@@ -1532,5 +1788,48 @@ mod tests {
         let changed = instrument_sound_fingerprint(&state, 0, 5, None);
 
         assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn resolved_chord_transpose_applies_accumulator_offset() {
+        assert_eq!(resolved_chord_transpose(7.0, 0.0, 5.0), 12.0);
+        assert_eq!(resolved_chord_transpose(7.0, 2.0, 8.0), 13.0);
+    }
+
+    #[test]
+    fn live_keyboard_transpose_applies_current_transpose_ramp_state() {
+        let state = SequencerState::new(1, Vec::new());
+        state.pattern.track_params[0].set_accumulator_idx(1);
+
+        let resolved = resolve_live_keyboard_transpose(
+            &state,
+            AccumulatorRuntimeState {
+                value: 5.0,
+                reversed: false,
+            },
+            0,
+            2.0,
+        );
+
+        assert_eq!(resolved, 7.0);
+    }
+
+    #[test]
+    fn live_keyboard_transpose_quantizes_after_transpose_ramp_offset() {
+        let state = SequencerState::new(1, Vec::new());
+        state.pattern.track_params[0].set_accumulator_idx(1);
+        state.pattern.track_params[0].set_fts_scale(1);
+
+        let resolved = resolve_live_keyboard_transpose(
+            &state,
+            AccumulatorRuntimeState {
+                value: 1.0,
+                reversed: false,
+            },
+            0,
+            2.6,
+        );
+
+        assert_eq!(resolved, 4.0);
     }
 }

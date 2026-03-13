@@ -1,3 +1,4 @@
+mod accumulator;
 mod audio;
 mod audiograph;
 #[allow(dead_code)]
@@ -11,9 +12,11 @@ mod gatepitch;
 #[allow(dead_code)]
 mod lisp_effect;
 mod project;
+mod recorder;
 #[allow(dead_code)]
 mod reverb;
 mod sampler;
+mod scale;
 #[allow(dead_code)]
 mod sequencer;
 mod ui;
@@ -158,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create shared sequencer state (start with 0 tracks)
     let state = Arc::new(sequencer::SequencerState::new(0, vec![]));
+    let master_recorder = Arc::new(recorder::MasterRecorder::new(sample_rate, channels));
 
     // Create psc channel for keyboard triggers
     let (keyboard_tx, keyboard_rx) = std::sync::mpsc::channel();
@@ -169,6 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_rate,
         channels as usize,
         block_size,
+        Arc::clone(&master_recorder),
         keyboard_rx,
     )?;
 
@@ -184,6 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             reverb_bus_id,
             reverb_node_id,
         },
+        master_recorder,
         keyboard_tx,
     );
     if args.iter().any(|arg| arg == "--headless-custom-repro") {

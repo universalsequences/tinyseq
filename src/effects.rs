@@ -23,6 +23,11 @@ pub enum ParamKind {
     Enum { labels: Vec<String> },        // value = index as f32
 }
 
+#[derive(Clone, Debug)]
+pub enum HostControl {
+    FxSidechain { input_channel: usize },
+}
+
 // ── ParamScaling ──
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,6 +47,7 @@ pub struct ParamDescriptor {
     pub kind: ParamKind,
     pub scaling: ParamScaling,
     pub node_param_idx: u32, // index into audio node's state array
+    pub host_control: Option<HostControl>,
 }
 
 impl ParamDescriptor {
@@ -84,6 +90,40 @@ impl ParamDescriptor {
                 }
                 ((val.max(self.min).ln() - log_min) / log_range).clamp(0.0, 1.0)
             }
+        }
+    }
+
+    /// Convert a normalized 0.0..1.0 control value into the stored parameter domain.
+    pub fn denormalize(&self, normalized: f32) -> f32 {
+        let normalized = normalized.clamp(0.0, 1.0);
+        match &self.kind {
+            ParamKind::Boolean => {
+                if normalized >= 0.5 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ParamKind::Enum { .. } => {
+                let range = self.max - self.min;
+                if range <= 0.0 {
+                    self.min
+                } else {
+                    (self.min + normalized * range).round().clamp(self.min, self.max)
+                }
+            }
+            ParamKind::Continuous { .. } => match self.scaling {
+                ParamScaling::Linear => self.min + normalized * (self.max - self.min),
+                ParamScaling::Exponential => {
+                    if self.min <= 0.0 || self.max <= 0.0 {
+                        self.min + normalized * (self.max - self.min)
+                    } else {
+                        let log_min = self.min.ln();
+                        let log_max = self.max.ln();
+                        (log_min + normalized * (log_max - log_min)).exp()
+                    }
+                }
+            },
         }
     }
 
@@ -148,6 +188,47 @@ impl ParamDescriptor {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ParamDescriptor, ParamKind, ParamScaling};
+
+    #[test]
+    fn denormalize_boolean_snaps_to_zero_or_one() {
+        let desc = ParamDescriptor {
+            name: "enabled".to_string(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            kind: ParamKind::Boolean,
+            scaling: ParamScaling::Linear,
+            node_param_idx: 0,
+            host_control: None,
+        };
+
+        assert_eq!(desc.denormalize(0.49), 0.0);
+        assert_eq!(desc.denormalize(0.5), 1.0);
+    }
+
+    #[test]
+    fn denormalize_exponential_matches_midpoint_in_log_space() {
+        let desc = ParamDescriptor {
+            name: "cutoff".to_string(),
+            min: 20.0,
+            max: 20_000.0,
+            default: 1_000.0,
+            kind: ParamKind::Continuous {
+                unit: Some("Hz".to_string()),
+            },
+            scaling: ParamScaling::Exponential,
+            node_param_idx: 0,
+            host_control: None,
+        };
+
+        let value = desc.denormalize(0.5);
+        assert!((value - 632.4555).abs() < 0.1, "value was {value}");
+    }
+}
+
 // ── EffectDescriptor ──
 
 #[derive(Clone, Debug)]
@@ -170,6 +251,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Boolean,
                     scaling: ParamScaling::Linear,
                     node_param_idx: 0,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "mode".to_string(),
@@ -185,6 +267,7 @@ impl EffectDescriptor {
                     },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 1,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "cutoff".to_string(),
@@ -196,6 +279,7 @@ impl EffectDescriptor {
                     },
                     scaling: ParamScaling::Exponential,
                     node_param_idx: 2,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "resonance".to_string(),
@@ -205,6 +289,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Continuous { unit: None },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 3,
+                    host_control: None,
                 },
             ],
         }
@@ -225,6 +310,7 @@ impl EffectDescriptor {
                     },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 0,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "synced".to_string(),
@@ -234,6 +320,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Boolean,
                     scaling: ParamScaling::Linear,
                     node_param_idx: 1,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "time".to_string(),
@@ -245,6 +332,7 @@ impl EffectDescriptor {
                     },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 2,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "feedback".to_string(),
@@ -254,6 +342,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Continuous { unit: None },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 3,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "dampening".to_string(),
@@ -263,6 +352,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Continuous { unit: None },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 4,
+                    host_control: None,
                 },
                 ParamDescriptor {
                     name: "width".to_string(),
@@ -272,6 +362,7 @@ impl EffectDescriptor {
                     kind: ParamKind::Continuous { unit: None },
                     scaling: ParamScaling::Linear,
                     node_param_idx: 5,
+                    host_control: None,
                 },
             ],
         }
@@ -314,6 +405,7 @@ impl EffectDescriptor {
                 },
                 scaling: ParamScaling::Linear,
                 node_param_idx: p.cell_id as u32,
+                host_control: None,
             })
             .collect();
         Self {
@@ -600,6 +692,30 @@ impl EffectSlotSnapshot {
             defaults: Vec::new(),
             plocks: (0..MAX_STEPS).map(|_| Vec::new()).collect(),
             param_node_indices: Vec::new(),
+        }
+    }
+
+    pub fn sync_to_descriptor(&mut self, desc: &EffectDescriptor, node_id: u32) {
+        let new_np = desc.params.len();
+        let old_defaults = self.defaults.clone();
+        let old_plocks = self.plocks.clone();
+
+        self.node_id = node_id;
+        self.num_params = new_np as u32;
+        self.defaults = desc.params.iter().map(|p| p.default).collect();
+        self.param_node_indices = desc.params.iter().map(|p| p.node_param_idx).collect();
+        self.plocks = (0..MAX_STEPS).map(|_| vec![None; new_np]).collect();
+
+        let preserve = old_defaults.len().min(new_np);
+        for i in 0..preserve {
+            self.defaults[i] = old_defaults[i];
+        }
+        for step in 0..MAX_STEPS {
+            if let Some(saved_step) = old_plocks.get(step) {
+                for param_idx in 0..preserve.min(saved_step.len()) {
+                    self.plocks[step][param_idx] = saved_step[param_idx];
+                }
+            }
         }
     }
 }

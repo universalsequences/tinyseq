@@ -685,33 +685,44 @@ impl App {
         let scratch_cursor = self.editor.scratch_cursor;
         let track = self.ui.cursor_track;
         let cursor_step = self.ui.cursor_step;
-        let runtime = self
+        let mut runtime = self
             .editor
             .scratch_runtime
             .take()
-            .unwrap_or_else(|| lisp_effect::ScratchControlRuntime::new(
-                Arc::clone(&self.state),
-                track,
-                cursor_step,
-            ))
-            .into_runtime();
+            .unwrap_or_else(|| {
+                lisp_effect::ScratchControlRuntime::new(
+                    Arc::clone(&self.state),
+                    self.graph.effect_descriptors.clone(),
+                    self.graph.instrument_descriptors.clone(),
+                    track,
+                    cursor_step,
+                )
+            });
+        runtime.sync_descriptors(
+            self.graph.effect_descriptors.clone(),
+            self.graph.instrument_descriptors.clone(),
+        );
         if let Some((text, cursor, runtime)) = lisp_effect::run_embedded_scratch_flow(
             track,
             cursor_step,
             &scratch_buffer,
             scratch_cursor,
             runtime,
-            |editor, name, payload| match name {
-                "register-hook" => self.register_hook_from_payload(editor, track, payload),
-                "clear-hooks" => Some(self.clear_control_hooks()),
-                _ => None,
+            |editor, event| match event {
+                Some((name, payload)) => match name {
+                    "register-hook" => self.register_hook_from_payload(editor, track, payload),
+                    "clear-hooks" => Some(self.clear_control_hooks()),
+                    _ => None,
+                },
+                None => {
+                    self.tick_control_hooks_with_editor(editor);
+                    None
+                }
             },
         ) {
             self.editor.scratch_buffer = text;
             self.editor.scratch_cursor = cursor;
-            self.editor.scratch_runtime = Some(
-                lisp_effect::ScratchControlRuntime::from_runtime(runtime, track, cursor_step),
-            );
+            self.editor.scratch_runtime = Some(runtime);
         }
     }
 

@@ -121,6 +121,54 @@ impl Timebase {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum SwingResolution {
+    Sixteenth = 0,
+    Eighth = 1,
+    Quarter = 2,
+    Half = 3,
+}
+
+impl SwingResolution {
+    pub const COUNT: usize = 4;
+    pub const ALL: [Self; Self::COUNT] = [Self::Sixteenth, Self::Eighth, Self::Quarter, Self::Half];
+    pub const LABELS: [&'static str; Self::COUNT] = ["1/16", "1/8", "1/4", "1/2"];
+
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL
+            .get(i as usize)
+            .copied()
+            .unwrap_or(Self::Sixteenth)
+    }
+
+    pub fn label(&self) -> &'static str {
+        Self::LABELS[*self as usize]
+    }
+
+    pub fn step_beats(&self) -> f64 {
+        match self {
+            Self::Sixteenth => 0.25,
+            Self::Eighth => 0.5,
+            Self::Quarter => 1.0,
+            Self::Half => 2.0,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        Self::from_index((self as u32 + 1) % Self::COUNT as u32)
+    }
+
+    pub fn prev(self) -> Self {
+        let idx = self as u32;
+        if idx == 0 {
+            Self::from_index(Self::COUNT as u32 - 1)
+        } else {
+            Self::from_index(idx - 1)
+        }
+    }
+}
+
 pub const SYNC_RESOLUTIONS: [(f64, &str); 8] = [
     (0.0, "Off"),
     (0.25, "1/16"),
@@ -166,9 +214,10 @@ impl StepParam {
         StepParam::Sync,
     ];
 
-    pub const VISIBLE: [StepParam; 4] = [
+    pub const VISIBLE: [StepParam; 5] = [
         StepParam::Duration,
         StepParam::Velocity,
+        StepParam::AuxA,
         StepParam::Transpose,
         StepParam::Sync,
     ];
@@ -204,7 +253,7 @@ impl StepParam {
             StepParam::Duration => 32.0,
             StepParam::Velocity => 1.0,
             StepParam::Speed => 2.0,
-            StepParam::AuxA => 1.0,
+            StepParam::AuxA => 16.0,
             StepParam::AuxB => 1.0,
             StepParam::Transpose => 48.0,
             StepParam::Chop => 8.0,
@@ -217,7 +266,7 @@ impl StepParam {
             StepParam::Duration => 0.05,
             StepParam::Velocity => 0.05,
             StepParam::Speed => 0.05,
-            StepParam::AuxA => 0.05,
+            StepParam::AuxA => 1.0,
             StepParam::AuxB => 0.05,
             StepParam::Transpose => 1.0,
             StepParam::Chop => 1.0,
@@ -312,6 +361,7 @@ impl StepParam {
             'd' => Some(StepParam::Duration),
             'v' => Some(StepParam::Velocity),
             's' => Some(StepParam::Speed),
+            'a' => Some(StepParam::AuxA),
             't' => Some(StepParam::Transpose),
             'y' => Some(StepParam::Sync),
             _ => None,
@@ -419,10 +469,16 @@ pub struct TrackParams {
     pub attack_ms: AtomicU32,
     pub release_ms: AtomicU32,
     pub swing: AtomicU32,
+    pub swing_resolution: AtomicU32,
     pub num_steps: AtomicU32,
+    pub volume: AtomicU32,
     pub send: AtomicU32,
     pub polyphonic: AtomicBool,
     pub timebase: AtomicU32,
+    pub accumulator_idx: AtomicU32,
+    pub accum_limit: AtomicU32,
+    pub accum_mode: AtomicU32,
+    pub fts_scale: AtomicU32,
 }
 
 impl TrackParams {
@@ -432,10 +488,16 @@ impl TrackParams {
             attack_ms: AtomicU32::new(0.0_f32.to_bits()),
             release_ms: AtomicU32::new(0.0_f32.to_bits()),
             swing: AtomicU32::new(50.0_f32.to_bits()),
+            swing_resolution: AtomicU32::new(SwingResolution::Sixteenth as u32),
             num_steps: AtomicU32::new(STEPS_PER_PAGE as u32),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
             send: AtomicU32::new(0.0_f32.to_bits()),
             polyphonic: AtomicBool::new(true),
             timebase: AtomicU32::new(Timebase::Sixteenth as u32),
+            accumulator_idx: AtomicU32::new(0),
+            accum_limit: AtomicU32::new(48.0_f32.to_bits()),
+            accum_mode: AtomicU32::new(0),
+            fts_scale: AtomicU32::new(0),
         }
     }
 
@@ -460,6 +522,19 @@ impl TrackParams {
         self.swing
             .store(val.clamp(50.0, 75.0).to_bits(), Ordering::Relaxed);
     }
+    pub fn get_swing_resolution(&self) -> SwingResolution {
+        SwingResolution::from_index(self.swing_resolution.load(Ordering::Relaxed))
+    }
+    pub fn set_swing_resolution(&self, resolution: SwingResolution) {
+        self.swing_resolution
+            .store(resolution as u32, Ordering::Relaxed);
+    }
+    pub fn next_swing_resolution(&self) {
+        self.set_swing_resolution(self.get_swing_resolution().next());
+    }
+    pub fn prev_swing_resolution(&self) {
+        self.set_swing_resolution(self.get_swing_resolution().prev());
+    }
     pub fn is_gate_on(&self) -> bool {
         self.gate.load(Ordering::Relaxed)
     }
@@ -472,6 +547,13 @@ impl TrackParams {
     pub fn set_num_steps(&self, val: usize) {
         self.num_steps
             .store(val.clamp(1, MAX_STEPS) as u32, Ordering::Relaxed);
+    }
+    pub fn get_volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+    pub fn set_volume(&self, val: f32) {
+        self.volume
+            .store(val.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
     pub fn get_send(&self) -> f32 {
         f32::from_bits(self.send.load(Ordering::Relaxed))
@@ -506,6 +588,31 @@ impl TrackParams {
         };
         self.timebase.store(next, Ordering::Relaxed);
     }
+    pub fn get_accumulator_idx(&self) -> usize {
+        self.accumulator_idx.load(Ordering::Relaxed) as usize
+    }
+    pub fn set_accumulator_idx(&self, idx: usize) {
+        self.accumulator_idx.store(idx as u32, Ordering::Relaxed);
+    }
+    pub fn get_accum_limit(&self) -> f32 {
+        f32::from_bits(self.accum_limit.load(Ordering::Relaxed))
+    }
+    pub fn set_accum_limit(&self, val: f32) {
+        self.accum_limit
+            .store(val.clamp(0.0, 127.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn get_accum_mode(&self) -> u32 {
+        self.accum_mode.load(Ordering::Relaxed)
+    }
+    pub fn set_accum_mode(&self, mode: u32) {
+        self.accum_mode.store(mode, Ordering::Relaxed);
+    }
+    pub fn get_fts_scale(&self) -> usize {
+        self.fts_scale.load(Ordering::Relaxed) as usize
+    }
+    pub fn set_fts_scale(&self, idx: usize) {
+        self.fts_scale.store(idx as u32, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone)]
@@ -514,10 +621,16 @@ pub struct TrackParamsSnapshot {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub swing: f32,
+    pub swing_resolution: SwingResolution,
     pub num_steps: usize,
+    pub volume: f32,
     pub send: f32,
     pub polyphonic: bool,
     pub timebase: Timebase,
+    pub accumulator_idx: usize,
+    pub accum_limit: f32,
+    pub accum_mode: u32,
+    pub fts_scale: usize,
 }
 
 impl Default for TrackParamsSnapshot {
@@ -527,10 +640,16 @@ impl Default for TrackParamsSnapshot {
             attack_ms: 0.0,
             release_ms: 0.0,
             swing: 50.0,
+            swing_resolution: SwingResolution::Sixteenth,
             num_steps: STEPS_PER_PAGE,
+            volume: 1.0,
             send: 0.0,
             polyphonic: false,
             timebase: Timebase::Sixteenth,
+            accumulator_idx: 0,
+            accum_limit: 48.0,
+            accum_mode: 0,
+            fts_scale: 0,
         }
     }
 }
@@ -652,6 +771,7 @@ pub struct Trigger {
     pub track: usize,
     pub step: usize,
     pub offset: usize,
+    pub cycle_start_beats: f64,
 }
 
 pub struct TimebasePLockData {

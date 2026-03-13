@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use eseqlisp::tui as eseq_tui;
 use eseqlisp::vm::Value as EValue;
-use eseqlisp::{CompileKind, Editor, EditorConfig, HostCommand, HostEvent, Runtime};
+use eseqlisp::{BufferMode, CompileKind, Editor, EditorConfig, HostCommand, HostEvent, Runtime};
 use serde::{Deserialize, Serialize};
 
 use crate::audiograph::{self, LiveGraph, NodeVTable};
+use crate::effects::EffectDescriptor;
 use crate::sequencer::{StepParam, StepSnapshot, Timebase};
 
 /// Monotonic counter so each compile produces a unique dylib filename,
@@ -1167,27 +1168,62 @@ struct SequencerEvalContext {
 
 type SharedSequencerEvalContext = Arc<Mutex<SequencerEvalContext>>;
 
+#[derive(Clone, Debug, Default)]
+struct SequencerNativeMetadata {
+    effect_descriptors: Vec<Vec<EffectDescriptor>>,
+    instrument_descriptors: Vec<EffectDescriptor>,
+}
+
+type SharedSequencerNativeMetadata = Arc<Mutex<SequencerNativeMetadata>>;
+
 pub struct ScratchControlRuntime {
     runtime: Runtime,
     context: SharedSequencerEvalContext,
+    metadata: SharedSequencerNativeMetadata,
 }
 
 impl ScratchControlRuntime {
     pub fn new(
         state: Arc<crate::sequencer::SequencerState>,
+        effect_descriptors: Vec<Vec<EffectDescriptor>>,
+        instrument_descriptors: Vec<EffectDescriptor>,
         track: usize,
         cursor_step: usize,
     ) -> Self {
         let context = Arc::new(Mutex::new(SequencerEvalContext { track, cursor_step }));
+        let metadata = Arc::new(Mutex::new(SequencerNativeMetadata {
+            effect_descriptors,
+            instrument_descriptors,
+        }));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, state, Arc::clone(&context));
-        Self { runtime, context }
+        register_sequencer_natives(
+            &mut runtime,
+            state,
+            Arc::clone(&context),
+            Arc::clone(&metadata),
+        );
+        Self {
+            runtime,
+            context,
+            metadata,
+        }
     }
 
     pub fn set_position(&mut self, track: usize, cursor_step: usize) {
         if let Ok(mut ctx) = self.context.lock() {
             ctx.track = track;
             ctx.cursor_step = cursor_step;
+        }
+    }
+
+    pub fn sync_descriptors(
+        &mut self,
+        effect_descriptors: Vec<Vec<EffectDescriptor>>,
+        instrument_descriptors: Vec<EffectDescriptor>,
+    ) {
+        if let Ok(mut metadata) = self.metadata.lock() {
+            metadata.effect_descriptors = effect_descriptors;
+            metadata.instrument_descriptors = instrument_descriptors;
         }
     }
 
@@ -1203,13 +1239,20 @@ impl ScratchControlRuntime {
         self.runtime.set_global_value(name, value);
     }
 
-    pub fn into_runtime(self) -> Runtime {
-        self.runtime
+    pub fn into_parts(self) -> (Runtime, SharedSequencerEvalContext, SharedSequencerNativeMetadata) {
+        (self.runtime, self.context, self.metadata)
     }
 
-    pub fn from_runtime(runtime: Runtime, track: usize, cursor_step: usize) -> Self {
-        let context = Arc::new(Mutex::new(SequencerEvalContext { track, cursor_step }));
-        Self { runtime, context }
+    pub fn from_parts(
+        runtime: Runtime,
+        context: SharedSequencerEvalContext,
+        metadata: SharedSequencerNativeMetadata,
+    ) -> Self {
+        Self {
+            runtime,
+            context,
+            metadata,
+        }
     }
 }
 
@@ -1217,6 +1260,7 @@ fn register_sequencer_natives(
     runtime: &mut Runtime,
     state: Arc<crate::sequencer::SequencerState>,
     context: SharedSequencerEvalContext,
+    metadata: SharedSequencerNativeMetadata,
 ) {
     let current_track = |ctx: &SharedSequencerEvalContext| {
         ctx.lock().map(|guard| guard.track).unwrap_or(0)
@@ -1226,18 +1270,75 @@ fn register_sequencer_natives(
     };
 
     let context_for_track = Arc::clone(&context);
-    runtime.register_native("seq-current-track", move |_args, _ctx| {
+    runtime.register_native_with_docs("seq-current-track", "(seq-current-track)", "Return the current 1-based track index for the scratch context.", move |_args, _ctx| {
         Ok(EValue::Number((current_track(&context_for_track) + 1) as f64))
     });
 
+    let state_for_set_track = Arc::clone(&state);
+    let context_for_set_track = Arc::clone(&context);
+    runtime.register_native_with_docs("seq-set-current-track", "(seq-set-current-track track)", "Set the current 1-based track index for subsequent scratch operations.", move |args, ctx| {
+        let Some(EValue::Number(track)) = args.first() else {
+            return Err("expected 1-based track number".to_string());
+        };
+        let track = *track as isize;
+        if track <= 0 {
+            return Err("tracks are 1-based".to_string());
+        }
+        let track_count = state_for_set_track.active_track_count() as isize;
+        if track > track_count {
+            return Err(format!("track out of range (1..={track_count})"));
+        }
+        let track_idx = (track - 1) as usize;
+        if let Ok(mut eval_ctx) = context_for_set_track.lock() {
+            eval_ctx.track = track_idx;
+        }
+        ctx.set_status(format!("current track {}", track));
+        Ok(EValue::Number(track as f64))
+    });
+
+    let state_for_host_set_track = Arc::clone(&state);
+    let context_for_host_set_track = Arc::clone(&context);
+    runtime.register_native("__host-set-current-track", move |args, _ctx| {
+        let Some(EValue::Number(track)) = args.first() else {
+            return Err("expected 1-based track number".to_string());
+        };
+        let track = *track as isize;
+        if track <= 0 {
+            return Err("tracks are 1-based".to_string());
+        }
+        let track_count = state_for_host_set_track.active_track_count() as isize;
+        if track > track_count {
+            return Err(format!("track out of range (1..={track_count})"));
+        }
+        if let Ok(mut eval_ctx) = context_for_host_set_track.lock() {
+            eval_ctx.track = (track - 1) as usize;
+        }
+        Ok(EValue::Number(track as f64))
+    });
+
     let context_for_step = Arc::clone(&context);
-    runtime.register_native("seq-current-step", move |_args, _ctx| {
+    runtime.register_native_with_docs("seq-current-step", "(seq-current-step)", "Return the current 1-based step index for the scratch context.", move |_args, _ctx| {
         Ok(EValue::Number((current_step(&context_for_step) + 1) as f64))
+    });
+
+    let context_for_host_set_step = Arc::clone(&context);
+    runtime.register_native("__host-set-current-step", move |args, _ctx| {
+        let Some(EValue::Number(step)) = args.first() else {
+            return Err("expected 1-based step number".to_string());
+        };
+        let step = *step as isize;
+        if step <= 0 {
+            return Err("steps are 1-based".to_string());
+        }
+        if let Ok(mut eval_ctx) = context_for_host_set_step.lock() {
+            eval_ctx.cursor_step = (step - 1) as usize;
+        }
+        Ok(EValue::Number(step as f64))
     });
 
     let state_for_steps = Arc::clone(&state);
     let context_for_steps = Arc::clone(&context);
-    runtime.register_native("seq-num-steps", move |_args, _ctx| {
+    runtime.register_native_with_docs("seq-num-steps", "(seq-num-steps)", "Return the number of steps in the current track.", move |_args, _ctx| {
         let track = current_track(&context_for_steps);
         Ok(EValue::Number(
             state_for_steps.pattern.track_params[track].get_num_steps() as f64,
@@ -1246,7 +1347,7 @@ fn register_sequencer_natives(
 
     let state_for_toggle = Arc::clone(&state);
     let context_for_toggle = Arc::clone(&context);
-    runtime.register_native("seq-toggle-step", move |args, ctx| {
+    runtime.register_native_with_docs("seq-toggle-step", "(seq-toggle-step step)", "Toggle the active state of a 1-based step in the current track.", move |args, ctx| {
         let track_idx = current_track(&context_for_toggle);
         let step_idx = parse_step_arg(&args, 0)?;
         state_for_toggle.toggle_step_and_clear_plocks(track_idx, step_idx);
@@ -1260,9 +1361,29 @@ fn register_sequencer_natives(
         Ok(EValue::Bool(active))
     });
 
+    let state_for_step_on = Arc::clone(&state);
+    let context_for_step_on = Arc::clone(&context);
+    runtime.register_native_with_docs("seq-step-on", "(seq-step-on step)", "Ensure a 1-based step is active in the current track.", move |args, ctx| {
+        let track_idx = current_track(&context_for_step_on);
+        let step_idx = parse_step_arg(&args, 0)?;
+        state_for_step_on.pattern.patterns[track_idx].set_step_active(step_idx, true);
+        ctx.set_status(format!("track {} step {} on", track_idx + 1, step_idx + 1));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_step_off = Arc::clone(&state);
+    let context_for_step_off = Arc::clone(&context);
+    runtime.register_native_with_docs("seq-step-off", "(seq-step-off step)", "Ensure a 1-based step is inactive in the current track.", move |args, ctx| {
+        let track_idx = current_track(&context_for_step_off);
+        let step_idx = parse_step_arg(&args, 0)?;
+        state_for_step_off.clear_step_payload(track_idx, step_idx);
+        ctx.set_status(format!("track {} step {} off", track_idx + 1, step_idx + 1));
+        Ok(EValue::Bool(true))
+    });
+
     let state_for_clear_step = Arc::clone(&state);
     let context_for_clear_step = Arc::clone(&context);
-    runtime.register_native("seq-clear-step", move |args, ctx| {
+    runtime.register_native_with_docs("seq-clear-step", "(seq-clear-step step)", "Clear all payload data for a 1-based step in the current track.", move |args, ctx| {
         let track_idx = current_track(&context_for_clear_step);
         let step_idx = parse_step_arg(&args, 0)?;
         state_for_clear_step.clear_step_payload(track_idx, step_idx);
@@ -1272,7 +1393,7 @@ fn register_sequencer_natives(
 
     let state_for_clear_track = Arc::clone(&state);
     let context_for_clear_track = Arc::clone(&context);
-    runtime.register_native("seq-clear-track", move |_args, ctx| {
+    runtime.register_native_with_docs("seq-clear-track", "(seq-clear-track)", "Clear all step payloads in the current track.", move |_args, ctx| {
         let track_idx = current_track(&context_for_clear_track);
         let num_steps = state_for_clear_track.pattern.track_params[track_idx].get_num_steps();
         for step in 0..num_steps {
@@ -1284,7 +1405,7 @@ fn register_sequencer_natives(
 
     let state_for_velocity = Arc::clone(&state);
     let context_for_velocity = Arc::clone(&context);
-    runtime.register_native("seq-set-velocity", move |args, ctx| {
+    runtime.register_native_with_docs("seq-set-velocity", "(seq-set-velocity step value)", "Set the velocity parameter for a 1-based step.", move |args, ctx| {
         let track_idx = current_track(&context_for_velocity);
         let step_idx = parse_step_arg(&args, 0)?;
         let Some(EValue::Number(value)) = args.get(1) else {
@@ -1297,7 +1418,7 @@ fn register_sequencer_natives(
 
     let state_for_transpose = Arc::clone(&state);
     let context_for_transpose = Arc::clone(&context);
-    runtime.register_native("seq-set-transpose", move |args, ctx| {
+    runtime.register_native_with_docs("seq-set-transpose", "(seq-set-transpose step value)", "Set the transpose parameter for a 1-based step.", move |args, ctx| {
         let track_idx = current_track(&context_for_transpose);
         let step_idx = parse_step_arg(&args, 0)?;
         let Some(EValue::Number(value)) = args.get(1) else {
@@ -1315,7 +1436,7 @@ fn register_sequencer_natives(
 
     let state_for_adjust = Arc::clone(&state);
     let context_for_adjust = Arc::clone(&context);
-    runtime.register_native("seq-adjust-transpose", move |args, ctx| {
+    runtime.register_native_with_docs("seq-adjust-transpose", "(seq-adjust-transpose step delta)", "Adjust the transpose parameter for a 1-based step by a delta.", move |args, ctx| {
         let track_idx = current_track(&context_for_adjust);
         let step_idx = parse_step_arg(&args, 0)?;
         let Some(EValue::Number(value)) = args.get(1) else {
@@ -1333,7 +1454,7 @@ fn register_sequencer_natives(
 
     let state_for_step = Arc::clone(&state);
     let context_for_step_native = Arc::clone(&context);
-    runtime.register_native("seq-step", move |args, _ctx| {
+    runtime.register_native_with_docs("seq-step", "(seq-step step)", "Return a map snapshot for a 1-based step in the current track.", move |args, _ctx| {
         let track_idx = current_track(&context_for_step_native);
         let step_idx = parse_step_arg(&args, 0)?;
         Ok(step_snapshot_to_value(
@@ -1344,7 +1465,7 @@ fn register_sequencer_natives(
 
     let state_for_track_steps = Arc::clone(&state);
     let context_for_track_steps = Arc::clone(&context);
-    runtime.register_native("seq-track-steps", move |_args, _ctx| {
+    runtime.register_native_with_docs("seq-track-steps", "(seq-track-steps)", "Return a list of step snapshot maps for the current track.", move |_args, _ctx| {
         let track_idx = current_track(&context_for_track_steps);
         let num_steps = state_for_track_steps.pattern.track_params[track_idx].get_num_steps();
         let mut steps = Vec::with_capacity(num_steps);
@@ -1359,7 +1480,7 @@ fn register_sequencer_natives(
 
     let state_for_rotate = Arc::clone(&state);
     let context_for_rotate = Arc::clone(&context);
-    runtime.register_native("seq-rotate-track", move |args, ctx| {
+    runtime.register_native_with_docs("seq-rotate-track", "(seq-rotate-track amount)", "Rotate the current track by the given step amount.", move |args, ctx| {
         let track_idx = current_track(&context_for_rotate);
         let Some(EValue::Number(direction)) = args.first() else {
             return Err("expected rotation direction".to_string());
@@ -1373,7 +1494,7 @@ fn register_sequencer_natives(
 
     let state_for_step_plock = Arc::clone(&state);
     let context_for_step_plock = Arc::clone(&context);
-    runtime.register_native("seq-plock-step", move |args, ctx| {
+    runtime.register_native_with_docs("seq-plock-step", "(seq-plock-step step :param value)", "Parameter-lock a step parameter using a keyword name.", move |args, ctx| {
         let track_idx = current_track(&context_for_step_plock);
         let step_idx = parse_step_arg(&args, 0)?;
         let param = parse_step_param_arg(&args, 1)?;
@@ -1391,7 +1512,7 @@ fn register_sequencer_natives(
 
     let state_for_timebase_plock = Arc::clone(&state);
     let context_for_timebase_plock = Arc::clone(&context);
-    runtime.register_native("seq-plock-timebase", move |args, ctx| {
+    runtime.register_native_with_docs("seq-plock-timebase", "(seq-plock-timebase step :timebase)", "Set a timebase override for a 1-based step.", move |args, ctx| {
         let track_idx = current_track(&context_for_timebase_plock);
         let step_idx = parse_step_arg(&args, 0)?;
         let timebase = parse_timebase_arg(&args, 1)?;
@@ -1407,13 +1528,90 @@ fn register_sequencer_natives(
 
     let state_for_effect_plock = Arc::clone(&state);
     let context_for_effect_plock = Arc::clone(&context);
-    runtime.register_native("seq-plock-effect", move |args, ctx| {
+    let metadata_for_effect_plock = Arc::clone(&metadata);
+    let context_for_effect_param_name = Arc::clone(&context);
+    let metadata_for_effect_name = Arc::clone(&metadata);
+    runtime.register_native_with_docs("seq-effect-param-name", "(seq-effect-param-name slot param-index)", "Return the parameter name for a 1-based effect slot and 0-based parameter index on the current track.", move |args, _ctx| {
+        let track_idx = current_track(&context_for_effect_param_name);
+        let slot_idx = parse_slot_arg(&args, 0)?;
+        let param_idx = parse_param_index_arg(&args, 1)?;
+        let name = metadata_for_effect_name
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .and_then(|slots| slots.get(slot_idx))
+            .and_then(|desc| desc.params.get(param_idx))
+            .map(|param| param.name.clone())
+            .ok_or_else(|| "effect parameter out of range".to_string())?;
+        Ok(EValue::String(name))
+    });
+
+    let context_for_effect_param_names = Arc::clone(&context);
+    let metadata_for_effect_names = Arc::clone(&metadata);
+    runtime.register_native_with_docs("seq-effect-param-names", "(seq-effect-param-names slot)", "Return a list of parameter names for a 1-based effect slot on the current track.", move |args, _ctx| {
+        let track_idx = current_track(&context_for_effect_param_names);
+        let slot_idx = parse_slot_arg(&args, 0)?;
+        let params = metadata_for_effect_names
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .and_then(|slots| slots.get(slot_idx))
+            .map(|desc| {
+                desc.params
+                    .iter()
+                    .map(|param| EValue::String(param.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| "effect slot out of range".to_string())?;
+        Ok(lisp_list(params))
+    });
+
+    runtime.register_native_with_docs("seq-plock-effect", "(seq-plock-effect step slot param-index normalized)", "Set an effect parameter lock for a 1-based step using a normalized 0.0..1.0 value.", move |args, ctx| {
         let track_idx = current_track(&context_for_effect_plock);
         let step_idx = parse_step_arg(&args, 0)?;
         let slot_idx = parse_slot_arg(&args, 1)?;
         let param_idx = parse_param_index_arg(&args, 2)?;
-        let value = parse_value_arg(&args, 3, "effect p-lock")?;
+        let normalized = parse_normalized_arg(&args, 3, "effect p-lock")?;
         let Some(slot) = state_for_effect_plock.pattern.effect_chains[track_idx].get(slot_idx) else {
+            return Err("effect slot out of range".to_string());
+        };
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        if param_idx >= num_params {
+            return Err("effect param index out of range".to_string());
+        }
+        let param_desc = metadata_for_effect_plock
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .and_then(|slots| slots.get(slot_idx))
+            .and_then(|desc| desc.params.get(param_idx))
+            .cloned()
+            .ok_or_else(|| "effect descriptor missing for parameter".to_string())?;
+        let value = param_desc.denormalize(normalized);
+        slot.plocks.set(step_idx, param_idx, value);
+        ctx.set_status(format!(
+            "track {} step {} effect {} param {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            slot_idx + 1,
+            param_idx,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_effect_plock_raw = Arc::clone(&state);
+    let context_for_effect_plock_raw = Arc::clone(&context);
+    runtime.register_native_with_docs("seq-plock-effect-raw", "(seq-plock-effect-raw step slot param-index value)", "Set an effect parameter lock for a 1-based step using the stored engine value.", move |args, ctx| {
+        let track_idx = current_track(&context_for_effect_plock_raw);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let slot_idx = parse_slot_arg(&args, 1)?;
+        let param_idx = parse_param_index_arg(&args, 2)?;
+        let value = parse_value_arg(&args, 3, "effect p-lock")?;
+        let Some(slot) = state_for_effect_plock_raw.pattern.effect_chains[track_idx].get(slot_idx) else {
             return Err("effect slot out of range".to_string());
         };
         let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
@@ -1434,12 +1632,80 @@ fn register_sequencer_natives(
 
     let state_for_instrument_plock = Arc::clone(&state);
     let context_for_instrument_plock = Arc::clone(&context);
-    runtime.register_native("seq-plock-instrument", move |args, ctx| {
+    let metadata_for_instrument_plock = Arc::clone(&metadata);
+    let context_for_instrument_param_name = Arc::clone(&context);
+    let metadata_for_instrument_name = Arc::clone(&metadata);
+    runtime.register_native_with_docs("seq-instrument-param-name", "(seq-instrument-param-name param-index)", "Return the parameter name for a 0-based instrument parameter index on the current track.", move |args, _ctx| {
+        let track_idx = current_track(&context_for_instrument_param_name);
+        let param_idx = parse_param_index_arg(&args, 0)?;
+        let name = metadata_for_instrument_name
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .and_then(|desc| desc.params.get(param_idx))
+            .map(|param| param.name.clone())
+            .ok_or_else(|| "instrument parameter out of range".to_string())?;
+        Ok(EValue::String(name))
+    });
+
+    let context_for_instrument_param_names = Arc::clone(&context);
+    let metadata_for_instrument_names = Arc::clone(&metadata);
+    runtime.register_native_with_docs("seq-instrument-param-names", "(seq-instrument-param-names)", "Return a list of parameter names for the current track's instrument.", move |_args, _ctx| {
+        let track_idx = current_track(&context_for_instrument_param_names);
+        let params = metadata_for_instrument_names
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .map(|desc| {
+                desc.params
+                    .iter()
+                    .map(|param| EValue::String(param.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| "instrument descriptor missing".to_string())?;
+        Ok(lisp_list(params))
+    });
+
+    runtime.register_native_with_docs("seq-plock-instrument", "(seq-plock-instrument step param-index normalized)", "Set an instrument parameter lock for a 1-based step using a normalized 0.0..1.0 value.", move |args, ctx| {
         let track_idx = current_track(&context_for_instrument_plock);
         let step_idx = parse_step_arg(&args, 0)?;
         let param_idx = parse_param_index_arg(&args, 1)?;
-        let value = parse_value_arg(&args, 2, "instrument p-lock")?;
+        let normalized = parse_normalized_arg(&args, 2, "instrument p-lock")?;
         let slot = &state_for_instrument_plock.pattern.instrument_slots[track_idx];
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        if param_idx >= num_params {
+            return Err("instrument param index out of range".to_string());
+        }
+        let param_desc = metadata_for_instrument_plock
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+            .as_ref()
+            .and_then(|desc| desc.params.get(param_idx))
+            .cloned()
+            .ok_or_else(|| "instrument descriptor missing for parameter".to_string())?;
+        let value = param_desc.denormalize(normalized);
+        slot.plocks.set(step_idx, param_idx, value);
+        ctx.set_status(format!(
+            "track {} step {} instrument param {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            param_idx,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_instrument_plock_raw = Arc::clone(&state);
+    let context_for_instrument_plock_raw = Arc::clone(&context);
+    runtime.register_native_with_docs("seq-plock-instrument-raw", "(seq-plock-instrument-raw step param-index value)", "Set an instrument parameter lock for a 1-based step using the stored engine value.", move |args, ctx| {
+        let track_idx = current_track(&context_for_instrument_plock_raw);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let param_idx = parse_param_index_arg(&args, 1)?;
+        let value = parse_value_arg(&args, 2, "instrument p-lock")?;
+        let slot = &state_for_instrument_plock_raw.pattern.instrument_slots[track_idx];
         let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
         if param_idx >= num_params {
             return Err("instrument param index out of range".to_string());
@@ -1454,6 +1720,28 @@ fn register_sequencer_natives(
         ));
         Ok(EValue::Bool(true))
     });
+}
+
+fn fallback_effect_descriptors(track_count: usize) -> Vec<Vec<EffectDescriptor>> {
+    (0..track_count)
+        .map(|_| EffectDescriptor::default_full_chain())
+        .collect()
+}
+
+fn fallback_instrument_descriptors(track_count: usize) -> Vec<EffectDescriptor> {
+    (0..track_count)
+        .map(|_| EffectDescriptor::builtin_delay())
+        .collect()
+}
+
+fn shared_native_metadata(
+    effect_descriptors: Vec<Vec<EffectDescriptor>>,
+    instrument_descriptors: Vec<EffectDescriptor>,
+) -> SharedSequencerNativeMetadata {
+    Arc::new(Mutex::new(SequencerNativeMetadata {
+        effect_descriptors,
+        instrument_descriptors,
+    }))
 }
 
 fn parse_step_arg(args: &[EValue], idx: usize) -> Result<usize, String> {
@@ -1493,6 +1781,10 @@ fn parse_value_arg(args: &[EValue], idx: usize, label: &str) -> Result<f32, Stri
         return Err(format!("expected {label} value"));
     };
     Ok(*value as f32)
+}
+
+fn parse_normalized_arg(args: &[EValue], idx: usize, label: &str) -> Result<f32, String> {
+    Ok(parse_value_arg(args, idx, label)?.clamp(0.0, 1.0))
 }
 
 fn parse_step_param_arg(args: &[EValue], idx: usize) -> Result<StepParam, String> {
@@ -1674,10 +1966,15 @@ where
         .or_else(|_| std::fs::read_to_string("init.lisp"))
         .unwrap_or_default();
     let mut runtime = Runtime::new();
+    let track_count = state.active_track_count();
     register_sequencer_natives(
         &mut runtime,
         state,
         new_eval_context(track.unwrap_or(0), cursor_step.unwrap_or(0)),
+        shared_native_metadata(
+            fallback_effect_descriptors(track_count),
+            fallback_instrument_descriptors(track_count),
+        ),
     );
     let mut editor = Editor::new(
         runtime,
@@ -1690,7 +1987,7 @@ where
         _ => default_template_for_kind(&kind).to_string(),
     };
     if editor
-        .open_or_create_file_buffer(&path, &initial)
+        .open_or_create_file_buffer_with_mode(&path, &initial, BufferMode::DGenLisp)
         .map_err(|e| eprintln!("Failed to open editor buffer '{}': {e:?}", path.display()))
         .is_err()
     {
@@ -2059,16 +2356,16 @@ pub fn run_embedded_scratch_flow(
     cursor_step: usize,
     initial_text: &str,
     initial_cursor: (usize, usize),
-    runtime: Runtime,
-    mut on_host_command: impl FnMut(&mut Editor, &str, &EValue) -> Option<String>,
-) -> Option<(String, (usize, usize), Runtime)> {
-    let mut control_runtime = ScratchControlRuntime::from_runtime(runtime, track, cursor_step);
+    mut control_runtime: ScratchControlRuntime,
+    mut on_loop_event: impl FnMut(&mut Editor, Option<(&str, &EValue)>) -> Option<String>,
+) -> Option<(String, (usize, usize), ScratchControlRuntime)> {
     control_runtime.set_position(track, cursor_step);
+    let (runtime, context, metadata) = control_runtime.into_parts();
     let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
         .or_else(|_| std::fs::read_to_string("init.lisp"))
         .unwrap_or_default();
     let mut editor = Editor::new(
-        control_runtime.into_runtime(),
+        runtime,
         EditorConfig {
             init_source: Some(init_src),
         },
@@ -2078,7 +2375,7 @@ pub fn run_embedded_scratch_flow(
     } else {
         initial_text.to_string()
     };
-    editor.open_scratch_buffer("*scratch*", &initial);
+    editor.open_scratch_buffer_with_mode("*scratch*", &initial, BufferMode::ESeqLisp);
     {
         let buffer = editor.active_buffer_mut();
         buffer.path = Some(PathBuf::from(".eseqlisp-scratch"));
@@ -2105,7 +2402,7 @@ pub fn run_embedded_scratch_flow(
 
         for command in editor.drain_host_commands() {
             if let HostCommand::Custom { name, payload } = command {
-                if let Some(status) = on_host_command(&mut editor, &name, &payload) {
+                if let Some(status) = on_loop_event(&mut editor, Some((&name, &payload))) {
                     editor.handle_host_event(HostEvent::Status(status));
                 } else {
                     editor.handle_host_event(HostEvent::Status(format!(
@@ -2114,6 +2411,8 @@ pub fn run_embedded_scratch_flow(
                 }
             }
         }
+
+        let _ = on_loop_event(&mut editor, None);
 
         if editor.needs_redraw() {
             if terminal
@@ -2127,7 +2426,11 @@ pub fn run_embedded_scratch_flow(
 
         if editor.should_quit() {
             let buffer = editor.active_buffer();
-            return Some((buffer.text(), buffer.cursor, editor.into_runtime()));
+            return Some((
+                buffer.text(),
+                buffer.cursor,
+                ScratchControlRuntime::from_parts(editor.into_runtime(), context, metadata),
+            ));
         }
     }
     None
@@ -2140,10 +2443,15 @@ pub fn eval_sequencer_control(
     cursor_step: Option<usize>,
 ) -> Result<Option<EValue>, String> {
     let mut runtime = Runtime::new();
+    let track_count = state.active_track_count();
     register_sequencer_natives(
         &mut runtime,
         state,
         new_eval_context(track.unwrap_or(0), cursor_step.unwrap_or(0)),
+        shared_native_metadata(
+            fallback_effect_descriptors(track_count),
+            fallback_instrument_descriptors(track_count),
+        ),
     );
     runtime
         .eval_str(control_prelude_source())
@@ -2319,9 +2627,13 @@ pub fn run_instrument_editor_flow(
 
 #[cfg(test)]
 mod tests {
-    use super::{ScratchControlRuntime, new_eval_context, register_sequencer_natives};
+    use super::{
+        ScratchControlRuntime, fallback_effect_descriptors, fallback_instrument_descriptors,
+        new_eval_context, register_sequencer_natives, shared_native_metadata,
+    };
+    use crate::effects::EffectDescriptor;
     use crate::sequencer::{StepParam, default_empty_effect_chain, SequencerState};
-    use eseqlisp::{Editor, EditorConfig, Runtime};
+    use eseqlisp::{BufferMode, Editor, EditorConfig, Runtime};
     use eseqlisp::vm::Value;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Arc;
@@ -2330,7 +2642,15 @@ mod tests {
     fn seq_step_returns_map_value() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            state,
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
 
         let result = runtime.eval_str("(seq-step 1)").unwrap();
         assert!(matches!(result, Some(Value::Map(_))));
@@ -2340,10 +2660,92 @@ mod tests {
     fn seq_track_steps_returns_list_value() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            state,
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
 
         let result = runtime.eval_str("(seq-track-steps)").unwrap();
         assert!(matches!(result, Some(Value::List(_))));
+    }
+
+    #[test]
+    fn seq_set_current_track_updates_context_for_following_calls() {
+        let state = Arc::new(SequencerState::new(
+            2,
+            vec![default_empty_effect_chain(), default_empty_effect_chain()],
+        ));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(2),
+                fallback_instrument_descriptors(2),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-set-current-track 2)").unwrap();
+        assert_eq!(result, Some(Value::Number(2.0)));
+
+        let result = runtime.eval_str("(seq-current-track)").unwrap();
+        assert_eq!(result, Some(Value::Number(2.0)));
+
+        let result = runtime.eval_str("(seq-toggle-step 1)").unwrap();
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert!(state.pattern.patterns[1].is_active(0));
+        assert!(!state.pattern.patterns[0].is_active(0));
+    }
+
+    #[test]
+    fn seq_step_on_activates_step_without_toggle_semantics() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-step-on 3)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert!(state.pattern.patterns[0].is_active(2));
+    }
+
+    #[test]
+    fn seq_step_off_clears_payload_and_deactivates_step() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        state.pattern.patterns[0].set_step_active(2, true);
+        state.pattern.step_data[0].set(2, StepParam::Velocity, 0.8);
+        state.pattern.effect_chains[0][0].plocks.set(2, 0, 0.25);
+
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-step-off 3)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert!(!state.pattern.patterns[0].is_active(2));
+        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(2, 0), None);
     }
 
     #[test]
@@ -2353,7 +2755,15 @@ mod tests {
         state.pattern.step_data[0].set(0, StepParam::Transpose, 7.0);
 
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
         let result = runtime.eval_str("(seq-rotate-track 1)").unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
@@ -2365,7 +2775,15 @@ mod tests {
     fn seq_plock_step_sets_step_param() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
 
         let result = runtime.eval_str("(seq-plock-step 2 :velocity 0.7)").unwrap();
 
@@ -2377,7 +2795,15 @@ mod tests {
     fn seq_plock_timebase_sets_timebase_override() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
 
         let result = runtime.eval_str("(seq-plock-timebase 3 :8t)").unwrap();
 
@@ -2386,15 +2812,166 @@ mod tests {
     }
 
     #[test]
-    fn seq_plock_effect_sets_slot_param_override() {
+    fn seq_plock_effect_normalizes_slot_param_override() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+        let effect_descriptors = fallback_effect_descriptors(1);
+        let expected = effect_descriptors[0][0].params[2].denormalize(0.5);
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(effect_descriptors, fallback_instrument_descriptors(1)),
+        );
 
-        let result = runtime.eval_str("(seq-plock-effect 1 1 0 0.25)").unwrap();
+        let result = runtime.eval_str("(seq-plock-effect 1 1 2 0.5)").unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
-        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 0), Some(0.25));
+        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 2), Some(expected));
+    }
+
+    #[test]
+    fn seq_plock_effect_raw_preserves_stored_value() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-plock-effect-raw 1 1 2 440.0)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 2), Some(440.0));
+    }
+
+    #[test]
+    fn seq_effect_param_name_returns_effect_param_name() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-effect-param-name 1 2)").unwrap();
+
+        assert_eq!(result, Some(Value::String("cutoff".to_string())));
+    }
+
+    #[test]
+    fn seq_effect_param_names_returns_effect_param_name_list() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
+
+        let result = runtime.eval_str("(seq-effect-param-names 1)").unwrap();
+
+        match result {
+            Some(Value::List(items)) => {
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|item| match &*item.borrow() {
+                        Value::String(name) => name.clone(),
+                        other => panic!("expected string, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["enabled", "mode", "cutoff", "resonance"]);
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seq_plock_instrument_normalizes_slot_param_override() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let instrument_desc = EffectDescriptor::builtin_delay();
+        state.pattern.instrument_slots[0].apply_descriptor(&instrument_desc, 0);
+        let expected = instrument_desc.params[2].denormalize(0.25);
+
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(fallback_effect_descriptors(1), vec![instrument_desc]),
+        );
+
+        let result = runtime.eval_str("(seq-plock-instrument 1 2 0.25)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert_eq!(state.pattern.instrument_slots[0].plocks.get(0, 2), Some(expected));
+    }
+
+    #[test]
+    fn seq_instrument_param_name_returns_instrument_param_name() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let instrument_desc = EffectDescriptor::builtin_delay();
+        state.pattern.instrument_slots[0].apply_descriptor(&instrument_desc, 0);
+
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(fallback_effect_descriptors(1), vec![instrument_desc]),
+        );
+
+        let result = runtime.eval_str("(seq-instrument-param-name 2)").unwrap();
+
+        assert_eq!(result, Some(Value::String("time".to_string())));
+    }
+
+    #[test]
+    fn seq_instrument_param_names_returns_instrument_param_name_list() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let instrument_desc = EffectDescriptor::builtin_delay();
+        state.pattern.instrument_slots[0].apply_descriptor(&instrument_desc, 0);
+
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(
+            &mut runtime,
+            Arc::clone(&state),
+            new_eval_context(0, 0),
+            shared_native_metadata(fallback_effect_descriptors(1), vec![instrument_desc]),
+        );
+
+        let result = runtime.eval_str("(seq-instrument-param-names)").unwrap();
+
+        match result {
+            Some(Value::List(items)) => {
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|item| match &*item.borrow() {
+                        Value::String(name) => name.clone(),
+                        other => panic!("expected string, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    names,
+                    vec!["wet", "synced", "time", "feedback", "dampening", "width"]
+                );
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2404,14 +2981,22 @@ mod tests {
             .or_else(|_| std::fs::read_to_string("init.lisp"))
             .unwrap_or_default();
         let mut runtime = Runtime::new();
-        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+        register_sequencer_natives(
+            &mut runtime,
+            state,
+            new_eval_context(0, 0),
+            shared_native_metadata(
+                fallback_effect_descriptors(1),
+                fallback_instrument_descriptors(1),
+            ),
+        );
         let mut editor = Editor::new(
             runtime,
             EditorConfig {
                 init_source: Some(init_src),
             },
         );
-        editor.open_scratch_buffer("*scratch*", "(seq-step 1)");
+        editor.open_scratch_buffer_with_mode("*scratch*", "(seq-step 1)", BufferMode::ESeqLisp);
         editor.active_buffer_mut().cursor = (0, "(seq-step 1)".len());
 
         editor.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
@@ -2424,7 +3009,13 @@ mod tests {
     #[test]
     fn scratch_control_runtime_can_invoke_exported_closure() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
-        let mut runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0);
+        let mut runtime = ScratchControlRuntime::new(
+            Arc::clone(&state),
+            fallback_effect_descriptors(2),
+            fallback_instrument_descriptors(2),
+            0,
+            0,
+        );
 
         let callback = runtime
             .eval("(lambda () (seq-toggle-step 1))")
@@ -2443,7 +3034,13 @@ mod tests {
             2,
             vec![default_empty_effect_chain(), default_empty_effect_chain()],
         ));
-        let mut runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0);
+        let mut runtime = ScratchControlRuntime::new(
+            Arc::clone(&state),
+            fallback_effect_descriptors(1),
+            fallback_instrument_descriptors(1),
+            0,
+            0,
+        );
 
         runtime.set_position(1, 0);
         let result = runtime.eval("(seq-toggle-step 1)").unwrap().unwrap();
@@ -2456,7 +3053,15 @@ mod tests {
     #[test]
     fn scratch_runtime_editor_loads_init_bindings_for_eval() {
         let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
-        let runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0).into_runtime();
+        let runtime = ScratchControlRuntime::new(
+            Arc::clone(&state),
+            fallback_effect_descriptors(1),
+            fallback_instrument_descriptors(1),
+            0,
+            0,
+        )
+        .into_parts()
+        .0;
         let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
             .or_else(|_| std::fs::read_to_string("init.lisp"))
             .unwrap_or_default();
@@ -2466,7 +3071,7 @@ mod tests {
                 init_source: Some(init_src),
             },
         );
-        editor.open_scratch_buffer("*scratch*", "(+ 1 1)");
+        editor.open_scratch_buffer_with_mode("*scratch*", "(+ 1 1)", BufferMode::ESeqLisp);
         editor.active_buffer_mut().cursor = (0, "(+ 1 1)".len());
 
         editor.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));

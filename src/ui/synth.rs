@@ -520,6 +520,7 @@ impl App {
         match code {
             KeyCode::Left => {
                 self.ui.params_column = 0;
+                self.ui.track_params_tab = 1;
             }
             KeyCode::Right => {
                 if self.is_current_custom_track() {

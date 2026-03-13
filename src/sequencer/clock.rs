@@ -187,6 +187,7 @@ impl SequencerClock {
                                 track: t,
                                 step,
                                 offset,
+                                cycle_start_beats: tc.boundaries[step],
                             });
                         }
                     }
