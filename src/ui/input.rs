@@ -9,6 +9,7 @@ use crate::lisp_effect;
 use crate::sequencer::{KeyboardTrigger, StepParam, STEPS_PER_PAGE};
 
 use super::browser::BrowserNode;
+use super::cirklon::track_list_row_layout;
 use super::draw::rect_contains;
 use super::{
     App, BrowserState, CompileTarget, EffectTab, InputMode, ParamMouseDrag, ParamMouseDragTarget,
@@ -24,6 +25,8 @@ enum EffectTabHit {
 
 impl App {
     pub fn handle_input(&mut self) -> std::io::Result<()> {
+        self.tick_control_hooks();
+
         if self.editor.pending_project_load.is_some() {
             let result = self.advance_project_load();
             if let Err(error) = result {
@@ -123,16 +126,15 @@ impl App {
                         self.handle_normal(key.code, key.modifiers);
                         return Ok(());
                     }
-                    // Backspace/Delete with visual selection: delete selected steps from any mode
+                    // Backspace/Delete with visual selection: clear all selected steps from any mode
                     if matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
                         && !self.ui.visual_steps.is_empty()
                         && !self.tracks.is_empty()
                     {
                         let track = self.ui.cursor_track;
-                        for step in self.ui.visual_steps.drain() {
-                            if self.state.pattern.patterns[track].is_active(step) {
-                                self.state.toggle_step_and_clear_plocks(track, step);
-                            }
+                        let steps: Vec<usize> = self.ui.visual_steps.drain().collect();
+                        for step in steps {
+                            self.state.clear_step_payload(track, step);
                         }
                         return Ok(());
                     }
@@ -143,6 +145,9 @@ impl App {
                         InputMode::PatternSelect => self.handle_pattern_select(key.code),
                         InputMode::PresetNameEntry => self.handle_preset_name_entry(key.code),
                         InputMode::ProjectNameEntry => self.handle_project_name_entry(key.code),
+                        InputMode::WavExportNameEntry => {
+                            self.handle_wav_export_name_entry(key.code)
+                        }
                         InputMode::EffectPicker => self.handle_effect_picker(key.code),
                         InputMode::InstrumentPicker => {
                             self.handle_instrument_picker_overlay(key.code)
@@ -155,13 +160,14 @@ impl App {
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.handle_mouse_click(mouse.column, mouse.row);
+                        self.handle_mouse_click(mouse.column, mouse.row, mouse.modifiers);
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         self.handle_mouse_drag(mouse.column, mouse.row);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.ui.param_mouse_drag = None;
+                        self.ui.track_drag_anchor = None;
                     }
                     MouseEventKind::ScrollUp => {
                         self.handle_mouse_scroll(mouse.column, mouse.row, -3);
@@ -273,6 +279,12 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Char('g') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.tracks.is_empty() {
+                    self.editor.pending_editor = Some(PendingEditor::Scratch);
+                }
+                return;
+            }
             KeyCode::Tab => {
                 let leaving_sidebar = self.ui.focused_region == Region::Sidebar;
                 self.ui.focused_region = self.ui.focused_region.next();
@@ -306,7 +318,7 @@ impl App {
                 }
                 return;
             }
-            // Ctrl+A: select all active steps (Cirklon) or switch to Audition (Sidebar)
+            // Ctrl+A: select all steps (Cirklon) or switch to Audition (Sidebar)
             KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.ui.focused_region == Region::Sidebar {
                     if !self.tracks.is_empty() {
@@ -314,10 +326,54 @@ impl App {
                     }
                 } else if !self.tracks.is_empty() {
                     self.ui.visual_steps.clear();
+                    self.ui.selection_anchor = None;
                     for step in 0..self.num_steps() {
-                        if self.state.pattern.patterns[self.ui.cursor_track].is_active(step) {
-                            self.ui.visual_steps.insert(step);
+                        self.ui.visual_steps.insert(step);
+                    }
+                }
+                return;
+            }
+            // Ctrl+C: copy selected steps to clipboard
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.tracks.is_empty() && self.ui.focused_region != Region::Sidebar {
+                    let steps = self.selected_steps();
+                    if !steps.is_empty() {
+                        let track = self.ui.cursor_track;
+                        let anchor = steps[0];
+                        let clipboard: Vec<(usize, _)> = steps
+                            .iter()
+                            .map(|&s| (s - anchor, self.state.capture_step_snapshot(track, s)))
+                            .collect();
+                        let count = clipboard.len();
+                        self.ui.step_clipboard = Some(clipboard);
+                        self.editor.status_message = Some((
+                            format!("Copied {} step{}", count, if count == 1 { "" } else { "s" }),
+                            Instant::now(),
+                        ));
+                    }
+                }
+                return;
+            }
+            // Ctrl+V: paste clipboard at cursor
+            KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.tracks.is_empty() && self.ui.focused_region != Region::Sidebar {
+                    if let Some(clipboard) = self.ui.step_clipboard.take() {
+                        let track = self.ui.cursor_track;
+                        let dest_start = self.ui.cursor_step;
+                        let ns = self.num_steps();
+                        for (offset, snap) in &clipboard {
+                            let dest = dest_start + offset;
+                            if dest >= ns {
+                                continue;
+                            }
+                            // Skip pasting an empty step over an existing active step
+                            if !snap.active && self.state.pattern.patterns[track].is_active(dest) {
+                                continue;
+                            }
+                            self.state.restore_step_snapshot(track, dest, snap);
                         }
+                        // Put clipboard back so it can be pasted again
+                        self.ui.step_clipboard = Some(clipboard);
                     }
                 }
                 return;
@@ -490,7 +546,7 @@ impl App {
         }
     }
 
-    fn handle_mouse_click(&mut self, col: u16, row: u16) {
+    fn handle_mouse_click(&mut self, col: u16, row: u16, modifiers: KeyModifiers) {
         self.ui.param_mouse_drag = None;
         match self.ui.input_mode {
             // Allow mouse through in Normal and step modes
@@ -571,6 +627,11 @@ impl App {
             return;
         }
 
+        if rect_contains(l.master_rec_button, col, row) {
+            self.toggle_master_recording();
+            return;
+        }
+
         // Pattern buttons (row 1 of info bar)
         if rect_contains(l.pattern_buttons_area, col, row) {
             use super::PatternBtn;
@@ -595,7 +656,7 @@ impl App {
                                 &self.graph.track_instrument_types,
                             ) {
                                 self.graph_controller().apply_sample_ids(&sample_ids);
-                                self.push_all_restored_instrument_defaults();
+                                self.push_all_restored_defaults();
                             }
                             self.clamp_cursor_to_steps();
                         }
@@ -619,7 +680,7 @@ impl App {
                                 &self.graph.track_instrument_types,
                             ) {
                                 self.graph_controller().apply_sample_ids(&sample_ids);
-                                self.push_all_restored_instrument_defaults();
+                                self.push_all_restored_defaults();
                             }
                             self.clamp_cursor_to_steps();
                             // Adjust page if current page is now past the end
@@ -641,12 +702,62 @@ impl App {
         if rect_contains(l.track_list, col, row) {
             let idx = (row - l.track_list.y) as usize;
             if idx < self.tracks.len() {
-                let dot_start = l.track_list.x + l.track_list.width.saturating_sub(6);
-                if col >= dot_start {
-                    self.ui.cursor_track = idx;
+                let layout = track_list_row_layout(l.track_list);
+                let shift_select = modifiers.contains(KeyModifiers::SHIFT);
+                let previous_track = self.ui.cursor_track;
+                self.ui.cursor_track = idx;
+                let arm_hit_left = layout.arm_x.saturating_sub(1);
+                let arm_hit_right = layout.arm_x + 2;
+                if col >= arm_hit_left && col < arm_hit_right {
                     self.graph.record_armed[idx] = !self.graph.record_armed[idx];
                     self.ui.focused_region = Region::Cirklon;
+                } else if col >= layout.volume_x && col < layout.volume_x + layout.volume_width {
+                    let inner_width = layout.volume_inner_width.max(1);
+                    let clamped_col = col.clamp(
+                        layout.volume_inner_x,
+                        layout.volume_inner_x + inner_width - 1,
+                    );
+                    let rel = clamped_col - layout.volume_inner_x;
+                    let volume = if inner_width <= 1 {
+                        0.0
+                    } else {
+                        rel as f32 / (inner_width - 1) as f32
+                    };
+                    let apply_bulk = self.has_track_selection() && {
+                        let (lo, hi) = self.track_selected_range();
+                        idx >= lo && idx <= hi
+                    };
+                    if apply_bulk {
+                        self.for_each_selected_track(|app, track| {
+                            app.state.pattern.track_params[track].set_volume(volume);
+                            app.push_track_volume(track);
+                        });
+                    } else {
+                        self.ui.track_selection_anchor = None;
+                        self.state.pattern.track_params[idx].set_volume(volume);
+                        self.push_track_volume(idx);
+                    }
+                    self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                        track: idx,
+                        target: ParamMouseDragTarget::TrackListVolume,
+                        start_col: col,
+                        start_display_value: volume,
+                    });
+                    self.ui.focused_region = Region::Cirklon;
                 } else {
+                    let drag_anchor = if shift_select {
+                        self.ui.track_selection_anchor.unwrap_or(previous_track)
+                    } else {
+                        idx
+                    };
+                    self.ui.track_drag_anchor = Some(drag_anchor);
+                    if shift_select {
+                        if self.ui.track_selection_anchor.is_none() && !self.tracks.is_empty() {
+                            self.ui.track_selection_anchor = Some(previous_track);
+                        }
+                    } else {
+                        self.ui.track_selection_anchor = None;
+                    }
                     self.ui.cursor_track = idx;
                     self.clamp_cursor_to_steps();
                     self.ui.focused_region = Region::Cirklon;
@@ -688,39 +799,83 @@ impl App {
             return;
         }
 
+        // Track params title row: click on Track / Accum tab labels
+        let track_params_title_row = l.track_params_inner.y.saturating_sub(1);
+        if row == track_params_title_row
+            && col >= l.track_params_inner.x
+            && col < l.track_params_inner.x + l.track_params_inner.width
+        {
+            let x_rel = col - l.track_params_inner.x;
+            // "[< Track >]" = 11 chars at offset 0, " " at 11, "[< Accum >]" = 11 chars at offset 12
+            if x_rel < 11 {
+                self.ui.track_params_tab = 0;
+                self.ui.focused_region = Region::Params;
+                self.ui.params_column = 0;
+            } else if x_rel >= 12 && x_rel < 23 {
+                self.ui.track_params_tab = 1;
+                self.ui.focused_region = Region::Params;
+                self.ui.params_column = 0;
+            }
+            return;
+        }
+
         // Track params inner: click selects param row
         if rect_contains(l.track_params_inner, col, row) {
             let row_idx = (row - l.track_params_inner.y) as usize;
-            if row_idx <= super::TP_LAST {
-                self.ui.focused_region = Region::Params;
-                self.ui.params_column = 0;
-                self.ui.track_param_cursor = row_idx;
-                let start_display_value = match row_idx {
-                    super::TP_ATTACK => {
-                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_attack_ms())
+            self.ui.focused_region = Region::Params;
+            self.ui.params_column = 0;
+            if self.ui.track_params_tab == 1 {
+                // Accum tab
+                if row_idx <= super::AC_LAST {
+                    self.ui.accum_cursor = row_idx;
+                    if row_idx == super::AC_LIMIT {
+                        let start_display_value =
+                            self.state.pattern.track_params[self.ui.cursor_track].get_accum_limit();
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::AccumParam { row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
                     }
-                    super::TP_RELEASE => {
-                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_release_ms())
+                }
+            } else {
+                // Track tab
+                if row_idx <= super::TP_LAST {
+                    self.ui.track_param_cursor = row_idx;
+                    let start_display_value = match row_idx {
+                        super::TP_ATTACK => Some(
+                            self.state.pattern.track_params[self.ui.cursor_track].get_attack_ms(),
+                        ),
+                        super::TP_RELEASE => Some(
+                            self.state.pattern.track_params[self.ui.cursor_track].get_release_ms(),
+                        ),
+                        super::TP_SWING => {
+                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_swing())
+                        }
+                        super::TP_STEPS => Some(
+                            self.state.pattern.track_params[self.ui.cursor_track].get_num_steps()
+                                as f32,
+                        ),
+                        super::TP_VOLUME => {
+                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_volume())
+                        }
+                        super::TP_SEND => {
+                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_send())
+                        }
+                        super::TP_MASTER => Some(f32::from_bits(
+                            self.state.transport.master_volume.load(Ordering::Relaxed),
+                        )),
+                        _ => None,
+                    };
+                    if let Some(start_display_value) = start_display_value {
+                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                            track: self.ui.cursor_track,
+                            target: ParamMouseDragTarget::TrackParam { row_idx },
+                            start_col: col,
+                            start_display_value,
+                        });
                     }
-                    super::TP_SWING => {
-                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_swing())
-                    }
-                    super::TP_STEPS => Some(
-                        self.state.pattern.track_params[self.ui.cursor_track].get_num_steps()
-                            as f32,
-                    ),
-                    super::TP_SEND => {
-                        Some(self.state.pattern.track_params[self.ui.cursor_track].get_send())
-                    }
-                    _ => None,
-                };
-                if let Some(start_display_value) = start_display_value {
-                    self.ui.param_mouse_drag = Some(ParamMouseDrag {
-                        track: self.ui.cursor_track,
-                        target: ParamMouseDragTarget::TrackParam { row_idx },
-                        start_col: col,
-                        start_display_value,
-                    });
                 }
             }
             return;
@@ -1045,9 +1200,32 @@ impl App {
         }
     }
 
-    fn handle_mouse_drag(&mut self, col: u16, _row: u16) {
+    fn handle_mouse_drag(&mut self, col: u16, row: u16) {
         if self.ui.param_mouse_drag.is_some() {
             self.apply_param_mouse_drag(col);
+            return;
+        }
+        if let Some(anchor) = self.ui.track_drag_anchor {
+            let track_list = self.ui.layout.track_list;
+            if rect_contains(track_list, col, row) {
+                let idx = (row - track_list.y) as usize;
+                if idx < self.tracks.len() {
+                    self.ui.cursor_track = idx;
+                    if idx == anchor {
+                        self.ui.track_selection_anchor = None;
+                    } else {
+                        self.ui.track_selection_anchor = Some(anchor);
+                    }
+                    self.clamp_cursor_to_steps();
+                    self.ui.focused_region = Region::Cirklon;
+                    self.browser.sync_to_track(
+                        &self.tracks,
+                        self.ui.cursor_track,
+                        self.is_sampler_track(self.ui.cursor_track),
+                        &self.ui,
+                    );
+                }
+            }
         }
     }
 
@@ -1202,27 +1380,65 @@ impl App {
 
         match self.ui.focused_region {
             Region::Cirklon => {
-                let sd = &self.state.pattern.step_data[self.ui.cursor_track];
                 for step in self.selected_steps() {
-                    sd.set(step, self.ui.active_param, val);
+                    self.state.set_step_param(
+                        self.ui.cursor_track,
+                        step,
+                        self.ui.active_param,
+                        val,
+                    );
                 }
             }
             Region::Params => {
                 if self.ui.params_column == 0 {
-                    let tp = &self.state.pattern.track_params[self.ui.cursor_track];
-                    match self.ui.track_param_cursor {
-                        super::TP_ATTACK => tp.set_attack_ms(val),
-                        super::TP_RELEASE => tp.set_release_ms(val),
-                        super::TP_SWING => tp.set_swing(val),
-                        super::TP_STEPS => {
-                            tp.set_num_steps(val as usize);
-                            self.clamp_cursor_to_steps();
+                    if self.ui.track_params_tab == 1 {
+                        // Accum tab value entry
+                        if self.ui.accum_cursor == super::AC_LIMIT {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_accum_limit(val.max(0.0));
+                            });
                         }
-                        super::TP_SEND => {
-                            tp.set_send(val.clamp(0.0, 1.0));
-                            self.push_send_gain(self.ui.cursor_track);
+                    } else {
+                        match self.ui.track_param_cursor {
+                            super::TP_ATTACK => self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_attack_ms(val);
+                            }),
+                            super::TP_RELEASE => self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_release_ms(val);
+                            }),
+                            super::TP_SWING => self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_swing(val);
+                            }),
+                            super::TP_STEPS => {
+                                self.for_each_selected_track(|app, track| {
+                                    app.state.pattern.track_params[track]
+                                        .set_num_steps(val as usize);
+                                });
+                                self.clamp_cursor_to_steps();
+                            }
+                            super::TP_VOLUME => {
+                                self.for_each_selected_track(|app, track| {
+                                    app.state.pattern.track_params[track]
+                                        .set_volume(val.clamp(0.0, 1.0));
+                                    app.push_track_volume(track);
+                                });
+                            }
+                            super::TP_SEND => {
+                                self.for_each_selected_track(|app, track| {
+                                    app.state.pattern.track_params[track]
+                                        .set_send(val.clamp(0.0, 1.0));
+                                    app.push_send_gain(track);
+                                });
+                            }
+                            super::TP_MASTER => {
+                                self.state
+                                    .transport
+                                    .master_volume
+                                    .store(val.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+                                self.push_master_volume();
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 } else if self.ui.effect_tab == EffectTab::Reverb {
                     self.set_reverb_param(self.ui.reverb_param_cursor, val);
@@ -1312,7 +1528,16 @@ impl App {
                     }
                     let slot = &chain[slot_idx];
 
-                    if self.has_selection() {
+                    if matches!(
+                        param_desc.host_control,
+                        Some(crate::effects::HostControl::FxSidechain { .. })
+                    ) {
+                        let selection = store_val.round().max(0.0) as usize;
+                        self.apply_effect_sidechain_selection(
+                            track, slot_idx, param_idx, selection,
+                        );
+                        slot.defaults.set(param_idx, selection as f32);
+                    } else if self.has_selection() {
                         for step in self.selected_steps() {
                             slot.plocks.set(step, param_idx, store_val);
                         }
@@ -1330,10 +1555,9 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
-        let sd = &self.state.pattern.step_data[self.ui.cursor_track];
         for step in self.selected_steps() {
-            let cur = sd.get(step, self.ui.active_param);
-            sd.set(step, self.ui.active_param, cur + delta);
+            self.state
+                .adjust_step_param(self.ui.cursor_track, step, self.ui.active_param, delta);
         }
     }
 
@@ -1382,7 +1606,7 @@ impl App {
                     &self.graph.track_instrument_types,
                 ) {
                     self.graph_controller().apply_sample_ids(&sample_ids);
-                    self.push_all_restored_instrument_defaults();
+                    self.push_all_restored_defaults();
                 }
                 self.clamp_cursor_to_steps();
                 self.ui.value_buffer.clear();
@@ -1413,7 +1637,7 @@ impl App {
                                 &self.graph.track_instrument_types,
                             ) {
                                 self.graph_controller().apply_sample_ids(&sample_ids);
-                                self.push_all_restored_instrument_defaults();
+                                self.push_all_restored_defaults();
                             }
                             self.clamp_cursor_to_steps();
                         }

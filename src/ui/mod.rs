@@ -1,13 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::EffectDescriptor;
-use crate::lisp_effect::{DGenManifest, LoadedDGenLib};
+use crate::lisp_effect::{DGenManifest, LoadedDGenLib, ScratchControlRuntime};
+use crate::recorder::{MasterRecorder, RecordingTake};
 use crate::sequencer::{
-    InstrumentType, KeyboardTrigger, SequencerState, StepParam, STEPS_PER_PAGE,
+    InstrumentType, KeyboardTrigger, SequencerState, StepParam, StepSnapshot, STEPS_PER_PAGE,
 };
 
 mod browser;
@@ -17,9 +18,11 @@ mod effect_params;
 mod effects;
 mod effects_draw;
 mod graph;
+mod hooks;
 mod input;
 mod params;
 mod projects;
+mod recording;
 mod synth;
 
 pub use browser::BrowserNode;
@@ -51,11 +54,21 @@ const TP_GATE: usize = 0;
 const TP_ATTACK: usize = 1;
 const TP_RELEASE: usize = 2;
 const TP_SWING: usize = 3;
-const TP_STEPS: usize = 4;
-const TP_TIMEBASE: usize = 5;
-const TP_SEND: usize = 6;
-const TP_POLY: usize = 7;
-const TP_LAST: usize = TP_POLY;
+const TP_SWING_RESOLUTION: usize = 4;
+const TP_STEPS: usize = 5;
+const TP_VOLUME: usize = 6;
+const TP_TIMEBASE: usize = 7;
+const TP_SEND: usize = 8;
+const TP_MASTER: usize = 9;
+const TP_POLY: usize = 10;
+const TP_FTS: usize = 11;
+const TP_LAST: usize = TP_FTS;
+
+// Accumulator tab cursor indices
+const AC_FN: usize = 0;
+const AC_LIMIT: usize = 1;
+const AC_MODE: usize = 2;
+const AC_LAST: usize = AC_MODE;
 
 enum PendingEditor {
     Effect {
@@ -65,6 +78,7 @@ enum PendingEditor {
     Instrument {
         name: Option<String>,
     },
+    Scratch,
 }
 
 enum CompileTarget {
@@ -76,6 +90,36 @@ enum CompileTarget {
     Instrument {
         name: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HookUnit {
+    Step,
+    Beat,
+    Bar,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum HookCallback {
+    Source(String),
+    Global(String),
+}
+
+#[derive(Clone, Debug)]
+struct SequencerHook {
+    id: u64,
+    unit: HookUnit,
+    interval: u64,
+    track: usize,
+    callback: HookCallback,
+}
+
+#[derive(Clone, Debug)]
+struct PendingHookInvocation {
+    hook_id: u64,
+    track: usize,
+    step_16th: u64,
+    code: String,
 }
 
 struct PendingCompile {
@@ -145,6 +189,8 @@ pub struct EngineNodeIds {
 #[derive(Clone, Copy)]
 pub enum ParamMouseDragTarget {
     TrackParam { row_idx: usize },
+    TrackListVolume,
+    AccumParam { row_idx: usize },
     SynthParam { row_idx: usize },
     ModParam { row_idx: usize },
     SourceParam { row_idx: usize },
@@ -171,6 +217,14 @@ pub struct EditorState {
     pub picker_items: Vec<String>,
     pub status_message: Option<(String, Instant)>,
     pub engine_registry: EngineRegistry,
+    pub scratch_buffer: String,
+    pub scratch_cursor: (usize, usize),
+    pub scratch_runtime: Option<ScratchControlRuntime>,
+    hooks: Vec<SequencerHook>,
+    pending_hook_invocations: VecDeque<PendingHookInvocation>,
+    next_hook_id: u64,
+    next_hook_callback_id: u64,
+    last_hook_step_16th: Option<u64>,
 }
 
 pub struct BrowserState {
@@ -215,6 +269,7 @@ pub enum InputMode {
     PatternSelect,
     PresetNameEntry,
     ProjectNameEntry,
+    WavExportNameEntry,
     EffectPicker,
     InstrumentPicker,
     ProjectPicker,
@@ -273,6 +328,7 @@ pub struct LayoutRects {
     pub effects_block: ratatui::prelude::Rect,
     pub info_bar: ratatui::prelude::Rect,
     pub rec_button: ratatui::prelude::Rect,
+    pub master_rec_button: ratatui::prelude::Rect,
     pub pattern_buttons_area: ratatui::prelude::Rect,
     pub page_blocks_area: ratatui::prelude::Rect,
     pub sidebar_inner: ratatui::prelude::Rect,
@@ -305,12 +361,16 @@ pub struct UiState {
     pub input_mode: InputMode,
     pub value_buffer: String,
     pub selection_anchor: Option<usize>,
+    pub track_selection_anchor: Option<usize>,
+    pub track_drag_anchor: Option<usize>,
     pub visual_steps: HashSet<usize>,
     pub should_quit: bool,
     pub focused_region: Region,
     pub sidebar_mode: SidebarMode,
     pub params_column: usize,
+    pub track_params_tab: usize,
     pub track_param_cursor: usize,
+    pub accum_cursor: usize,
     pub effect_tab: EffectTab,
     pub effect_param_cursor: usize,
     pub dropdown_open: bool,
@@ -345,6 +405,9 @@ pub struct UiState {
     pub source_scroll_offset: usize,
     pub preset_prompt_kind: PresetPromptKind,
     pub param_mouse_drag: Option<ParamMouseDrag>,
+    /// Step clipboard: list of (relative offset from anchor, snapshot) pairs.
+    pub step_clipboard: Option<Vec<(usize, StepSnapshot)>>,
+    pub master_recording: bool,
 }
 
 pub struct App {
@@ -358,6 +421,8 @@ pub struct App {
     pub browser: BrowserState,
     pub preset_browser: PresetBrowserState,
     pub graph: GraphState,
+    pub master_recorder: Arc<MasterRecorder>,
+    pub pending_recording_take: Option<RecordingTake>,
 }
 
 impl App {
@@ -366,6 +431,7 @@ impl App {
         lg: LiveGraphPtr,
         sample_rate: u32,
         buses: AudioBuses,
+        master_recorder: Arc<MasterRecorder>,
         keyboard_tx: std::sync::mpsc::Sender<KeyboardTrigger>,
     ) -> Self {
         let has_tracks = state.active_track_count() > 0;
@@ -395,12 +461,16 @@ impl App {
                 input_mode: InputMode::Normal,
                 value_buffer: String::new(),
                 selection_anchor: None,
+                track_selection_anchor: None,
+                track_drag_anchor: None,
                 visual_steps: HashSet::new(),
                 should_quit: false,
                 focused_region,
                 sidebar_mode,
                 params_column: 0,
+                track_params_tab: 0,
                 track_param_cursor: 0,
+                accum_cursor: 0,
                 effect_tab: EffectTab::Slot(0),
                 effect_param_cursor: 0,
                 dropdown_open: false,
@@ -435,6 +505,8 @@ impl App {
                 source_scroll_offset: 0,
                 preset_prompt_kind: PresetPromptKind::SaveNew,
                 param_mouse_drag: None,
+                step_clipboard: None,
+                master_recording: false,
             },
             editor: EditorState {
                 pending_editor: None,
@@ -447,6 +519,14 @@ impl App {
                 picker_items: Vec::new(),
                 status_message: None,
                 engine_registry: EngineRegistry::default(),
+                scratch_buffer: String::new(),
+                scratch_cursor: (0, 0),
+                scratch_runtime: None,
+                hooks: Vec::new(),
+                pending_hook_invocations: VecDeque::new(),
+                next_hook_id: 1,
+                next_hook_callback_id: 1,
+                last_hook_step_16th: None,
             },
             browser: BrowserState {
                 tree: browser_tree,
@@ -459,6 +539,8 @@ impl App {
                 filter: String::new(),
                 scroll_offset: 0,
             },
+            master_recorder,
+            pending_recording_take: None,
             graph: GraphState {
                 lg,
                 track_node_ids: Vec::new(),
@@ -495,6 +577,26 @@ impl App {
 
     fn has_selection(&self) -> bool {
         self.ui.selection_anchor.is_some() || !self.ui.visual_steps.is_empty()
+    }
+
+    fn track_selected_range(&self) -> (usize, usize) {
+        match self.ui.track_selection_anchor {
+            Some(anchor) => {
+                let lo = anchor.min(self.ui.cursor_track);
+                let hi = anchor.max(self.ui.cursor_track);
+                (lo, hi)
+            }
+            None => (self.ui.cursor_track, self.ui.cursor_track),
+        }
+    }
+
+    fn has_track_selection(&self) -> bool {
+        self.ui.track_selection_anchor.is_some()
+    }
+
+    fn selected_tracks(&self) -> Vec<usize> {
+        let (lo, hi) = self.track_selected_range();
+        (lo..=hi).collect()
     }
 
     pub(super) fn effective_sidebar_mode(&self) -> SidebarMode {

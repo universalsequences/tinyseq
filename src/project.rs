@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::effects::EffectSlotSnapshot;
 use crate::sequencer::{
-    ChordSnapshot, InstrumentType, PatternSnapshot, Timebase, TrackParamsSnapshot, TrackSoundState,
-    NUM_PARAMS, TRACK_PATTERN_WORDS,
+    ChordSnapshot, InstrumentType, PatternSnapshot, SwingResolution, Timebase, TrackParamsSnapshot,
+    TrackSoundState, NUM_PARAMS, TRACK_PATTERN_WORDS,
 };
 
 const PROJECTS_DIR: &str = "projects";
@@ -16,11 +16,25 @@ pub struct ProjectFile {
     pub version: u32,
     pub name: String,
     pub bpm: u32,
+    #[serde(default = "default_master_volume")]
+    pub master_volume: f32,
     pub current_pattern: usize,
     pub reverb: ProjectReverbState,
     pub tracks: Vec<ProjectTrack>,
     pub custom_effects: Vec<Vec<Option<String>>>,
+    #[serde(default)]
+    pub scratch: ProjectScratchState,
     pub patterns: Vec<ProjectPattern>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ProjectScratchState {
+    #[serde(default)]
+    pub buffer: String,
+    #[serde(default)]
+    pub cursor_row: usize,
+    #[serde(default)]
+    pub cursor_col: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -39,7 +53,6 @@ pub enum ProjectTrack {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProjectPattern {
-    #[serde(deserialize_with = "deserialize_track_bits")]
     pub track_bits: Vec<[u64; TRACK_PATTERN_WORDS]>,
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<ProjectTrackParams>,
@@ -60,10 +73,22 @@ pub struct ProjectTrackParams {
     pub attack_ms: f32,
     pub release_ms: f32,
     pub swing: f32,
+    #[serde(default = "default_swing_resolution")]
+    pub swing_resolution: u8,
     pub num_steps: usize,
+    #[serde(default = "default_track_volume")]
+    pub volume: f32,
     pub send: f32,
     pub polyphonic: bool,
     pub timebase: u8,
+    #[serde(default)]
+    pub accumulator_idx: usize,
+    #[serde(default = "default_accum_limit")]
+    pub accum_limit: f32,
+    #[serde(default)]
+    pub accum_mode: u32,
+    #[serde(default)]
+    pub fts_scale: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -148,10 +173,16 @@ impl From<TrackParamsSnapshot> for ProjectTrackParams {
             attack_ms: value.attack_ms,
             release_ms: value.release_ms,
             swing: value.swing,
+            swing_resolution: value.swing_resolution as u8,
             num_steps: value.num_steps,
+            volume: value.volume,
             send: value.send,
             polyphonic: value.polyphonic,
             timebase: value.timebase as u8,
+            accumulator_idx: value.accumulator_idx,
+            accum_limit: value.accum_limit,
+            accum_mode: value.accum_mode,
+            fts_scale: value.fts_scale,
         }
     }
 }
@@ -163,10 +194,16 @@ impl From<ProjectTrackParams> for TrackParamsSnapshot {
             attack_ms: value.attack_ms,
             release_ms: value.release_ms,
             swing: value.swing,
+            swing_resolution: SwingResolution::from_index(value.swing_resolution as u32),
             num_steps: value.num_steps,
+            volume: value.volume,
             send: value.send,
             polyphonic: value.polyphonic,
             timebase: Timebase::from_index(value.timebase as u32),
+            accumulator_idx: value.accumulator_idx,
+            accum_limit: value.accum_limit,
+            accum_mode: value.accum_mode,
+            fts_scale: value.fts_scale,
         }
     }
 }
@@ -303,32 +340,149 @@ pub fn project_file_version() -> u32 {
     PROJECT_FILE_VERSION
 }
 
+fn default_accum_limit() -> f32 {
+    48.0
+}
+
+fn default_track_volume() -> f32 {
+    1.0
+}
+
+fn default_swing_resolution() -> u8 {
+    SwingResolution::Sixteenth as u8
+}
+
+fn default_master_volume() -> f32 {
+    1.0
+}
+
 pub fn chord_snapshot_from_steps(steps: Vec<Vec<f32>>) -> ChordSnapshot {
     ChordSnapshot { steps }
 }
 
-fn deserialize_track_bits<'de, D>(
-    deserializer: D,
-) -> Result<Vec<[u64; TRACK_PATTERN_WORDS]>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum TrackBitsRepr {
-        Legacy(Vec<u64>),
-        Current(Vec<[u64; TRACK_PATTERN_WORDS]>),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_project() -> ProjectFile {
+        ProjectFile {
+            version: project_file_version(),
+            name: "roundtrip".to_string(),
+            bpm: 120,
+            master_volume: 1.0,
+            current_pattern: 1,
+            reverb: ProjectReverbState {
+                size: 0.2,
+                brightness: 0.8,
+                replace: 0.3,
+            },
+            tracks: vec![
+                ProjectTrack::Custom {
+                    instrument_name: "prophet-5".to_string(),
+                },
+                ProjectTrack::Sampler {
+                    sample_path: "samples/drums/kick.wav".to_string(),
+                },
+            ],
+            custom_effects: vec![vec![Some("widener".to_string()), None], vec![None, None]],
+            scratch: ProjectScratchState {
+                buffer: "(+ 1 2)".to_string(),
+                cursor_row: 3,
+                cursor_col: 7,
+            },
+            patterns: vec![ProjectPattern {
+                track_bits: vec![[0b1011, 0, 0, 0], [0b0101, 1, 0, 0]],
+                step_data: vec![vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; 256]; 2],
+                track_params: vec![
+                    ProjectTrackParams {
+                        gate: true,
+                        attack_ms: 0.0,
+                        release_ms: 10.0,
+                        swing: 50.0,
+                        swing_resolution: SwingResolution::Sixteenth as u8,
+                        num_steps: 64,
+                        volume: 0.8,
+                        send: 0.25,
+                        polyphonic: true,
+                        timebase: Timebase::Sixteenth as u8,
+                        accumulator_idx: 1,
+                        accum_limit: 24.0,
+                        accum_mode: 2,
+                        fts_scale: 0,
+                    },
+                    ProjectTrackParams {
+                        gate: false,
+                        attack_ms: 5.0,
+                        release_ms: 25.0,
+                        swing: 55.0,
+                        swing_resolution: SwingResolution::Quarter as u8,
+                        num_steps: 128,
+                        volume: 1.1,
+                        send: 0.5,
+                        polyphonic: false,
+                        timebase: Timebase::Eighth as u8,
+                        accumulator_idx: 0,
+                        accum_limit: 48.0,
+                        accum_mode: 0,
+                        fts_scale: 0,
+                    },
+                ],
+                effect_slots: vec![vec![], vec![]],
+                instrument_slots: vec![
+                    ProjectEffectSlot {
+                        num_params: 2,
+                        defaults: vec![0.1, 0.2],
+                        plocks: vec![vec![None, Some(0.8)]; 256],
+                        param_node_indices: vec![0, 1],
+                    },
+                    ProjectEffectSlot {
+                        num_params: 0,
+                        defaults: vec![],
+                        plocks: vec![vec![]; 256],
+                        param_node_indices: vec![],
+                    },
+                ],
+                instrument_base_note_offsets: vec![0.0, 12.0],
+                track_sound_states: vec![
+                    ProjectTrackSoundState {
+                        loaded_preset: Some("lead".to_string()),
+                        dirty: false,
+                    },
+                    ProjectTrackSoundState {
+                        loaded_preset: None,
+                        dirty: true,
+                    },
+                ],
+                chord_snapshots: vec![vec![Vec::new(); 256], vec![Vec::new(); 256]],
+                timebase_plock_snapshots: vec![vec![None; 256], vec![None; 256]],
+                instrument_types: vec![
+                    ProjectInstrumentType::Custom,
+                    ProjectInstrumentType::Sampler,
+                ],
+                sample_paths: vec![None, Some("samples/drums/kick.wav".to_string())],
+                sample_names: vec!["prophet-5".to_string(), "kick".to_string()],
+            }],
+        }
     }
 
-    match TrackBitsRepr::deserialize(deserializer)? {
-        TrackBitsRepr::Current(bits) => Ok(bits),
-        TrackBitsRepr::Legacy(bits) => Ok(bits
-            .into_iter()
-            .map(|word| {
-                let mut words = [0u64; TRACK_PATTERN_WORDS];
-                words[0] = word;
-                words
-            })
-            .collect()),
+    #[test]
+    fn current_project_format_roundtrips() {
+        let project = sample_project();
+        let json = serde_json::to_string(&project).expect("serialize current project");
+        let restored: ProjectFile =
+            serde_json::from_str(&json).expect("deserialize current project");
+
+        assert_eq!(restored.name, project.name);
+        assert_eq!(restored.scratch.buffer, project.scratch.buffer);
+        assert_eq!(restored.scratch.cursor_row, project.scratch.cursor_row);
+        assert_eq!(restored.scratch.cursor_col, project.scratch.cursor_col);
+        assert_eq!(restored.patterns.len(), 1);
+        assert_eq!(restored.patterns[0].track_bits[0], [0b1011, 0, 0, 0]);
+        assert_eq!(restored.patterns[0].track_bits[1], [0b0101, 1, 0, 0]);
+        assert_eq!(restored.patterns[0].step_data[0].len(), 256);
+        assert_eq!(restored.patterns[0].timebase_plock_snapshots[0].len(), 256);
+        assert_eq!(restored.patterns[0].track_params[0].accumulator_idx, 1);
+        assert_eq!(restored.patterns[0].track_params[0].accum_limit, 24.0);
+        assert_eq!(restored.patterns[0].track_params[0].accum_mode, 2);
     }
 }

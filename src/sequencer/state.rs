@@ -11,18 +11,18 @@ use super::data::{
 };
 
 #[derive(Clone)]
-struct StepSlotPlocks {
-    params: Vec<Option<f32>>,
+pub struct StepSlotPlocks {
+    pub params: Vec<Option<f32>>,
 }
 
 #[derive(Clone)]
-struct StepSnapshot {
-    active: bool,
-    params: [f32; NUM_PARAMS],
-    chord: Vec<f32>,
-    timebase: Option<Timebase>,
-    effect_plocks: Vec<StepSlotPlocks>,
-    instrument_plocks: StepSlotPlocks,
+pub struct StepSnapshot {
+    pub active: bool,
+    pub params: [f32; NUM_PARAMS],
+    pub chord: Vec<f32>,
+    pub timebase: Option<Timebase>,
+    pub effect_plocks: Vec<StepSlotPlocks>,
+    pub instrument_plocks: StepSlotPlocks,
 }
 
 #[derive(Clone)]
@@ -80,10 +80,16 @@ impl PatternSnapshot {
                 attack_ms: tp.get_attack_ms(),
                 release_ms: tp.get_release_ms(),
                 swing: tp.get_swing(),
+                swing_resolution: tp.get_swing_resolution(),
                 num_steps: tp.get_num_steps(),
+                volume: tp.get_volume(),
                 send: tp.get_send(),
                 polyphonic: tp.is_polyphonic(),
                 timebase: tp.get_timebase(),
+                accumulator_idx: tp.get_accumulator_idx(),
+                accum_limit: tp.get_accum_limit(),
+                accum_mode: tp.get_accum_mode(),
+                fts_scale: tp.get_fts_scale(),
             });
 
             let chain: Vec<EffectSlotSnapshot> = state.pattern.effect_chains[t]
@@ -159,10 +165,16 @@ impl PatternSnapshot {
             tp.set_attack_ms(snap.attack_ms);
             tp.set_release_ms(snap.release_ms);
             tp.set_swing(snap.swing);
+            tp.set_swing_resolution(snap.swing_resolution);
             tp.set_num_steps(snap.num_steps);
+            tp.set_volume(snap.volume);
             tp.set_send(snap.send);
             tp.polyphonic.store(snap.polyphonic, Ordering::Relaxed);
             tp.set_timebase(snap.timebase);
+            tp.set_accumulator_idx(snap.accumulator_idx);
+            tp.set_accum_limit(snap.accum_limit);
+            tp.set_accum_mode(snap.accum_mode);
+            tp.set_fts_scale(snap.fts_scale);
 
             for (slot_idx, slot_snap) in self.effect_slots[t].iter().enumerate() {
                 if slot_idx < state.pattern.effect_chains[t].len() {
@@ -272,6 +284,22 @@ impl PatternSnapshot {
             self.push_default_track(t, slot_descriptors);
         }
     }
+
+    pub fn sync_effect_slot(
+        &mut self,
+        track: usize,
+        slot_idx: usize,
+        desc: &EffectDescriptor,
+        node_id: u32,
+    ) {
+        while self.effect_slots.len() <= track {
+            self.push_default_track(track, &[]);
+        }
+        while self.effect_slots[track].len() <= slot_idx {
+            self.effect_slots[track].push(EffectSlotSnapshot::new_empty());
+        }
+        self.effect_slots[track][slot_idx].sync_to_descriptor(desc, node_id);
+    }
 }
 
 pub fn default_empty_effect_chain() -> Vec<EffectSlotState> {
@@ -306,6 +334,7 @@ pub struct TransportState {
     pub playhead: AtomicU32,
     pub playing: AtomicBool,
     pub bpm: AtomicU32,
+    pub master_volume: AtomicU32,
     pub mod_reset_counter: AtomicU32,
     pub pending_mod_resync: AtomicBool,
     pub peak_l: AtomicU32,
@@ -386,6 +415,7 @@ impl SequencerState {
                 playhead: AtomicU32::new(0),
                 playing: AtomicBool::new(false),
                 bpm: AtomicU32::new(DEFAULT_BPM),
+                master_volume: AtomicU32::new(1.0_f32.to_bits()),
                 mod_reset_counter: AtomicU32::new(0),
                 pending_mod_resync: AtomicBool::new(false),
                 peak_l: AtomicU32::new(0.0_f32.to_bits()),
@@ -535,7 +565,7 @@ impl SequencerState {
         }
     }
 
-    fn capture_step_snapshot(&self, track: usize, step: usize) -> StepSnapshot {
+    pub fn capture_step_snapshot(&self, track: usize, step: usize) -> StepSnapshot {
         let mut params = [0.0; NUM_PARAMS];
         for param in StepParam::ALL {
             params[param.index()] = self.pattern.step_data[track].get(step, param);
@@ -576,7 +606,7 @@ impl SequencerState {
         }
     }
 
-    fn clear_step_payload(&self, track: usize, step: usize) {
+    pub fn clear_step_payload(&self, track: usize, step: usize) {
         for param in StepParam::ALL {
             self.pattern.step_data[track].set(step, param, param.default_value());
         }
@@ -597,7 +627,41 @@ impl SequencerState {
         }
     }
 
-    fn restore_step_snapshot(&self, track: usize, step: usize, snapshot: &StepSnapshot) {
+    pub fn set_step_param(&self, track: usize, step: usize, param: StepParam, value: f32) {
+        let previous = self.pattern.step_data[track].get(step, param);
+        self.pattern.step_data[track].set(step, param, value);
+
+        if param != StepParam::Transpose {
+            return;
+        }
+
+        let applied = self.pattern.step_data[track].get(step, param);
+        let delta = applied - previous;
+        if delta == 0.0 {
+            return;
+        }
+
+        let chord_count = self.pattern.chord_data[track].count(step);
+        if chord_count == 0 {
+            return;
+        }
+
+        let mut notes = Vec::with_capacity(chord_count);
+        for note_idx in 0..chord_count {
+            notes.push(self.pattern.chord_data[track].get(step, note_idx) + delta);
+        }
+        self.pattern.chord_data[track].clear_step(step);
+        for transpose in notes {
+            self.pattern.chord_data[track].add_note(step, transpose);
+        }
+    }
+
+    pub fn adjust_step_param(&self, track: usize, step: usize, param: StepParam, delta: f32) {
+        let current = self.pattern.step_data[track].get(step, param);
+        self.set_step_param(track, step, param, current + delta);
+    }
+
+    pub fn restore_step_snapshot(&self, track: usize, step: usize, snapshot: &StepSnapshot) {
         for param in StepParam::ALL {
             self.pattern.step_data[track].set(step, param, snapshot.params[param.index()]);
         }
@@ -642,6 +706,32 @@ impl SequencerState {
                 Some(val) => instrument_slot.plocks.set(step, param_idx, val),
                 None => instrument_slot.plocks.clear_param(step, param_idx),
             }
+        }
+    }
+
+    /// Cyclically rotate `steps` (sorted) left (direction < 0) or right (direction > 0).
+    pub fn rotate_steps(&self, track: usize, steps: &[usize], direction: isize) {
+        if steps.len() < 2 {
+            return;
+        }
+        let snapshots: Vec<_> = steps
+            .iter()
+            .map(|&s| self.capture_step_snapshot(track, s))
+            .collect();
+        let n = steps.len();
+        for (i, &step) in steps.iter().enumerate() {
+            let src = if direction > 0 {
+                // Rotate right: slot i gets content from slot i-1 (last wraps to first)
+                if i == 0 {
+                    n - 1
+                } else {
+                    i - 1
+                }
+            } else {
+                // Rotate left: slot i gets content from slot i+1 (first wraps to last)
+                (i + 1) % n
+            };
+            self.restore_step_snapshot(track, step, &snapshots[src]);
         }
     }
 
@@ -812,5 +902,334 @@ mod tests {
             state.pattern.instrument_slots[0].plocks.get(3, 0),
             Some(0.25)
         );
+    }
+
+    fn make_state_with_instrument() -> SequencerState {
+        let state = SequencerState::new(
+            1,
+            vec![vec![EffectSlotState::new(
+                &EffectDescriptor::builtin_filter(),
+                1,
+            )]],
+        );
+        state.pattern.track_params[0].set_num_steps(8);
+        state.pattern.instrument_slots[0].apply_descriptor(&EffectDescriptor::builtin_delay(), 2);
+        state
+    }
+
+    fn populate_step(state: &SequencerState, track: usize, step: usize) {
+        state.pattern.patterns[track].set_step_active(step, true);
+        state.pattern.step_data[track].set(step, StepParam::Velocity, 0.75);
+        state.pattern.step_data[track].set(step, StepParam::Transpose, 7.0);
+        state.pattern.chord_data[track].add_note(step, 0.0);
+        state.pattern.chord_data[track].add_note(step, 4.0);
+        state.pattern.timebase_plocks[track].set(step, Timebase::Eighth);
+        state.pattern.effect_chains[track][0]
+            .plocks
+            .set(step, 0, 440.0);
+        state.pattern.instrument_slots[track]
+            .plocks
+            .set(step, 0, 0.5);
+    }
+
+    fn assert_step_matches_populated(state: &SequencerState, track: usize, step: usize) {
+        assert!(
+            state.pattern.patterns[track].is_active(step),
+            "step {step} should be active"
+        );
+        assert_eq!(
+            state.pattern.step_data[track].get(step, StepParam::Velocity),
+            0.75
+        );
+        assert_eq!(
+            state.pattern.step_data[track].get(step, StepParam::Transpose),
+            7.0
+        );
+        assert_eq!(state.pattern.chord_data[track].count(step), 2);
+        assert_eq!(state.pattern.chord_data[track].get(step, 0), 0.0);
+        assert_eq!(state.pattern.chord_data[track].get(step, 1), 4.0);
+        assert_eq!(
+            state.pattern.timebase_plocks[track].get(step),
+            Some(Timebase::Eighth)
+        );
+        assert_eq!(
+            state.pattern.effect_chains[track][0].plocks.get(step, 0),
+            Some(440.0)
+        );
+        assert_eq!(
+            state.pattern.instrument_slots[track].plocks.get(step, 0),
+            Some(0.5)
+        );
+    }
+
+    fn assert_step_is_default(state: &SequencerState, track: usize, step: usize) {
+        assert!(
+            !state.pattern.patterns[track].is_active(step),
+            "step {step} should be inactive"
+        );
+        assert_eq!(
+            state.pattern.step_data[track].get(step, StepParam::Velocity),
+            StepParam::Velocity.default_value()
+        );
+        assert_eq!(state.pattern.chord_data[track].count(step), 0);
+        assert_eq!(state.pattern.timebase_plocks[track].get(step), None);
+        assert_eq!(
+            state.pattern.effect_chains[track][0].plocks.get(step, 0),
+            None
+        );
+        assert_eq!(
+            state.pattern.instrument_slots[track].plocks.get(step, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn set_step_param_transpose_shifts_chord_notes() {
+        let state = make_state_with_instrument();
+        let track = 0;
+        let step = 2;
+
+        state.pattern.step_data[track].set(step, StepParam::Transpose, 7.0);
+        state.pattern.chord_data[track].add_note(step, 0.0);
+        state.pattern.chord_data[track].add_note(step, 4.0);
+
+        state.set_step_param(track, step, StepParam::Transpose, 10.0);
+
+        assert_eq!(
+            state.pattern.step_data[track].get(step, StepParam::Transpose),
+            10.0
+        );
+        assert_eq!(state.pattern.chord_data[track].count(step), 2);
+        assert_eq!(state.pattern.chord_data[track].get(step, 0), 3.0);
+        assert_eq!(state.pattern.chord_data[track].get(step, 1), 7.0);
+    }
+
+    #[test]
+    fn adjust_step_param_transpose_shifts_chord_notes() {
+        let state = make_state_with_instrument();
+        let track = 0;
+        let step = 2;
+
+        state.pattern.step_data[track].set(step, StepParam::Transpose, 7.0);
+        state.pattern.chord_data[track].add_note(step, 0.0);
+        state.pattern.chord_data[track].add_note(step, 4.0);
+
+        state.adjust_step_param(track, step, StepParam::Transpose, -2.0);
+
+        assert_eq!(
+            state.pattern.step_data[track].get(step, StepParam::Transpose),
+            5.0
+        );
+        assert_eq!(state.pattern.chord_data[track].count(step), 2);
+        assert_eq!(state.pattern.chord_data[track].get(step, 0), -2.0);
+        assert_eq!(state.pattern.chord_data[track].get(step, 1), 2.0);
+    }
+
+    // ── copy / paste (capture_step_snapshot + restore_step_snapshot) ──
+
+    #[test]
+    fn copy_paste_preserves_all_fields() {
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 2);
+
+        let snap = state.capture_step_snapshot(0, 2);
+        state.restore_step_snapshot(0, 5, &snap);
+
+        assert_step_matches_populated(&state, 0, 5);
+        // Source step is unchanged
+        assert_step_matches_populated(&state, 0, 2);
+    }
+
+    #[test]
+    fn copy_paste_multi_step_with_offsets() {
+        // Simulates Ctrl+C on steps 1,2 then Ctrl+V at step 4.
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 1);
+        state.pattern.patterns[0].set_step_active(2, true);
+        state.pattern.step_data[0].set(2, StepParam::Velocity, 0.3);
+
+        let anchor = 1usize;
+        let clipboard: Vec<(usize, StepSnapshot)> = [1usize, 2]
+            .iter()
+            .map(|&s| (s - anchor, state.capture_step_snapshot(0, s)))
+            .collect();
+
+        let dest_start = 4usize;
+        for (offset, snap) in &clipboard {
+            state.restore_step_snapshot(0, dest_start + offset, snap);
+        }
+
+        // Step 4 (offset 0) should match original step 1
+        assert_step_matches_populated(&state, 0, 4);
+        // Step 5 (offset 1) should match original step 2
+        assert!(state.pattern.patterns[0].is_active(5));
+        assert_eq!(state.pattern.step_data[0].get(5, StepParam::Velocity), 0.3);
+    }
+
+    #[test]
+    fn paste_inactive_snapshot_over_active_step_preserves_existing() {
+        // An "empty" snapshot must not overwrite an active step.
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 3);
+
+        let empty_snap = state.capture_step_snapshot(0, 7); // step 7 is default/inactive
+        assert!(!empty_snap.active);
+
+        // Simulate the paste guard from Ctrl+V: skip if snapshot inactive and dest active
+        let dest = 3usize;
+        if !empty_snap.active && state.pattern.patterns[0].is_active(dest) {
+            // correctly skipped
+        } else {
+            state.restore_step_snapshot(0, dest, &empty_snap);
+            panic!("should not overwrite active step with empty snapshot");
+        }
+
+        assert_step_matches_populated(&state, 0, 3);
+    }
+
+    #[test]
+    fn paste_active_snapshot_over_empty_step_writes_data() {
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 1);
+
+        let snap = state.capture_step_snapshot(0, 1);
+        assert!(snap.active);
+
+        // Dest step 5 is empty — paste guard should allow the write
+        let dest = 5usize;
+        assert!(!state.pattern.patterns[0].is_active(dest));
+        // Guard passes (snap.active == true), so we restore
+        state.restore_step_snapshot(0, dest, &snap);
+
+        assert_step_matches_populated(&state, 0, 5);
+    }
+
+    #[test]
+    fn paste_out_of_bounds_offsets_are_skipped() {
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 0);
+        let ns = state.pattern.track_params[0].get_num_steps(); // 8
+
+        let snap = state.capture_step_snapshot(0, 0);
+        // dest_start=6, offsets 0..4 → destinations 6,7,8,9; 8 and 9 exceed ns
+        let dest_start = 6usize;
+        for offset in 0..4 {
+            let dest = dest_start + offset;
+            if dest >= ns {
+                continue; // bounds guard — no write, no panic
+            }
+            state.restore_step_snapshot(0, dest, &snap);
+        }
+
+        assert!(state.pattern.patterns[0].is_active(6));
+        assert!(state.pattern.patterns[0].is_active(7));
+    }
+
+    // ── rotate_steps ──
+
+    #[test]
+    fn rotate_steps_left_wraps_first_to_last() {
+        // A B C _ at steps 0,1,2,3  →  B C _ A
+        let state = make_state_with_instrument();
+        state.pattern.patterns[0].set_step_active(0, true);
+        state.pattern.step_data[0].set(0, StepParam::Transpose, 1.0);
+        state.pattern.patterns[0].set_step_active(1, true);
+        state.pattern.step_data[0].set(1, StepParam::Transpose, 2.0);
+        state.pattern.patterns[0].set_step_active(2, true);
+        state.pattern.step_data[0].set(2, StepParam::Transpose, 3.0);
+        // step 3 stays empty
+
+        state.rotate_steps(0, &[0, 1, 2, 3], -1);
+
+        assert!(state.pattern.patterns[0].is_active(0));
+        assert_eq!(state.pattern.step_data[0].get(0, StepParam::Transpose), 2.0);
+        assert!(state.pattern.patterns[0].is_active(1));
+        assert_eq!(state.pattern.step_data[0].get(1, StepParam::Transpose), 3.0);
+        assert!(!state.pattern.patterns[0].is_active(2)); // formerly empty step 3
+        assert!(state.pattern.patterns[0].is_active(3));
+        assert_eq!(state.pattern.step_data[0].get(3, StepParam::Transpose), 1.0);
+    }
+
+    #[test]
+    fn rotate_steps_right_wraps_last_to_first() {
+        // A B C _ at steps 0,1,2,3  →  _ A B C
+        let state = make_state_with_instrument();
+        state.pattern.patterns[0].set_step_active(0, true);
+        state.pattern.step_data[0].set(0, StepParam::Transpose, 1.0);
+        state.pattern.patterns[0].set_step_active(1, true);
+        state.pattern.step_data[0].set(1, StepParam::Transpose, 2.0);
+        state.pattern.patterns[0].set_step_active(2, true);
+        state.pattern.step_data[0].set(2, StepParam::Transpose, 3.0);
+        // step 3 stays empty
+
+        state.rotate_steps(0, &[0, 1, 2, 3], 1);
+
+        assert!(!state.pattern.patterns[0].is_active(0)); // formerly empty step 3
+        assert!(state.pattern.patterns[0].is_active(1));
+        assert_eq!(state.pattern.step_data[0].get(1, StepParam::Transpose), 1.0);
+        assert!(state.pattern.patterns[0].is_active(2));
+        assert_eq!(state.pattern.step_data[0].get(2, StepParam::Transpose), 2.0);
+        assert!(state.pattern.patterns[0].is_active(3));
+        assert_eq!(state.pattern.step_data[0].get(3, StepParam::Transpose), 3.0);
+    }
+
+    #[test]
+    fn rotate_steps_preserves_plocks_and_chords() {
+        // step 0 has full data; step 1 is empty. Rotate left: step 1 gets step 0's data.
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 0);
+
+        state.rotate_steps(0, &[0, 1], -1);
+
+        assert_step_is_default(&state, 0, 0);
+        assert_step_matches_populated(&state, 0, 1);
+    }
+
+    #[test]
+    fn rotate_steps_two_left_equals_rotate_by_two() {
+        // A B C → (left) → B C A → (left) → C A B
+        let state = make_state_with_instrument();
+        state.pattern.patterns[0].set_step_active(0, true);
+        state.pattern.step_data[0].set(0, StepParam::Transpose, 10.0);
+        state.pattern.patterns[0].set_step_active(1, true);
+        state.pattern.step_data[0].set(1, StepParam::Transpose, 20.0);
+        state.pattern.patterns[0].set_step_active(2, true);
+        state.pattern.step_data[0].set(2, StepParam::Transpose, 30.0);
+
+        state.rotate_steps(0, &[0, 1, 2], -1);
+        state.rotate_steps(0, &[0, 1, 2], -1);
+
+        assert_eq!(
+            state.pattern.step_data[0].get(0, StepParam::Transpose),
+            30.0
+        );
+        assert_eq!(
+            state.pattern.step_data[0].get(1, StepParam::Transpose),
+            10.0
+        );
+        assert_eq!(
+            state.pattern.step_data[0].get(2, StepParam::Transpose),
+            20.0
+        );
+    }
+
+    // ── clear_step_payload ──
+
+    #[test]
+    fn clear_step_payload_removes_all_data_including_plocks() {
+        let state = make_state_with_instrument();
+        populate_step(&state, 0, 3);
+
+        state.clear_step_payload(0, 3);
+
+        assert_step_is_default(&state, 0, 3);
+    }
+
+    #[test]
+    fn clear_step_payload_on_inactive_step_is_safe() {
+        let state = make_state_with_instrument();
+        // step 4 was never populated — clearing it should not panic
+        state.clear_step_payload(0, 4);
+        assert_step_is_default(&state, 0, 4);
     }
 }

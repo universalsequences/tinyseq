@@ -6,7 +6,7 @@ use crossterm::event::KeyCode;
 
 use crate::effects::BUILTIN_SLOT_COUNT;
 use crate::project::{
-    self, chord_snapshot_from_steps, project_file_version, ProjectFile, ProjectPattern,
+    self, ProjectScratchState, chord_snapshot_from_steps, project_file_version, ProjectFile, ProjectPattern,
     ProjectReverbState, ProjectTrack,
 };
 use crate::sequencer::{InstrumentType, PatternSnapshot, MAX_STEPS};
@@ -215,6 +215,9 @@ impl App {
             version: project_file_version(),
             name: project_name.to_string(),
             bpm: self.state.transport.bpm.load(Ordering::Relaxed),
+            master_volume: f32::from_bits(
+                self.state.transport.master_volume.load(Ordering::Relaxed),
+            ),
             current_pattern,
             reverb: ProjectReverbState {
                 size: self.ui.reverb_size,
@@ -223,6 +226,11 @@ impl App {
             },
             tracks,
             custom_effects,
+            scratch: ProjectScratchState {
+                buffer: self.editor.scratch_buffer.clone(),
+                cursor_row: self.editor.scratch_cursor.0,
+                cursor_col: self.editor.scratch_cursor.1,
+            },
             patterns,
         })
     }
@@ -412,8 +420,10 @@ impl App {
             version: _,
             name: _,
             bpm,
+            master_volume,
             current_pattern: saved_current_pattern,
             reverb,
+            scratch,
             tracks: _,
             custom_effects: _,
             patterns: _,
@@ -442,6 +452,10 @@ impl App {
             .current_pattern
             .store(current_pattern as u32, Ordering::Relaxed);
         self.state.transport.bpm.store(bpm, Ordering::Relaxed);
+        self.state
+            .transport
+            .master_volume
+            .store(master_volume.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
 
         self.ui.cursor_track = 0;
         self.ui.cursor_step = 0;
@@ -480,6 +494,10 @@ impl App {
         }
 
         self.current_project_name = Some(pending.name.clone());
+        self.editor.scratch_buffer = scratch.buffer;
+        self.editor.scratch_cursor = (scratch.cursor_row, scratch.cursor_col);
+        self.editor.scratch_runtime = None;
+        self.clear_control_hooks();
         let status = if pending.fallback_samples > 0 {
             format!(
                 "Opened project '{}' with {} fallback sample{}",
@@ -664,18 +682,35 @@ impl App {
     }
 
     pub(super) fn push_all_restored_defaults(&self) {
+        self.push_master_volume();
         for track_idx in 0..self.tracks.len() {
+            self.push_track_volume(track_idx);
             self.push_send_gain(track_idx);
             for slot_idx in 0..self.state.pattern.effect_chains[track_idx].len() {
                 let slot = &self.state.pattern.effect_chains[track_idx][slot_idx];
                 let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
                 for param_idx in 0..num_params {
-                    self.send_slot_param(
-                        track_idx,
-                        slot_idx,
-                        param_idx,
-                        slot.defaults.get(param_idx),
-                    );
+                    let value = slot.defaults.get(param_idx);
+                    let host_control = self
+                        .graph
+                        .effect_descriptors
+                        .get(track_idx)
+                        .and_then(|slots| slots.get(slot_idx))
+                        .and_then(|desc| desc.params.get(param_idx))
+                        .and_then(|param| param.host_control.as_ref());
+                    if matches!(
+                        host_control,
+                        Some(crate::effects::HostControl::FxSidechain { .. })
+                    ) {
+                        self.apply_effect_sidechain_selection(
+                            track_idx,
+                            slot_idx,
+                            param_idx,
+                            value.round().max(0.0) as usize,
+                        );
+                    } else {
+                        self.send_slot_param(track_idx, slot_idx, param_idx, value);
+                    }
                 }
             }
         }

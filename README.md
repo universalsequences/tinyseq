@@ -11,6 +11,7 @@ A terminal-based step sequencer for sample playback, built in Rust with a lock-f
 - **Per-step parameter locks** (p-locks) for duration, velocity, transpose, chop, and two aux sends
 - **Multi-pattern bank** with clone, delete, and instant switching
 - **Per-track effects chain**: built-in filter and delay, plus custom DSP effects written in a Lisp dialect (DGenLisp) that hot-compile into the audio graph
+- **Embedded control Lisp via `eseqlisp`** for scratch scripting, hook-based pattern automation, and in-app instrument/effect editing
 - **Global reverb bus** with per-track send levels
 - **Polyphonic voice pool** with chord recording
 - **Keyboard playing and recording** with quantized step input
@@ -162,6 +163,20 @@ The audio runs through a C-based lock-free graph engine (`audiograph/`) that sup
 ## Custom effects
 
 tinyseq supports custom DSP effects written in DGenLisp, a Lisp dialect that compiles to native shared libraries. Place `.dgenlisp` source files in the `effects/` directory and load them via **Ctrl+L**. Effects are hot-compiled in a background thread and patched into the audio graph on completion.
+
+## `eseqlisp` integration
+
+tinyseq now embeds [`eseqlisp`](https://github.com/universalsequences/eseqlisp) for control scripting and editing.
+
+- Custom instrument/effect editing runs inside the terminal UI instead of shelling out to `vim`
+- `Ctrl+G` opens a fullscreen scratch buffer for live sequencer scripting
+- Scratch can query and mutate pattern data, register timed hooks, and is saved with project files
+- Project load restores scratch text and cursor position, but does not auto-run saved scratch code or hooks
+
+`eseqlisp` is intentionally separate from DGenLisp:
+
+- **DGenLisp** is the DSP/instrument/effect language
+- **eseqlisp** is the control/UI/agent language
 
 ## Dependencies
 

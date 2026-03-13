@@ -2,11 +2,21 @@ use std::ffi::{CStr, CString};
 use std::io::{self, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
+use eseqlisp::tui as eseq_tui;
+use eseqlisp::vm::Value as EValue;
+use eseqlisp::{CompileKind, Editor, EditorConfig, HostCommand, HostEvent, Runtime};
 use serde::{Deserialize, Serialize};
 
 use crate::audiograph::{self, LiveGraph, NodeVTable};
+use crate::sequencer::{StepParam, StepSnapshot, Timebase};
 
 /// Monotonic counter so each compile produces a unique dylib filename,
 /// preventing dlopen from returning a stale cached handle.
@@ -596,7 +606,7 @@ pub struct LispEditResult {
     pub node_id: i32,
     pub lib: LoadedDGenLib,
     pub source: String,
-    pub params: Vec<DGenParam>,
+    pub manifest: DGenManifest,
     pub name: String,
 }
 
@@ -709,12 +719,11 @@ pub fn run_editor_flow(
                                         println!("Press Enter to return to sequencer...");
                                         let mut buf = String::new();
                                         std::io::stdin().read_line(&mut buf).ok();
-                                        let params = manifest.params.clone();
                                         return Some(LispEditResult {
                                             node_id,
                                             lib,
                                             source,
-                                            params,
+                                            manifest,
                                             name,
                                         });
                                     }
@@ -1106,6 +1115,1100 @@ pub struct InstrumentEditResult {
     pub name: String,
 }
 
+pub struct EffectEditResult {
+    pub manifest: DGenManifest,
+    pub lib: LoadedDGenLib,
+    pub source: String,
+    pub name: String,
+}
+
+struct PendingCompileJob {
+    receiver: std::sync::mpsc::Receiver<Result<CompileResult, String>>,
+    kind: CompileKind,
+    name: String,
+    source: String,
+}
+
+#[derive(Clone)]
+struct LiveAppliedCompile {
+    kind: CompileKind,
+    name: String,
+    source: String,
+}
+
+struct RestoreTerminalGuard;
+
+impl Drop for RestoreTerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+fn editor_file_path(kind: CompileKind, existing_name: Option<&str>) -> PathBuf {
+    let (dir, name) = match kind {
+        CompileKind::Instrument => (INSTRUMENTS_DIR, existing_name.unwrap_or("untitled")),
+        CompileKind::Effect => (EFFECTS_DIR, existing_name.unwrap_or("untitled")),
+    };
+    Path::new(dir).join(format!("{name}.lisp"))
+}
+
+fn default_template_for_kind(kind: &CompileKind) -> &'static str {
+    match kind {
+        CompileKind::Instrument => INSTRUMENT_TEMPLATE,
+        CompileKind::Effect => TEMPLATE,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SequencerEvalContext {
+    track: usize,
+    cursor_step: usize,
+}
+
+type SharedSequencerEvalContext = Arc<Mutex<SequencerEvalContext>>;
+
+pub struct ScratchControlRuntime {
+    runtime: Runtime,
+    context: SharedSequencerEvalContext,
+}
+
+impl ScratchControlRuntime {
+    pub fn new(
+        state: Arc<crate::sequencer::SequencerState>,
+        track: usize,
+        cursor_step: usize,
+    ) -> Self {
+        let context = Arc::new(Mutex::new(SequencerEvalContext { track, cursor_step }));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, state, Arc::clone(&context));
+        Self { runtime, context }
+    }
+
+    pub fn set_position(&mut self, track: usize, cursor_step: usize) {
+        if let Ok(mut ctx) = self.context.lock() {
+            ctx.track = track;
+            ctx.cursor_step = cursor_step;
+        }
+    }
+
+    pub fn eval(&mut self, code: &str) -> Result<Option<EValue>, String> {
+        self.runtime.eval_str(code).map_err(|e| format!("{e:?}"))
+    }
+
+    pub fn take_status_message(&mut self) -> Option<String> {
+        self.runtime.take_status_message()
+    }
+
+    pub fn set_global_value(&mut self, name: &str, value: EValue) {
+        self.runtime.set_global_value(name, value);
+    }
+
+    pub fn into_runtime(self) -> Runtime {
+        self.runtime
+    }
+
+    pub fn from_runtime(runtime: Runtime, track: usize, cursor_step: usize) -> Self {
+        let context = Arc::new(Mutex::new(SequencerEvalContext { track, cursor_step }));
+        Self { runtime, context }
+    }
+}
+
+fn register_sequencer_natives(
+    runtime: &mut Runtime,
+    state: Arc<crate::sequencer::SequencerState>,
+    context: SharedSequencerEvalContext,
+) {
+    let current_track = |ctx: &SharedSequencerEvalContext| {
+        ctx.lock().map(|guard| guard.track).unwrap_or(0)
+    };
+    let current_step = |ctx: &SharedSequencerEvalContext| {
+        ctx.lock().map(|guard| guard.cursor_step).unwrap_or(0)
+    };
+
+    let context_for_track = Arc::clone(&context);
+    runtime.register_native("seq-current-track", move |_args, _ctx| {
+        Ok(EValue::Number((current_track(&context_for_track) + 1) as f64))
+    });
+
+    let context_for_step = Arc::clone(&context);
+    runtime.register_native("seq-current-step", move |_args, _ctx| {
+        Ok(EValue::Number((current_step(&context_for_step) + 1) as f64))
+    });
+
+    let state_for_steps = Arc::clone(&state);
+    let context_for_steps = Arc::clone(&context);
+    runtime.register_native("seq-num-steps", move |_args, _ctx| {
+        let track = current_track(&context_for_steps);
+        Ok(EValue::Number(
+            state_for_steps.pattern.track_params[track].get_num_steps() as f64,
+        ))
+    });
+
+    let state_for_toggle = Arc::clone(&state);
+    let context_for_toggle = Arc::clone(&context);
+    runtime.register_native("seq-toggle-step", move |args, ctx| {
+        let track_idx = current_track(&context_for_toggle);
+        let step_idx = parse_step_arg(&args, 0)?;
+        state_for_toggle.toggle_step_and_clear_plocks(track_idx, step_idx);
+        let active = state_for_toggle.pattern.patterns[track_idx].is_active(step_idx);
+        ctx.set_status(format!(
+            "track {} step {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            if active { "on" } else { "off" }
+        ));
+        Ok(EValue::Bool(active))
+    });
+
+    let state_for_clear_step = Arc::clone(&state);
+    let context_for_clear_step = Arc::clone(&context);
+    runtime.register_native("seq-clear-step", move |args, ctx| {
+        let track_idx = current_track(&context_for_clear_step);
+        let step_idx = parse_step_arg(&args, 0)?;
+        state_for_clear_step.clear_step_payload(track_idx, step_idx);
+        ctx.set_status(format!("track {} step {} cleared", track_idx + 1, step_idx + 1));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_clear_track = Arc::clone(&state);
+    let context_for_clear_track = Arc::clone(&context);
+    runtime.register_native("seq-clear-track", move |_args, ctx| {
+        let track_idx = current_track(&context_for_clear_track);
+        let num_steps = state_for_clear_track.pattern.track_params[track_idx].get_num_steps();
+        for step in 0..num_steps {
+            state_for_clear_track.clear_step_payload(track_idx, step);
+        }
+        ctx.set_status(format!("track {} cleared", track_idx + 1));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_velocity = Arc::clone(&state);
+    let context_for_velocity = Arc::clone(&context);
+    runtime.register_native("seq-set-velocity", move |args, ctx| {
+        let track_idx = current_track(&context_for_velocity);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let Some(EValue::Number(value)) = args.get(1) else {
+            return Err("expected velocity value".to_string());
+        };
+        state_for_velocity.set_step_param(track_idx, step_idx, StepParam::Velocity, *value as f32);
+        ctx.set_status(format!("track {} step {} velocity {}", track_idx + 1, step_idx + 1, value));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_transpose = Arc::clone(&state);
+    let context_for_transpose = Arc::clone(&context);
+    runtime.register_native("seq-set-transpose", move |args, ctx| {
+        let track_idx = current_track(&context_for_transpose);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let Some(EValue::Number(value)) = args.get(1) else {
+            return Err("expected transpose value".to_string());
+        };
+        state_for_transpose.set_step_param(track_idx, step_idx, StepParam::Transpose, *value as f32);
+        ctx.set_status(format!(
+            "track {} step {} transpose {}",
+            track_idx + 1,
+            step_idx + 1,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_adjust = Arc::clone(&state);
+    let context_for_adjust = Arc::clone(&context);
+    runtime.register_native("seq-adjust-transpose", move |args, ctx| {
+        let track_idx = current_track(&context_for_adjust);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let Some(EValue::Number(value)) = args.get(1) else {
+            return Err("expected transpose delta".to_string());
+        };
+        state_for_adjust.adjust_step_param(track_idx, step_idx, StepParam::Transpose, *value as f32);
+        ctx.set_status(format!(
+            "track {} step {} transpose adjusted by {}",
+            track_idx + 1,
+            step_idx + 1,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_step = Arc::clone(&state);
+    let context_for_step_native = Arc::clone(&context);
+    runtime.register_native("seq-step", move |args, _ctx| {
+        let track_idx = current_track(&context_for_step_native);
+        let step_idx = parse_step_arg(&args, 0)?;
+        Ok(step_snapshot_to_value(
+            step_idx,
+            state_for_step.capture_step_snapshot(track_idx, step_idx),
+        ))
+    });
+
+    let state_for_track_steps = Arc::clone(&state);
+    let context_for_track_steps = Arc::clone(&context);
+    runtime.register_native("seq-track-steps", move |_args, _ctx| {
+        let track_idx = current_track(&context_for_track_steps);
+        let num_steps = state_for_track_steps.pattern.track_params[track_idx].get_num_steps();
+        let mut steps = Vec::with_capacity(num_steps);
+        for step_idx in 0..num_steps {
+            steps.push(step_snapshot_to_value(
+                step_idx,
+                state_for_track_steps.capture_step_snapshot(track_idx, step_idx),
+            ));
+        }
+        Ok(lisp_list(steps))
+    });
+
+    let state_for_rotate = Arc::clone(&state);
+    let context_for_rotate = Arc::clone(&context);
+    runtime.register_native("seq-rotate-track", move |args, ctx| {
+        let track_idx = current_track(&context_for_rotate);
+        let Some(EValue::Number(direction)) = args.first() else {
+            return Err("expected rotation direction".to_string());
+        };
+        let num_steps = state_for_rotate.pattern.track_params[track_idx].get_num_steps();
+        let steps: Vec<usize> = (0..num_steps).collect();
+        state_for_rotate.rotate_steps(track_idx, &steps, *direction as isize);
+        ctx.set_status(format!("track {} rotated by {}", track_idx + 1, *direction as isize));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_step_plock = Arc::clone(&state);
+    let context_for_step_plock = Arc::clone(&context);
+    runtime.register_native("seq-plock-step", move |args, ctx| {
+        let track_idx = current_track(&context_for_step_plock);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let param = parse_step_param_arg(&args, 1)?;
+        let value = parse_value_arg(&args, 2, "step param")?;
+        state_for_step_plock.set_step_param(track_idx, step_idx, param, value);
+        ctx.set_status(format!(
+            "track {} step {} {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            param.short_label(),
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_timebase_plock = Arc::clone(&state);
+    let context_for_timebase_plock = Arc::clone(&context);
+    runtime.register_native("seq-plock-timebase", move |args, ctx| {
+        let track_idx = current_track(&context_for_timebase_plock);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let timebase = parse_timebase_arg(&args, 1)?;
+        state_for_timebase_plock.pattern.timebase_plocks[track_idx].set(step_idx, timebase);
+        ctx.set_status(format!(
+            "track {} step {} timebase {}",
+            track_idx + 1,
+            step_idx + 1,
+            timebase.label()
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_effect_plock = Arc::clone(&state);
+    let context_for_effect_plock = Arc::clone(&context);
+    runtime.register_native("seq-plock-effect", move |args, ctx| {
+        let track_idx = current_track(&context_for_effect_plock);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let slot_idx = parse_slot_arg(&args, 1)?;
+        let param_idx = parse_param_index_arg(&args, 2)?;
+        let value = parse_value_arg(&args, 3, "effect p-lock")?;
+        let Some(slot) = state_for_effect_plock.pattern.effect_chains[track_idx].get(slot_idx) else {
+            return Err("effect slot out of range".to_string());
+        };
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        if param_idx >= num_params {
+            return Err("effect param index out of range".to_string());
+        }
+        slot.plocks.set(step_idx, param_idx, value);
+        ctx.set_status(format!(
+            "track {} step {} effect {} param {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            slot_idx + 1,
+            param_idx,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+
+    let state_for_instrument_plock = Arc::clone(&state);
+    let context_for_instrument_plock = Arc::clone(&context);
+    runtime.register_native("seq-plock-instrument", move |args, ctx| {
+        let track_idx = current_track(&context_for_instrument_plock);
+        let step_idx = parse_step_arg(&args, 0)?;
+        let param_idx = parse_param_index_arg(&args, 1)?;
+        let value = parse_value_arg(&args, 2, "instrument p-lock")?;
+        let slot = &state_for_instrument_plock.pattern.instrument_slots[track_idx];
+        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+        if param_idx >= num_params {
+            return Err("instrument param index out of range".to_string());
+        }
+        slot.plocks.set(step_idx, param_idx, value);
+        ctx.set_status(format!(
+            "track {} step {} instrument param {} {}",
+            track_idx + 1,
+            step_idx + 1,
+            param_idx,
+            value
+        ));
+        Ok(EValue::Bool(true))
+    });
+}
+
+fn parse_step_arg(args: &[EValue], idx: usize) -> Result<usize, String> {
+    let Some(EValue::Number(step)) = args.get(idx) else {
+        return Err("expected 1-based step number".to_string());
+    };
+    let step = *step as isize;
+    if step <= 0 {
+        return Err("steps are 1-based".to_string());
+    }
+    Ok((step - 1) as usize)
+}
+
+fn parse_slot_arg(args: &[EValue], idx: usize) -> Result<usize, String> {
+    let Some(EValue::Number(slot)) = args.get(idx) else {
+        return Err("expected 1-based slot number".to_string());
+    };
+    let slot = *slot as isize;
+    if slot <= 0 {
+        return Err("slots are 1-based".to_string());
+    }
+    Ok((slot - 1) as usize)
+}
+
+fn parse_param_index_arg(args: &[EValue], idx: usize) -> Result<usize, String> {
+    let Some(EValue::Number(param_idx)) = args.get(idx) else {
+        return Err("expected 0-based parameter index".to_string());
+    };
+    if *param_idx < 0.0 {
+        return Err("parameter index must be >= 0".to_string());
+    }
+    Ok(*param_idx as usize)
+}
+
+fn parse_value_arg(args: &[EValue], idx: usize, label: &str) -> Result<f32, String> {
+    let Some(EValue::Number(value)) = args.get(idx) else {
+        return Err(format!("expected {label} value"));
+    };
+    Ok(*value as f32)
+}
+
+fn parse_step_param_arg(args: &[EValue], idx: usize) -> Result<StepParam, String> {
+    let Some(value) = args.get(idx) else {
+        return Err("expected step param".to_string());
+    };
+    match value {
+        EValue::Keyword(name) | EValue::String(name) => {
+            let normalized = name.to_ascii_lowercase();
+            match normalized.as_str() {
+                "duration" | "dur" => Ok(StepParam::Duration),
+                "velocity" | "vel" => Ok(StepParam::Velocity),
+                "speed" | "spd" => Ok(StepParam::Speed),
+                "auxa" | "aux-a" | "aux_a" | "axa" => Ok(StepParam::AuxA),
+                "auxb" | "aux-b" | "aux_b" | "axb" => Ok(StepParam::AuxB),
+                "transpose" | "trn" => Ok(StepParam::Transpose),
+                "chop" | "chp" => Ok(StepParam::Chop),
+                "sync" | "syn" => Ok(StepParam::Sync),
+                _ => Err("unknown step param".to_string()),
+            }
+        }
+        _ => Err("expected step param keyword/string".to_string()),
+    }
+}
+
+fn parse_timebase_arg(args: &[EValue], idx: usize) -> Result<Timebase, String> {
+    let Some(value) = args.get(idx) else {
+        return Err("expected timebase".to_string());
+    };
+    match value {
+        EValue::Number(n) if *n >= 0.0 => {
+            let idx = *n as usize;
+            Timebase::ALL
+                .get(idx)
+                .copied()
+                .ok_or_else(|| "invalid timebase index".to_string())
+        }
+        EValue::Keyword(name) | EValue::String(name) => {
+            let normalized = name.to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "whole" => Ok(Timebase::Whole),
+                "2" | "half" => Ok(Timebase::Half),
+                "4" | "quarter" => Ok(Timebase::Quarter),
+                "8" | "eighth" => Ok(Timebase::Eighth),
+                "16" | "sixteenth" => Ok(Timebase::Sixteenth),
+                "32" | "thirtysecond" | "thirty-second" => Ok(Timebase::ThirtySecond),
+                "64" | "sixtyfourth" | "sixty-fourth" => Ok(Timebase::SixtyFourth),
+                "2t" | "halftriplet" | "half-triplet" => Ok(Timebase::HalfTriplet),
+                "4t" | "quartertriplet" | "quarter-triplet" => Ok(Timebase::QuarterTriplet),
+                "8t" | "eighthtriplet" | "eighth-triplet" => Ok(Timebase::EighthTriplet),
+                "16t" | "sixteenthtriplet" | "sixteenth-triplet" => Ok(Timebase::SixteenthTriplet),
+                "32t" | "thirtysecondtriplet" | "thirty-second-triplet" => Ok(Timebase::ThirtySecondTriplet),
+                "64t" | "sixtyfourthtriplet" | "sixty-fourth-triplet" => Ok(Timebase::SixtyFourthTriplet),
+                "prh" | "polyrhythm" => Ok(Timebase::Polyrhythm),
+                _ => Err("unknown timebase".to_string()),
+            }
+        }
+        _ => Err("expected timebase keyword/string/index".to_string()),
+    }
+}
+
+fn lisp_string(value: impl Into<String>) -> Rc<RefCell<EValue>> {
+    Rc::new(RefCell::new(EValue::String(value.into())))
+}
+
+fn lisp_number(value: f64) -> Rc<RefCell<EValue>> {
+    Rc::new(RefCell::new(EValue::Number(value)))
+}
+
+fn lisp_bool(value: bool) -> Rc<RefCell<EValue>> {
+    Rc::new(RefCell::new(EValue::Bool(value)))
+}
+
+fn lisp_value(value: EValue) -> Rc<RefCell<EValue>> {
+    Rc::new(RefCell::new(value))
+}
+
+fn lisp_list(items: Vec<EValue>) -> EValue {
+    EValue::List(
+        items.into_iter()
+            .map(|value| Rc::new(RefCell::new(value)))
+            .collect(),
+    )
+}
+
+fn step_snapshot_to_value(step: usize, snapshot: StepSnapshot) -> EValue {
+    let mut map: HashMap<String, Rc<RefCell<EValue>>> = HashMap::new();
+    map.insert("step".to_string(), lisp_number((step + 1) as f64));
+    map.insert("active".to_string(), lisp_bool(snapshot.active));
+    map.insert(
+        "duration".to_string(),
+        lisp_number(snapshot.params[StepParam::Duration.index()] as f64),
+    );
+    map.insert(
+        "velocity".to_string(),
+        lisp_number(snapshot.params[StepParam::Velocity.index()] as f64),
+    );
+    map.insert(
+        "speed".to_string(),
+        lisp_number(snapshot.params[StepParam::Speed.index()] as f64),
+    );
+    map.insert(
+        "transpose".to_string(),
+        lisp_number(snapshot.params[StepParam::Transpose.index()] as f64),
+    );
+    map.insert(
+        "chord".to_string(),
+        lisp_value(lisp_list(
+            snapshot
+                .chord
+                .into_iter()
+                .map(|note| EValue::Number(note as f64))
+                .collect(),
+        )),
+    );
+    EValue::Map(map)
+}
+
+fn scratch_buffer_template() -> String {
+    r#"; Scratch buffer for live sequencer scripting.
+; C-x C-e eval s-expression at cursor
+; C-x C-b eval whole buffer
+; C-q quit scratch
+; Examples:
+;   (seq-track-steps)
+;   (for-each |n| (seq-toggle-step n) (list 1 5 9 13))
+;   (every :bar 2 '(seq-toggle-step 1))
+;   (clear-hooks)
+
+(seq-track-steps)
+"#
+    .to_string()
+}
+
+fn control_prelude_source() -> &'static str {
+    r#"
+(def empty? (xs) (= (len xs) 0))
+(def map (fn xs)
+  (if (empty? xs)
+    '()
+    (cons (fn (first xs))
+          (map fn (rest xs)))))
+(def filter (fn xs)
+  (if (empty? xs)
+    '()
+    (if (fn (first xs))
+      (cons (first xs) (filter fn (rest xs)))
+      (filter fn (rest xs)))))
+(def reduce (fn acc xs)
+  (if (empty? xs)
+    acc
+    (reduce fn (fn acc (first xs)) (rest xs))))
+(def for-each (fn xs)
+  (if (empty? xs)
+    nil
+    (do
+      (fn (first xs))
+      (for-each fn (rest xs)))))
+"#
+}
+
+fn new_eval_context(track: usize, cursor_step: usize) -> SharedSequencerEvalContext {
+    Arc::new(Mutex::new(SequencerEvalContext { track, cursor_step }))
+}
+
+fn run_embedded_editor_session<F>(
+    kind: CompileKind,
+    path: PathBuf,
+    sample_rate: u32,
+    state: Arc<crate::sequencer::SequencerState>,
+    track: Option<usize>,
+    cursor_step: Option<usize>,
+    mut apply_compiled: F,
+) -> Option<(CompileResult, String, String)>
+where
+    F: FnMut(CompileKind, CompileResult, &str, &str) -> Result<(), String>,
+{
+    let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
+        .or_else(|_| std::fs::read_to_string("init.lisp"))
+        .unwrap_or_default();
+    let mut runtime = Runtime::new();
+    register_sequencer_natives(
+        &mut runtime,
+        state,
+        new_eval_context(track.unwrap_or(0), cursor_step.unwrap_or(0)),
+    );
+    let mut editor = Editor::new(
+        runtime,
+        EditorConfig {
+            init_source: Some(init_src),
+        },
+    );
+    let initial = match std::fs::read_to_string(&path) {
+        Ok(src) if !src.trim().is_empty() => src,
+        _ => default_template_for_kind(&kind).to_string(),
+    };
+    if editor
+        .open_or_create_file_buffer(&path, &initial)
+        .map_err(|e| eprintln!("Failed to open editor buffer '{}': {e:?}", path.display()))
+        .is_err()
+    {
+        return None;
+    }
+
+    let mut terminal = ratatui::init();
+    let _restore_guard = RestoreTerminalGuard;
+    let mut pending_job: Option<PendingCompileJob> = None;
+    let mut quit_after_compile = false;
+    let mut last_live_applied: Option<LiveAppliedCompile> = None;
+
+    loop {
+        if crossterm::event::poll(Duration::from_millis(16)).ok()? {
+            match crossterm::event::read().ok()? {
+                crossterm::event::Event::Key(key)
+                    if !matches!(key.kind, crossterm::event::KeyEventKind::Release) =>
+                {
+                    editor.handle_key(key)
+                }
+                crossterm::event::Event::Resize(_, _) => editor.mark_needs_redraw(),
+                _ => {}
+            }
+        }
+
+        for command in editor.drain_host_commands() {
+            match command {
+                HostCommand::CompileInstrument {
+                    source,
+                    suggested_name,
+                    path,
+                    ..
+                } if matches!(kind, CompileKind::Instrument) => {
+                    let name = suggested_name
+                        .or_else(|| {
+                            path.as_ref().and_then(|p| {
+                                p.file_stem().map(|stem| stem.to_string_lossy().to_string())
+                            })
+                        })
+                        .unwrap_or_else(|| "untitled".to_string());
+                    let save_path = path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
+                    std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))).ok();
+                    if let Err(error) = std::fs::write(&save_path, &source) {
+                        editor.handle_host_event(HostEvent::Error(format!(
+                            "failed to save '{}': {error}",
+                            save_path.display()
+                        )));
+                        continue;
+                    }
+                    editor.handle_host_event(HostEvent::CommandStarted {
+                        label: format!("compile instrument '{name}'"),
+                    });
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let compile_source = source.clone();
+                    std::thread::spawn(move || {
+                        let result = compile_and_load_instrument(&compile_source, sample_rate);
+                        let _ = tx.send(result);
+                    });
+                    pending_job = Some(PendingCompileJob {
+                        receiver: rx,
+                        kind: CompileKind::Instrument,
+                        name,
+                        source,
+                    });
+                }
+                HostCommand::CompileEffect {
+                    source,
+                    suggested_name,
+                    path,
+                    ..
+                } if matches!(kind, CompileKind::Effect) => {
+                    let name = suggested_name
+                        .or_else(|| {
+                            path.as_ref().and_then(|p| {
+                                p.file_stem().map(|stem| stem.to_string_lossy().to_string())
+                            })
+                        })
+                        .unwrap_or_else(|| "untitled".to_string());
+                    let save_path = path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
+                    std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))).ok();
+                    if let Err(error) = std::fs::write(&save_path, &source) {
+                        editor.handle_host_event(HostEvent::Error(format!(
+                            "failed to save '{}': {error}",
+                            save_path.display()
+                        )));
+                        continue;
+                    }
+                    editor.handle_host_event(HostEvent::CommandStarted {
+                        label: format!("compile effect '{name}'"),
+                    });
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let compile_source = source.clone();
+                    std::thread::spawn(move || {
+                        let result = compile_and_load(&compile_source, sample_rate);
+                        let _ = tx.send(result);
+                    });
+                    pending_job = Some(PendingCompileJob {
+                        receiver: rx,
+                        kind: CompileKind::Effect,
+                        name,
+                        source,
+                    });
+                }
+                HostCommand::Custom { name, payload } => {
+                    if name == "compile-current" {
+                        let source = editor.active_buffer().text();
+                        let save_path = editor
+                            .active_buffer()
+                            .path
+                            .clone()
+                            .unwrap_or_else(|| editor_file_path(kind.clone(), None));
+                        let suggested_name = save_path
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().to_string());
+                        let command = match kind {
+                            CompileKind::Instrument => HostCommand::CompileInstrument {
+                                source,
+                                suggested_name,
+                                buffer_id: editor.active_buffer().id,
+                                path: Some(save_path),
+                            },
+                            CompileKind::Effect => HostCommand::CompileEffect {
+                                source,
+                                suggested_name,
+                                buffer_id: editor.active_buffer().id,
+                                path: Some(save_path),
+                            },
+                        };
+
+                        match command {
+                            HostCommand::CompileInstrument {
+                                source,
+                                suggested_name,
+                                path,
+                                ..
+                            } => {
+                                let name = suggested_name
+                                    .or_else(|| {
+                                        path.as_ref().and_then(|p| {
+                                            p.file_stem()
+                                                .map(|stem| stem.to_string_lossy().to_string())
+                                        })
+                                    })
+                                    .unwrap_or_else(|| "untitled".to_string());
+                                let save_path = path.unwrap_or_else(|| {
+                                    editor_file_path(CompileKind::Instrument, Some(&name))
+                                });
+                                std::fs::create_dir_all(
+                                    save_path.parent().unwrap_or(Path::new(".")),
+                                )
+                                .ok();
+                                if let Err(error) = std::fs::write(&save_path, &source) {
+                                    editor.handle_host_event(HostEvent::Error(format!(
+                                        "failed to save '{}': {error}",
+                                        save_path.display()
+                                    )));
+                                    continue;
+                                }
+                                editor.handle_host_event(HostEvent::CommandStarted {
+                                    label: format!("compile instrument '{name}'"),
+                                });
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let compile_source = source.clone();
+                                std::thread::spawn(move || {
+                                    let result =
+                                        compile_and_load_instrument(&compile_source, sample_rate);
+                                    let _ = tx.send(result);
+                                });
+                                pending_job = Some(PendingCompileJob {
+                                    receiver: rx,
+                                    kind: CompileKind::Instrument,
+                                    name,
+                                    source,
+                                });
+                            }
+                            HostCommand::CompileEffect {
+                                source,
+                                suggested_name,
+                                path,
+                                ..
+                            } => {
+                                let name = suggested_name
+                                    .or_else(|| {
+                                        path.as_ref().and_then(|p| {
+                                            p.file_stem()
+                                                .map(|stem| stem.to_string_lossy().to_string())
+                                        })
+                                    })
+                                    .unwrap_or_else(|| "untitled".to_string());
+                                let save_path = path.unwrap_or_else(|| {
+                                    editor_file_path(CompileKind::Effect, Some(&name))
+                                });
+                                std::fs::create_dir_all(
+                                    save_path.parent().unwrap_or(Path::new(".")),
+                                )
+                                .ok();
+                                if let Err(error) = std::fs::write(&save_path, &source) {
+                                    editor.handle_host_event(HostEvent::Error(format!(
+                                        "failed to save '{}': {error}",
+                                        save_path.display()
+                                    )));
+                                    continue;
+                                }
+                                editor.handle_host_event(HostEvent::CommandStarted {
+                                    label: format!("compile effect '{name}'"),
+                                });
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let compile_source = source.clone();
+                                std::thread::spawn(move || {
+                                    let result = compile_and_load(&compile_source, sample_rate);
+                                    let _ = tx.send(result);
+                                });
+                                pending_job = Some(PendingCompileJob {
+                                    receiver: rx,
+                                    kind: CompileKind::Effect,
+                                    name,
+                                    source,
+                                });
+                            }
+                            HostCommand::Custom { .. } => {}
+                        }
+                    } else {
+                        editor.handle_host_event(HostEvent::Status(format!(
+                            "host command '{name}' ignored: {payload:?}"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(job) = pending_job.take() {
+            match job.receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    let compiled_name = job.name.clone();
+                    let kind = job.kind.clone();
+                    editor.handle_host_event(HostEvent::CompileFinished {
+                        kind: kind.clone(),
+                        success: true,
+                        name: Some(compiled_name),
+                        diagnostics: None,
+                    });
+                    if quit_after_compile {
+                        return Some((result, job.name, job.source));
+                    } else if let Err(error) = apply_compiled(kind, result, &job.name, &job.source)
+                    {
+                        editor.handle_host_event(HostEvent::Error(error));
+                    } else {
+                        last_live_applied = Some(LiveAppliedCompile {
+                            kind: job.kind,
+                            name: job.name,
+                            source: job.source,
+                        });
+                    }
+                }
+                Ok(Err(error)) => {
+                    editor.handle_host_event(HostEvent::CompileFinished {
+                        kind: job.kind,
+                        success: false,
+                        name: Some(job.name),
+                        diagnostics: Some(error),
+                    });
+                    if quit_after_compile {
+                        quit_after_compile = false;
+                        editor.clear_quit_request();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    pending_job = Some(job);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    editor.handle_host_event(HostEvent::Error("compile worker crashed".to_string()));
+                }
+            }
+        }
+
+        if editor.needs_redraw() {
+            terminal.draw(|frame| eseq_tui::render(frame, &mut editor)).ok()?;
+            editor.clear_needs_redraw();
+        }
+
+        if editor.should_quit() {
+            if pending_job.is_some() {
+                quit_after_compile = true;
+            } else {
+                let buffer = editor.active_buffer();
+                let source = buffer.text();
+                let save_path = buffer
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| editor_file_path(kind.clone(), Some(&buffer.name)));
+                if let Err(error) = std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))) {
+                    editor.handle_host_event(HostEvent::Error(format!(
+                        "failed to create parent dir for '{}': {error}",
+                        save_path.display()
+                    )));
+                    editor.clear_quit_request();
+                    continue;
+                }
+                if let Err(error) = std::fs::write(&save_path, &source) {
+                    editor.handle_host_event(HostEvent::Error(format!(
+                        "failed to save '{}': {error}",
+                        save_path.display()
+                    )));
+                    editor.clear_quit_request();
+                    continue;
+                }
+
+                let name = save_path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "untitled".to_string());
+
+                if last_live_applied
+                    .as_ref()
+                    .map(|applied| {
+                        applied.kind == kind
+                            && applied.name == name
+                            && applied.source == source
+                    })
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+
+                editor.handle_host_event(HostEvent::CommandStarted {
+                    label: match kind {
+                        CompileKind::Instrument => format!("compile instrument '{name}'"),
+                        CompileKind::Effect => format!("compile effect '{name}'"),
+                    },
+                });
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                match kind {
+                    CompileKind::Instrument => {
+                        let compile_source = source.clone();
+                        std::thread::spawn(move || {
+                            let result = compile_and_load_instrument(&compile_source, sample_rate);
+                            let _ = tx.send(result);
+                        });
+                    }
+                    CompileKind::Effect => {
+                        let compile_source = source.clone();
+                        std::thread::spawn(move || {
+                            let result = compile_and_load(&compile_source, sample_rate);
+                            let _ = tx.send(result);
+                        });
+                    }
+                }
+
+                pending_job = Some(PendingCompileJob {
+                    receiver: rx,
+                    kind: kind.clone(),
+                    name,
+                    source,
+                });
+                quit_after_compile = true;
+                editor.clear_quit_request();
+            }
+        }
+    }
+}
+
+pub fn run_embedded_scratch_flow(
+    track: usize,
+    cursor_step: usize,
+    initial_text: &str,
+    initial_cursor: (usize, usize),
+    runtime: Runtime,
+    mut on_host_command: impl FnMut(&mut Editor, &str, &EValue) -> Option<String>,
+) -> Option<(String, (usize, usize), Runtime)> {
+    let mut control_runtime = ScratchControlRuntime::from_runtime(runtime, track, cursor_step);
+    control_runtime.set_position(track, cursor_step);
+    let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
+        .or_else(|_| std::fs::read_to_string("init.lisp"))
+        .unwrap_or_default();
+    let mut editor = Editor::new(
+        control_runtime.into_runtime(),
+        EditorConfig {
+            init_source: Some(init_src),
+        },
+    );
+    let initial = if initial_text.trim().is_empty() {
+        scratch_buffer_template()
+    } else {
+        initial_text.to_string()
+    };
+    editor.open_scratch_buffer("*scratch*", &initial);
+    {
+        let buffer = editor.active_buffer_mut();
+        buffer.path = Some(PathBuf::from(".eseqlisp-scratch"));
+        let row = initial_cursor.0.min(buffer.lines.len().saturating_sub(1));
+        let col = initial_cursor.1.min(buffer.lines[row].len());
+        buffer.cursor = (row, col);
+    }
+
+    let mut terminal = ratatui::init();
+    let _restore_guard = RestoreTerminalGuard;
+
+    loop {
+        if crossterm::event::poll(Duration::from_millis(16)).ok() == Some(true) {
+            match crossterm::event::read().ok() {
+                Some(crossterm::event::Event::Key(key))
+                    if !matches!(key.kind, crossterm::event::KeyEventKind::Release) =>
+                {
+                    editor.handle_key(key)
+                }
+                Some(crossterm::event::Event::Resize(_, _)) => editor.mark_needs_redraw(),
+                _ => {}
+            }
+        }
+
+        for command in editor.drain_host_commands() {
+            if let HostCommand::Custom { name, payload } = command {
+                if let Some(status) = on_host_command(&mut editor, &name, &payload) {
+                    editor.handle_host_event(HostEvent::Status(status));
+                } else {
+                    editor.handle_host_event(HostEvent::Status(format!(
+                        "host command '{name}' ignored: {payload:?}"
+                    )));
+                }
+            }
+        }
+
+        if editor.needs_redraw() {
+            if terminal
+                .draw(|frame| eseq_tui::render(frame, &mut editor))
+                .is_err()
+            {
+                break;
+            }
+            editor.clear_needs_redraw();
+        }
+
+        if editor.should_quit() {
+            let buffer = editor.active_buffer();
+            return Some((buffer.text(), buffer.cursor, editor.into_runtime()));
+        }
+    }
+    None
+}
+
+pub fn eval_sequencer_control(
+    code: &str,
+    state: Arc<crate::sequencer::SequencerState>,
+    track: Option<usize>,
+    cursor_step: Option<usize>,
+) -> Result<Option<EValue>, String> {
+    let mut runtime = Runtime::new();
+    register_sequencer_natives(
+        &mut runtime,
+        state,
+        new_eval_context(track.unwrap_or(0), cursor_step.unwrap_or(0)),
+    );
+    runtime
+        .eval_str(control_prelude_source())
+        .map_err(|e| format!("{e:?}"))?;
+    runtime.eval_str(code).map_err(|e| format!("{e:?}"))
+}
+
+pub fn run_embedded_effect_editor_flow<F>(
+    sample_rate: u32,
+    state: Arc<crate::sequencer::SequencerState>,
+    track: usize,
+    existing_name: Option<&str>,
+    apply_compiled: F,
+) -> Option<EffectEditResult>
+where
+    F: FnMut(CompileKind, CompileResult, &str, &str) -> Result<(), String>,
+{
+    let path = editor_file_path(CompileKind::Effect, existing_name);
+    let (result, name, source) = run_embedded_editor_session(
+        CompileKind::Effect,
+        path,
+        sample_rate,
+        state,
+        Some(track),
+        None,
+        apply_compiled,
+    )?;
+    Some(EffectEditResult {
+        manifest: result.manifest,
+        lib: result.lib,
+        source,
+        name,
+    })
+}
+
+pub fn run_embedded_instrument_editor_flow<F>(
+    sample_rate: u32,
+    state: Arc<crate::sequencer::SequencerState>,
+    track: Option<usize>,
+    existing_name: Option<&str>,
+    apply_compiled: F,
+) -> Option<InstrumentEditResult>
+where
+    F: FnMut(CompileKind, CompileResult, &str, &str) -> Result<(), String>,
+{
+    let path = editor_file_path(CompileKind::Instrument, existing_name);
+    let (result, name, source) = run_embedded_editor_session(
+        CompileKind::Instrument,
+        path,
+        sample_rate,
+        state,
+        track,
+        None,
+        apply_compiled,
+    )?;
+    let params = result.manifest.params.clone();
+    Some(InstrumentEditResult {
+        manifest: result.manifest,
+        lib: result.lib,
+        source,
+        params,
+        name,
+    })
+}
+
 /// Run the instrument edit → compile → name → save flow.
 /// Called while terminal is in normal (non-raw) mode.
 /// Does NOT wire nodes — the caller handles graph wiring.
@@ -1211,5 +2314,164 @@ pub fn run_instrument_editor_flow(
         if buf.trim() == "q" {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScratchControlRuntime, new_eval_context, register_sequencer_natives};
+    use crate::sequencer::{StepParam, default_empty_effect_chain, SequencerState};
+    use eseqlisp::{Editor, EditorConfig, Runtime};
+    use eseqlisp::vm::Value;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+
+    #[test]
+    fn seq_step_returns_map_value() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+
+        let result = runtime.eval_str("(seq-step 1)").unwrap();
+        assert!(matches!(result, Some(Value::Map(_))));
+    }
+
+    #[test]
+    fn seq_track_steps_returns_list_value() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+
+        let result = runtime.eval_str("(seq-track-steps)").unwrap();
+        assert!(matches!(result, Some(Value::List(_))));
+    }
+
+    #[test]
+    fn seq_rotate_track_rotates_full_pattern() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        state.pattern.patterns[0].set_step_active(0, true);
+        state.pattern.step_data[0].set(0, StepParam::Transpose, 7.0);
+
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+        let result = runtime.eval_str("(seq-rotate-track 1)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert!(state.pattern.patterns[0].is_active(1));
+        assert_eq!(state.pattern.step_data[0].get(1, StepParam::Transpose), 7.0);
+    }
+
+    #[test]
+    fn seq_plock_step_sets_step_param() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+
+        let result = runtime.eval_str("(seq-plock-step 2 :velocity 0.7)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert_eq!(state.pattern.step_data[0].get(1, StepParam::Velocity), 0.7);
+    }
+
+    #[test]
+    fn seq_plock_timebase_sets_timebase_override() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+
+        let result = runtime.eval_str("(seq-plock-timebase 3 :8t)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert_eq!(state.pattern.timebase_plocks[0].get(2), Some(crate::sequencer::Timebase::EighthTriplet));
+    }
+
+    #[test]
+    fn seq_plock_effect_sets_slot_param_override() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, Arc::clone(&state), new_eval_context(0, 0));
+
+        let result = runtime.eval_str("(seq-plock-effect 1 1 0 0.25)").unwrap();
+
+        assert_eq!(result, Some(Value::Bool(true)));
+        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 0), Some(0.25));
+    }
+
+    #[test]
+    fn seq_step_shows_value_through_editor_eval_binding() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
+            .or_else(|_| std::fs::read_to_string("init.lisp"))
+            .unwrap_or_default();
+        let mut runtime = Runtime::new();
+        register_sequencer_natives(&mut runtime, state, new_eval_context(0, 0));
+        let mut editor = Editor::new(
+            runtime,
+            EditorConfig {
+                init_source: Some(init_src),
+            },
+        );
+        editor.open_scratch_buffer("*scratch*", "(seq-step 1)");
+        editor.active_buffer_mut().cursor = (0, "(seq-step 1)".len());
+
+        editor.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+
+        let minibuffer = editor.minibuffer.unwrap_or_default();
+        assert!(minibuffer.contains("step"), "minibuffer was: {minibuffer}");
+    }
+
+    #[test]
+    fn scratch_control_runtime_can_invoke_exported_closure() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let mut runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0);
+
+        let callback = runtime
+            .eval("(lambda () (seq-toggle-step 1))")
+            .unwrap()
+            .unwrap();
+        runtime.set_global_value("__hook_test", callback);
+        let result = runtime.eval("(__hook_test)").unwrap().unwrap();
+
+        assert_eq!(result, Value::Bool(true));
+        assert!(state.pattern.patterns[0].is_active(0));
+    }
+
+    #[test]
+    fn scratch_control_runtime_runs_source_hooks_with_dynamic_track_context() {
+        let state = Arc::new(SequencerState::new(
+            2,
+            vec![default_empty_effect_chain(), default_empty_effect_chain()],
+        ));
+        let mut runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0);
+
+        runtime.set_position(1, 0);
+        let result = runtime.eval("(seq-toggle-step 1)").unwrap().unwrap();
+
+        assert_eq!(result, Value::Bool(true));
+        assert!(state.pattern.patterns[1].is_active(0));
+        assert!(!state.pattern.patterns[0].is_active(0));
+    }
+
+    #[test]
+    fn scratch_runtime_editor_loads_init_bindings_for_eval() {
+        let state = Arc::new(SequencerState::new(1, vec![default_empty_effect_chain()]));
+        let runtime = ScratchControlRuntime::new(Arc::clone(&state), 0, 0).into_runtime();
+        let init_src = std::fs::read_to_string("../eseqlisp/init.lisp")
+            .or_else(|_| std::fs::read_to_string("init.lisp"))
+            .unwrap_or_default();
+        let mut editor = Editor::new(
+            runtime,
+            EditorConfig {
+                init_source: Some(init_src),
+            },
+        );
+        editor.open_scratch_buffer("*scratch*", "(+ 1 1)");
+        editor.active_buffer_mut().cursor = (0, "(+ 1 1)".len());
+
+        editor.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+
+        assert_eq!(editor.minibuffer.unwrap_or_default(), "2");
     }
 }
