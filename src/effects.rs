@@ -109,7 +109,9 @@ impl ParamDescriptor {
                 if range <= 0.0 {
                     self.min
                 } else {
-                    (self.min + normalized * range).round().clamp(self.min, self.max)
+                    (self.min + normalized * range)
+                        .round()
+                        .clamp(self.min, self.max)
                 }
             }
             ParamKind::Continuous { .. } => match self.scaling {
@@ -235,6 +237,8 @@ mod tests {
 pub struct EffectDescriptor {
     pub name: String,
     pub params: Vec<ParamDescriptor>,
+    pub input_channels: usize,
+    pub output_channels: usize,
 }
 
 impl EffectDescriptor {
@@ -242,6 +246,8 @@ impl EffectDescriptor {
     pub fn builtin_filter() -> Self {
         Self {
             name: "Filter".to_string(),
+            input_channels: 2,
+            output_channels: 2,
             params: vec![
                 ParamDescriptor {
                     name: "enabled".to_string(),
@@ -299,6 +305,8 @@ impl EffectDescriptor {
     pub fn builtin_delay() -> Self {
         Self {
             name: "Delay".to_string(),
+            input_channels: 2,
+            output_channels: 2,
             params: vec![
                 ParamDescriptor {
                     name: "wet".to_string(),
@@ -387,11 +395,18 @@ impl EffectDescriptor {
         Self {
             name: String::new(),
             params: Vec::new(),
+            input_channels: 0,
+            output_channels: 0,
         }
     }
 
     /// Construct from a lisp effect manifest.
-    pub fn from_lisp_manifest(name: &str, params: &[crate::lisp_effect::DGenParam]) -> Self {
+    pub fn from_lisp_manifest(
+        name: &str,
+        params: &[crate::lisp_effect::DGenParam],
+        input_channels: usize,
+        output_channels: usize,
+    ) -> Self {
         let descriptors = params
             .iter()
             .filter(|p| !p.hidden)
@@ -411,6 +426,8 @@ impl EffectDescriptor {
         Self {
             name: name.to_string(),
             params: descriptors,
+            input_channels,
+            output_channels,
         }
     }
 }

@@ -1,11 +1,14 @@
 use crossterm::event::KeyCode;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use super::draw::region_border_style;
-use super::{App, BrowserState, InputMode, PresetPromptKind, Region, SidebarMode, UiState};
+use super::params::draw_track_params_column;
+use super::{
+    App, BrowserState, InputMode, PresetPromptKind, Region, SidebarMode, SidebarTab, UiState,
+};
 use crate::lisp_effect;
 
 // ── Sample Browser tree ──
@@ -256,6 +259,105 @@ impl BrowserState {
     }
 
     pub(super) fn handle_sidebar_input(app: &mut App, code: KeyCode) {
+        if app.ui.sidebar_tab == SidebarTab::Tools {
+            app.ui.params_column = 0;
+            app.handle_track_params_column(code);
+            return;
+        }
+        if app.ui.sidebar_tab == SidebarTab::Agent {
+            if app.agent_panel.model_dropdown_open {
+                match code {
+                    KeyCode::Up => {
+                        if app.agent_panel.model_dropdown_cursor > 0 {
+                            app.agent_panel.model_dropdown_cursor -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        let max = app.agent_model_options().len();
+                        if app.agent_panel.model_dropdown_cursor + 1 < max {
+                            app.agent_panel.model_dropdown_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        app.select_agent_model_index(app.agent_panel.model_dropdown_cursor);
+                        app.agent_panel.model_dropdown_open = false;
+                    }
+                    KeyCode::Esc => {
+                        app.agent_panel.model_dropdown_open = false;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match code {
+                KeyCode::Char(c) => {
+                    if app.agent_panel.pending_request.is_none() {
+                        let cursor = app
+                            .agent_panel
+                            .input_cursor
+                            .min(app.agent_panel.input_buffer.len());
+                        app.agent_panel.input_buffer.insert(cursor, c);
+                        app.agent_panel.input_cursor = cursor + 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if app.agent_panel.pending_request.is_none() {
+                        let cursor = app
+                            .agent_panel
+                            .input_cursor
+                            .min(app.agent_panel.input_buffer.len());
+                        if cursor > 0 {
+                            app.agent_panel.input_buffer.remove(cursor - 1);
+                            app.agent_panel.input_cursor = cursor - 1;
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if app.agent_panel.pending_request.is_none() {
+                        app.agent_panel.input_cursor =
+                            app.agent_panel.input_cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Right => {
+                    if app.agent_panel.pending_request.is_none() {
+                        app.agent_panel.input_cursor = (app.agent_panel.input_cursor + 1)
+                            .min(app.agent_panel.input_buffer.len());
+                    }
+                }
+                KeyCode::Home => app.agent_panel.input_cursor = 0,
+                KeyCode::End => app.agent_panel.input_cursor = app.agent_panel.input_buffer.len(),
+                KeyCode::Delete => {
+                    if app.agent_panel.pending_request.is_none() {
+                        let cursor = app
+                            .agent_panel
+                            .input_cursor
+                            .min(app.agent_panel.input_buffer.len());
+                        if cursor < app.agent_panel.input_buffer.len() {
+                            app.agent_panel.input_buffer.remove(cursor);
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = app.submit_agent_prompt() {
+                        app.editor.status_message = Some((error, Instant::now()));
+                    }
+                }
+                KeyCode::Esc => {
+                    if app.agent_panel.pending_request.is_some() {
+                        app.cancel_agent_request();
+                    } else {
+                        if !app.tracks.is_empty() {
+                            app.ui.sidebar_tab = SidebarTab::Tools;
+                        } else {
+                            app.ui.sidebar_tab = SidebarTab::Sounds;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Instrument picker mode: separate input handling
         if app.effective_sidebar_mode() == SidebarMode::InstrumentPicker {
             Self::handle_instrument_picker_input(app, code);
@@ -293,7 +395,11 @@ impl BrowserState {
                     app.preset_browser.filter.clear();
                     app.preset_browser.cursor = 0;
                     app.preset_browser.scroll_offset = 0;
-                    app.ui.focused_region = Region::Cirklon;
+                    if !app.tracks.is_empty() {
+                        app.ui.sidebar_tab = SidebarTab::Tools;
+                    } else {
+                        app.ui.focused_region = Region::Cirklon;
+                    }
                 }
                 _ => {}
             }
@@ -365,9 +471,11 @@ impl BrowserState {
                 app.browser.filter.clear();
                 app.browser.cursor = 0;
                 app.browser.scroll_offset = 0;
-                app.ui.focused_region = Region::Cirklon;
                 if !app.tracks.is_empty() {
+                    app.ui.sidebar_tab = SidebarTab::Tools;
                     app.ui.sidebar_mode = SidebarMode::Audition;
+                } else {
+                    app.ui.focused_region = Region::Cirklon;
                 }
             }
             _ => {}
@@ -402,9 +510,11 @@ impl BrowserState {
                 }
             },
             KeyCode::Esc => {
-                app.ui.focused_region = Region::Cirklon;
                 if !app.tracks.is_empty() {
+                    app.ui.sidebar_tab = SidebarTab::Tools;
                     app.ui.sidebar_mode = SidebarMode::Audition;
+                } else {
+                    app.ui.focused_region = Region::Cirklon;
                 }
             }
             _ => {}
@@ -740,24 +850,75 @@ impl App {
 
 pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.ui.focused_region == Region::Sidebar;
-
-    let title = match app.effective_sidebar_mode() {
-        SidebarMode::InstrumentPicker => " Instrument ",
-        SidebarMode::AddTrack => " + Add Track ",
-        SidebarMode::Audition => " \u{266b} Audition ",
-        SidebarMode::Presets => " Presets ",
-    };
-
     let block = Block::default()
-        .title(title)
         .borders(Borders::ALL)
         .border_style(region_border_style(app, Region::Sidebar));
-    let inner = block.inner(area);
+    let block_inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if block_inner.height < 2 || block_inner.width < 4 {
+        app.ui.layout.sidebar_tabs = block_inner;
+        app.ui.layout.sidebar_inner = Rect::new(block_inner.x, block_inner.y, block_inner.width, 0);
+        return;
+    }
+
+    let tabs_area = Rect::new(block_inner.x, block_inner.y, block_inner.width, 1);
+    let inner = Rect::new(
+        block_inner.x,
+        block_inner.y + 1,
+        block_inner.width,
+        block_inner.height.saturating_sub(1),
+    );
+
+    app.ui.layout.sidebar_tabs = tabs_area;
     app.ui.layout.sidebar_inner = inner;
 
     if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+
+    let tools_selected = app.ui.sidebar_tab == SidebarTab::Tools;
+    let agent_selected = app.ui.sidebar_tab == SidebarTab::Agent;
+    let sounds_selected = app.ui.sidebar_tab == SidebarTab::Sounds;
+    let tools_style = if tools_selected && focused {
+        Style::default().fg(Color::Black).bg(Color::White).bold()
+    } else if tools_selected {
+        Style::default().fg(Color::Black).bg(Color::Rgb(90, 90, 90))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let agent_style = if agent_selected && focused {
+        Style::default().fg(Color::Black).bg(Color::White).bold()
+    } else if agent_selected {
+        Style::default().fg(Color::Black).bg(Color::Rgb(90, 90, 90))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let sounds_style = if sounds_selected && focused {
+        Style::default().fg(Color::Black).bg(Color::White).bold()
+    } else if sounds_selected {
+        Style::default().fg(Color::Black).bg(Color::Rgb(90, 90, 90))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Tools ", tools_style),
+            Span::raw(" "),
+            Span::styled(" Agent ", agent_style),
+            Span::raw(" "),
+            Span::styled(" Sounds ", sounds_style),
+        ])),
+        tabs_area,
+    );
+
+    if app.ui.sidebar_tab == SidebarTab::Tools {
+        draw_track_params_column(frame, app, inner, focused);
+        return;
+    }
+
+    if app.ui.sidebar_tab == SidebarTab::Agent {
+        draw_agent_sidebar(frame, app, inner, focused);
         return;
     }
 
@@ -825,16 +986,18 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             ))),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
-        if focused {
-            let filter_text = format!("> {}\u{2588}", app.preset_browser.filter);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    filter_text,
-                    Style::default().fg(Color::White),
-                ))),
-                Rect::new(inner.x, inner.y + 2, inner.width, 1),
-            );
-        }
+        let filter_text = if focused {
+            format!("> {}\u{2588}", app.preset_browser.filter)
+        } else {
+            format!("> {}", app.preset_browser.filter)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                filter_text,
+                Style::default().fg(Color::White),
+            ))),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+        );
         let list_start_y = inner.y + 3;
         let scroll = app.preset_browser.scroll_offset;
         for (vi, i) in (scroll..items.len()).enumerate() {
@@ -879,20 +1042,17 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let items = app.browser.visible_items();
     let max_visible = (inner.height as usize).saturating_sub(1); // 1 row for filter
 
-    // Filter input line (only when focused)
-    if focused {
-        let filter_text = format!("> {}\u{2588}", app.browser.filter);
-        let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
-        let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
-        frame.render_widget(Paragraph::new(filter_line), filter_area);
-    }
-
-    let list_start_y = if focused { inner.y + 1 } else { inner.y };
-    let list_max = if focused {
-        max_visible
+    let filter_text = if focused {
+        format!("> {}\u{2588}", app.browser.filter)
     } else {
-        inner.height as usize
+        format!("> {}", app.browser.filter)
     };
+    let filter_line = Line::from(Span::styled(filter_text, Style::default().fg(Color::White)));
+    let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(Paragraph::new(filter_line), filter_area);
+
+    let list_start_y = inner.y + 1;
+    let list_max = max_visible;
     let scroll = app.browser.scroll_offset;
 
     for (vi, i) in (scroll..items.len()).enumerate() {
@@ -965,5 +1125,323 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 style,
             );
         }
+    }
+}
+
+fn draw_agent_sidebar(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let provider_state = &app.agent_panel.provider_state;
+    let selected_provider = provider_state
+        .providers
+        .iter()
+        .find(|entry| entry.provider == provider_state.selected_provider);
+
+    let model_label = selected_provider
+        .map(|provider| provider.selected_model.as_str())
+        .unwrap_or("unavailable");
+    let focus_mark = if focused { " <" } else { "" };
+    let pending = app.agent_panel.pending_request.is_some();
+    let elapsed = app
+        .agent_panel
+        .pending_request
+        .as_ref()
+        .map(|pending| pending.started_at.elapsed())
+        .unwrap_or_default();
+    let input_lines = build_agent_input_lines(app, focused, pending);
+    let input_height = input_lines.len().max(1) as u16;
+    let header_height = if selected_provider
+        .map(|provider| !provider.api_key_present)
+        .unwrap_or(app.agent_panel.load_error.is_some())
+    {
+        2
+    } else {
+        1
+    };
+    let status_height = if pending { 1 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(status_height),
+            Constraint::Length(input_height),
+        ])
+        .split(area);
+
+    let mut header_lines = vec![Line::from(Span::styled(
+        format!("model: {model_label}{focus_mark}"),
+        Style::default().fg(Color::Cyan),
+    ))];
+    if let Some(provider) = selected_provider {
+        if !provider.api_key_present {
+            header_lines.push(Line::from(Span::styled(
+                format!("error: missing {}", provider.provider.api_key_env()),
+                Style::default().fg(Color::LightRed),
+            )));
+        }
+    } else if let Some(error) = app.agent_panel.load_error.as_ref() {
+        header_lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(Color::LightRed),
+        )));
+    }
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+    draw_agent_model_dropdown(frame, app, chunks[0]);
+
+    let transcript_lines = build_agent_transcript_lines(app);
+    let visible_height = chunks[1].height as usize;
+    let total_lines = transcript_lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = app.agent_panel.scroll_offset.min(max_scroll);
+    let start = total_lines.saturating_sub(visible_height + scroll);
+    let end = total_lines.saturating_sub(scroll);
+    let visible = if start < end {
+        transcript_lines[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    frame.render_widget(
+        Paragraph::new(visible).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+
+    if pending {
+        frame.render_widget(Paragraph::new(build_agent_status_line(elapsed)), chunks[2]);
+    }
+
+    frame.render_widget(Paragraph::new(input_lines), chunks[3]);
+}
+
+fn build_agent_transcript_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let wrap_width = app.ui.layout.sidebar_inner.width.saturating_sub(2).max(8) as usize;
+    for entry in &app.agent_panel.transcript {
+        let (label_style, text_style) = match entry.role.as_str() {
+            "user" => (
+                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::White),
+            ),
+            "assistant" => (
+                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::Gray),
+            ),
+            "tool" => (
+                Style::default().fg(Color::LightBlue),
+                Style::default().fg(Color::Gray),
+            ),
+            "error" => (
+                Style::default().fg(Color::LightRed),
+                Style::default().fg(Color::LightRed),
+            ),
+            _ => (
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
+            ),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{}:", entry.role),
+            label_style.bold(),
+        )));
+        for part in entry.text.lines() {
+            for wrapped in wrap_agent_text(part, wrap_width) {
+                lines.push(Line::from(Span::styled(wrapped, text_style)));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Describe a synth or effect and press Enter.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+fn wrap_agent_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            if word.len() <= width {
+                current.push_str(word);
+            } else {
+                for chunk in word.as_bytes().chunks(width.max(1)) {
+                    out.push(String::from_utf8_lossy(chunk).to_string());
+                }
+            }
+            continue;
+        }
+
+        if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(current);
+            if word.len() <= width {
+                current = word.to_string();
+            } else {
+                current = String::new();
+                for chunk in word.as_bytes().chunks(width.max(1)) {
+                    out.push(String::from_utf8_lossy(chunk).to_string());
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn build_agent_input_lines(app: &App, focused: bool, pending: bool) -> Vec<Line<'static>> {
+    let wrap_width = app.ui.layout.sidebar_inner.width.saturating_sub(4).max(8) as usize;
+    let text = app.agent_panel.input_buffer.clone();
+
+    let wrapped = if text.is_empty() {
+        vec![String::new()]
+    } else {
+        wrap_agent_text(&text, wrap_width)
+    };
+
+    let mut rendered = Vec::new();
+    let mut absolute_offset = 0usize;
+    let cursor_offset = app
+        .agent_panel
+        .input_cursor
+        .min(app.agent_panel.input_buffer.len());
+
+    for (idx, line) in wrapped.into_iter().enumerate() {
+        let prefix = if idx == 0 { "> " } else { "  " };
+        let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::White))];
+        let line_len = line.len();
+
+        if focused
+            && !pending
+            && cursor_offset >= absolute_offset
+            && cursor_offset <= absolute_offset + line_len
+        {
+            let local_cursor = cursor_offset.saturating_sub(absolute_offset);
+            let before = &line[..local_cursor.min(line.len())];
+            let cursor_char = line
+                .get(local_cursor..)
+                .and_then(|rest| rest.chars().next())
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| " ".to_string());
+            let after_start = local_cursor.saturating_add(cursor_char.len());
+            let after = if after_start <= line.len() {
+                &line[after_start..]
+            } else {
+                ""
+            };
+
+            if !before.is_empty() {
+                spans.push(Span::styled(
+                    before.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            spans.push(Span::styled(
+                cursor_char,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ));
+            if !after.is_empty() {
+                spans.push(Span::styled(
+                    after.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(line, Style::default().fg(Color::White)));
+        }
+
+        rendered.push(Line::from(spans));
+        absolute_offset += line_len;
+    }
+
+    if rendered.is_empty() {
+        rendered.push(Line::from(Span::styled(
+            "> ",
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    rendered
+}
+
+fn build_agent_status_line(elapsed: std::time::Duration) -> Line<'static> {
+    let label = "Working";
+    let palette = [
+        Color::Rgb(120, 208, 210),
+        Color::Rgb(132, 220, 222),
+        Color::Rgb(146, 232, 234),
+        Color::Rgb(132, 220, 222),
+    ];
+    let shift = ((elapsed.as_millis() / 140) as usize) % palette.len();
+    let mut spans = Vec::new();
+    for (idx, ch) in label.chars().enumerate() {
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(palette[(idx + shift) % palette.len()]),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" ({:>2}s • esc to interrupt)", elapsed.as_secs()),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
+}
+
+fn draw_agent_model_dropdown(frame: &mut Frame, app: &App, model_row: Rect) {
+    if !app.agent_panel.model_dropdown_open {
+        return;
+    }
+
+    let options = app.agent_model_options();
+    if options.is_empty() {
+        return;
+    }
+
+    let dropdown_x = model_row.x + 7;
+    let dropdown_width = model_row.width.saturating_sub(7).min(28).max(16);
+    let selected = app.agent_panel.model_dropdown_cursor;
+    let visible_count = options
+        .len()
+        .min(app.ui.layout.sidebar_inner.height.saturating_sub(1) as usize);
+    let scroll = selected.saturating_sub(visible_count.saturating_sub(1));
+    if visible_count == 0 {
+        return;
+    }
+
+    for vi in 0..visible_count {
+        let idx = scroll + vi;
+        if idx >= options.len() {
+            break;
+        }
+        let y = model_row.y + 1 + vi as u16;
+        let is_cursor = idx == selected;
+        let style = if is_cursor {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60))
+        };
+        let text = format!(
+            " {:<width$}",
+            options[idx].1,
+            width = dropdown_width.saturating_sub(2) as usize
+        );
+        frame.render_widget(Clear, Rect::new(dropdown_x, y, dropdown_width, 1));
+        frame.render_widget(
+            Paragraph::new(text).style(style),
+            Rect::new(dropdown_x, y, dropdown_width, 1),
+        );
     }
 }

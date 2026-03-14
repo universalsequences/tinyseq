@@ -1,12 +1,12 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::{self, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -536,10 +536,55 @@ pub unsafe fn remove_effect_from_chain(
     predecessor_id: i32,
     successor_id: i32,
 ) {
-    audiograph::graph_disconnect(lg, predecessor_id, 0, effect_node_id, 0);
-    audiograph::graph_disconnect(lg, effect_node_id, 0, successor_id, 0);
+    for src_port in 0..2 {
+        for dst_port in 0..2 {
+            audiograph::graph_disconnect(lg, predecessor_id, src_port, effect_node_id, dst_port);
+            audiograph::graph_disconnect(lg, effect_node_id, src_port, successor_id, dst_port);
+            audiograph::graph_disconnect(lg, predecessor_id, src_port, successor_id, dst_port);
+        }
+    }
     audiograph::delete_node(lg, effect_node_id);
-    audiograph::graph_connect(lg, predecessor_id, 0, successor_id, 0);
+}
+
+unsafe fn connect_effect_chain(
+    lg: *mut LiveGraph,
+    predecessor_id: i32,
+    predecessor_outputs: usize,
+    effect_id: i32,
+    effect_inputs: usize,
+    effect_outputs: usize,
+    successor_id: i32,
+    successor_inputs: usize,
+) {
+    for src_port in 0..2 {
+        for dst_port in 0..2 {
+            audiograph::graph_disconnect(lg, predecessor_id, src_port, successor_id, dst_port);
+        }
+    }
+
+    if effect_inputs <= 1 {
+        let pred_channels = predecessor_outputs.max(1).min(2);
+        for src_port in 0..pred_channels {
+            let _ = audiograph::graph_connect(lg, predecessor_id, src_port as i32, effect_id, 0);
+        }
+    } else {
+        let pred_channels = predecessor_outputs.max(1).min(2);
+        for ch in 0..pred_channels.min(effect_inputs).min(2) {
+            let _ = audiograph::graph_connect(lg, predecessor_id, ch as i32, effect_id, ch as i32);
+        }
+    }
+
+    if effect_outputs <= 1 {
+        let succ_channels = successor_inputs.max(1).min(2);
+        for dst_port in 0..succ_channels {
+            let _ = audiograph::graph_connect(lg, effect_id, 0, successor_id, dst_port as i32);
+        }
+    } else {
+        let succ_channels = successor_inputs.max(1).min(2);
+        for ch in 0..succ_channels.min(effect_outputs).min(2) {
+            let _ = audiograph::graph_connect(lg, effect_id, ch as i32, successor_id, ch as i32);
+        }
+    }
 }
 
 /// Add a DGenLisp effect between predecessor and successor nodes.
@@ -550,7 +595,9 @@ pub unsafe fn add_effect_to_chain_at(
     manifest: &DGenManifest,
     lib: &LoadedDGenLib,
     predecessor_id: i32,
+    predecessor_outputs: usize,
     successor_id: i32,
+    successor_inputs: usize,
     existing_effect: Option<i32>,
 ) -> Result<i32, String> {
     // Remove old effect if present
@@ -577,7 +624,7 @@ pub unsafe fn add_effect_to_chain_at(
         state_size,
         name.as_ptr(),
         manifest.n_inputs as c_int,
-        1, // mono output for insert chain
+        manifest.n_outputs as c_int,
         init_msg.as_ptr() as *const c_void,
         init_msg_size,
     );
@@ -586,10 +633,16 @@ pub unsafe fn add_effect_to_chain_at(
         return Err("Failed to add DGenLisp node to graph".to_string());
     }
 
-    // Rewire: predecessor → effect → successor
-    audiograph::graph_disconnect(lg, predecessor_id, 0, successor_id, 0);
-    audiograph::graph_connect(lg, predecessor_id, 0, node_id, 0);
-    audiograph::graph_connect(lg, node_id, 0, successor_id, 0);
+    connect_effect_chain(
+        lg,
+        predecessor_id,
+        predecessor_outputs,
+        node_id,
+        manifest.n_inputs,
+        manifest.n_outputs,
+        successor_id,
+        successor_inputs,
+    );
 
     Ok(node_id)
 }
@@ -662,7 +715,9 @@ pub fn run_editor_flow(
                                         &manifest,
                                         &lib,
                                         predecessor_id,
+                                        2,
                                         successor_id,
+                                        2,
                                         existing_effect,
                                     )
                                 } {
@@ -1239,7 +1294,13 @@ impl ScratchControlRuntime {
         self.runtime.set_global_value(name, value);
     }
 
-    pub fn into_parts(self) -> (Runtime, SharedSequencerEvalContext, SharedSequencerNativeMetadata) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Runtime,
+        SharedSequencerEvalContext,
+        SharedSequencerNativeMetadata,
+    ) {
         (self.runtime, self.context, self.metadata)
     }
 
@@ -1262,39 +1323,49 @@ fn register_sequencer_natives(
     context: SharedSequencerEvalContext,
     metadata: SharedSequencerNativeMetadata,
 ) {
-    let current_track = |ctx: &SharedSequencerEvalContext| {
-        ctx.lock().map(|guard| guard.track).unwrap_or(0)
-    };
-    let current_step = |ctx: &SharedSequencerEvalContext| {
-        ctx.lock().map(|guard| guard.cursor_step).unwrap_or(0)
-    };
+    let current_track =
+        |ctx: &SharedSequencerEvalContext| ctx.lock().map(|guard| guard.track).unwrap_or(0);
+    let current_step =
+        |ctx: &SharedSequencerEvalContext| ctx.lock().map(|guard| guard.cursor_step).unwrap_or(0);
 
     let context_for_track = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-current-track", "(seq-current-track)", "Return the current 1-based track index for the scratch context.", move |_args, _ctx| {
-        Ok(EValue::Number((current_track(&context_for_track) + 1) as f64))
-    });
+    runtime.register_native_with_docs(
+        "seq-current-track",
+        "(seq-current-track)",
+        "Return the current 1-based track index for the scratch context.",
+        move |_args, _ctx| {
+            Ok(EValue::Number(
+                (current_track(&context_for_track) + 1) as f64,
+            ))
+        },
+    );
 
     let state_for_set_track = Arc::clone(&state);
     let context_for_set_track = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-set-current-track", "(seq-set-current-track track)", "Set the current 1-based track index for subsequent scratch operations.", move |args, ctx| {
-        let Some(EValue::Number(track)) = args.first() else {
-            return Err("expected 1-based track number".to_string());
-        };
-        let track = *track as isize;
-        if track <= 0 {
-            return Err("tracks are 1-based".to_string());
-        }
-        let track_count = state_for_set_track.active_track_count() as isize;
-        if track > track_count {
-            return Err(format!("track out of range (1..={track_count})"));
-        }
-        let track_idx = (track - 1) as usize;
-        if let Ok(mut eval_ctx) = context_for_set_track.lock() {
-            eval_ctx.track = track_idx;
-        }
-        ctx.set_status(format!("current track {}", track));
-        Ok(EValue::Number(track as f64))
-    });
+    runtime.register_native_with_docs(
+        "seq-set-current-track",
+        "(seq-set-current-track track)",
+        "Set the current 1-based track index for subsequent scratch operations.",
+        move |args, ctx| {
+            let Some(EValue::Number(track)) = args.first() else {
+                return Err("expected 1-based track number".to_string());
+            };
+            let track = *track as isize;
+            if track <= 0 {
+                return Err("tracks are 1-based".to_string());
+            }
+            let track_count = state_for_set_track.active_track_count() as isize;
+            if track > track_count {
+                return Err(format!("track out of range (1..={track_count})"));
+            }
+            let track_idx = (track - 1) as usize;
+            if let Ok(mut eval_ctx) = context_for_set_track.lock() {
+                eval_ctx.track = track_idx;
+            }
+            ctx.set_status(format!("current track {}", track));
+            Ok(EValue::Number(track as f64))
+        },
+    );
 
     let state_for_host_set_track = Arc::clone(&state);
     let context_for_host_set_track = Arc::clone(&context);
@@ -1317,9 +1388,12 @@ fn register_sequencer_natives(
     });
 
     let context_for_step = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-current-step", "(seq-current-step)", "Return the current 1-based step index for the scratch context.", move |_args, _ctx| {
-        Ok(EValue::Number((current_step(&context_for_step) + 1) as f64))
-    });
+    runtime.register_native_with_docs(
+        "seq-current-step",
+        "(seq-current-step)",
+        "Return the current 1-based step index for the scratch context.",
+        move |_args, _ctx| Ok(EValue::Number((current_step(&context_for_step) + 1) as f64)),
+    );
 
     let context_for_host_set_step = Arc::clone(&context);
     runtime.register_native("__host-set-current-step", move |args, _ctx| {
@@ -1338,193 +1412,291 @@ fn register_sequencer_natives(
 
     let state_for_steps = Arc::clone(&state);
     let context_for_steps = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-num-steps", "(seq-num-steps)", "Return the number of steps in the current track.", move |_args, _ctx| {
-        let track = current_track(&context_for_steps);
-        Ok(EValue::Number(
-            state_for_steps.pattern.track_params[track].get_num_steps() as f64,
-        ))
-    });
+    runtime.register_native_with_docs(
+        "seq-num-steps",
+        "(seq-num-steps)",
+        "Return the number of steps in the current track.",
+        move |_args, _ctx| {
+            let track = current_track(&context_for_steps);
+            Ok(EValue::Number(
+                state_for_steps.pattern.track_params[track].get_num_steps() as f64,
+            ))
+        },
+    );
 
     let state_for_toggle = Arc::clone(&state);
     let context_for_toggle = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-toggle-step", "(seq-toggle-step step)", "Toggle the active state of a 1-based step in the current track.", move |args, ctx| {
-        let track_idx = current_track(&context_for_toggle);
-        let step_idx = parse_step_arg(&args, 0)?;
-        state_for_toggle.toggle_step_and_clear_plocks(track_idx, step_idx);
-        let active = state_for_toggle.pattern.patterns[track_idx].is_active(step_idx);
-        ctx.set_status(format!(
-            "track {} step {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            if active { "on" } else { "off" }
-        ));
-        Ok(EValue::Bool(active))
-    });
+    runtime.register_native_with_docs(
+        "seq-toggle-step",
+        "(seq-toggle-step step)",
+        "Toggle the active state of a 1-based step in the current track.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_toggle);
+            let step_idx = parse_step_arg(&args, 0)?;
+            state_for_toggle.toggle_step_and_clear_plocks(track_idx, step_idx);
+            let active = state_for_toggle.pattern.patterns[track_idx].is_active(step_idx);
+            ctx.set_status(format!(
+                "track {} step {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                if active { "on" } else { "off" }
+            ));
+            Ok(EValue::Bool(active))
+        },
+    );
 
     let state_for_step_on = Arc::clone(&state);
     let context_for_step_on = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-step-on", "(seq-step-on step)", "Ensure a 1-based step is active in the current track.", move |args, ctx| {
-        let track_idx = current_track(&context_for_step_on);
-        let step_idx = parse_step_arg(&args, 0)?;
-        state_for_step_on.pattern.patterns[track_idx].set_step_active(step_idx, true);
-        ctx.set_status(format!("track {} step {} on", track_idx + 1, step_idx + 1));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-step-on",
+        "(seq-step-on step)",
+        "Ensure a 1-based step is active in the current track.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_step_on);
+            let step_idx = parse_step_arg(&args, 0)?;
+            state_for_step_on.pattern.patterns[track_idx].set_step_active(step_idx, true);
+            ctx.set_status(format!("track {} step {} on", track_idx + 1, step_idx + 1));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_step_off = Arc::clone(&state);
     let context_for_step_off = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-step-off", "(seq-step-off step)", "Ensure a 1-based step is inactive in the current track.", move |args, ctx| {
-        let track_idx = current_track(&context_for_step_off);
-        let step_idx = parse_step_arg(&args, 0)?;
-        state_for_step_off.clear_step_payload(track_idx, step_idx);
-        ctx.set_status(format!("track {} step {} off", track_idx + 1, step_idx + 1));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-step-off",
+        "(seq-step-off step)",
+        "Ensure a 1-based step is inactive in the current track.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_step_off);
+            let step_idx = parse_step_arg(&args, 0)?;
+            state_for_step_off.clear_step_payload(track_idx, step_idx);
+            ctx.set_status(format!("track {} step {} off", track_idx + 1, step_idx + 1));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_clear_step = Arc::clone(&state);
     let context_for_clear_step = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-clear-step", "(seq-clear-step step)", "Clear all payload data for a 1-based step in the current track.", move |args, ctx| {
-        let track_idx = current_track(&context_for_clear_step);
-        let step_idx = parse_step_arg(&args, 0)?;
-        state_for_clear_step.clear_step_payload(track_idx, step_idx);
-        ctx.set_status(format!("track {} step {} cleared", track_idx + 1, step_idx + 1));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-clear-step",
+        "(seq-clear-step step)",
+        "Clear all payload data for a 1-based step in the current track.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_clear_step);
+            let step_idx = parse_step_arg(&args, 0)?;
+            state_for_clear_step.clear_step_payload(track_idx, step_idx);
+            ctx.set_status(format!(
+                "track {} step {} cleared",
+                track_idx + 1,
+                step_idx + 1
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_clear_track = Arc::clone(&state);
     let context_for_clear_track = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-clear-track", "(seq-clear-track)", "Clear all step payloads in the current track.", move |_args, ctx| {
-        let track_idx = current_track(&context_for_clear_track);
-        let num_steps = state_for_clear_track.pattern.track_params[track_idx].get_num_steps();
-        for step in 0..num_steps {
-            state_for_clear_track.clear_step_payload(track_idx, step);
-        }
-        ctx.set_status(format!("track {} cleared", track_idx + 1));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-clear-track",
+        "(seq-clear-track)",
+        "Clear all step payloads in the current track.",
+        move |_args, ctx| {
+            let track_idx = current_track(&context_for_clear_track);
+            let num_steps = state_for_clear_track.pattern.track_params[track_idx].get_num_steps();
+            for step in 0..num_steps {
+                state_for_clear_track.clear_step_payload(track_idx, step);
+            }
+            ctx.set_status(format!("track {} cleared", track_idx + 1));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_velocity = Arc::clone(&state);
     let context_for_velocity = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-set-velocity", "(seq-set-velocity step value)", "Set the velocity parameter for a 1-based step.", move |args, ctx| {
-        let track_idx = current_track(&context_for_velocity);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let Some(EValue::Number(value)) = args.get(1) else {
-            return Err("expected velocity value".to_string());
-        };
-        state_for_velocity.set_step_param(track_idx, step_idx, StepParam::Velocity, *value as f32);
-        ctx.set_status(format!("track {} step {} velocity {}", track_idx + 1, step_idx + 1, value));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-set-velocity",
+        "(seq-set-velocity step value)",
+        "Set the velocity parameter for a 1-based step.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_velocity);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let Some(EValue::Number(value)) = args.get(1) else {
+                return Err("expected velocity value".to_string());
+            };
+            state_for_velocity.set_step_param(
+                track_idx,
+                step_idx,
+                StepParam::Velocity,
+                *value as f32,
+            );
+            ctx.set_status(format!(
+                "track {} step {} velocity {}",
+                track_idx + 1,
+                step_idx + 1,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_transpose = Arc::clone(&state);
     let context_for_transpose = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-set-transpose", "(seq-set-transpose step value)", "Set the transpose parameter for a 1-based step.", move |args, ctx| {
-        let track_idx = current_track(&context_for_transpose);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let Some(EValue::Number(value)) = args.get(1) else {
-            return Err("expected transpose value".to_string());
-        };
-        state_for_transpose.set_step_param(track_idx, step_idx, StepParam::Transpose, *value as f32);
-        ctx.set_status(format!(
-            "track {} step {} transpose {}",
-            track_idx + 1,
-            step_idx + 1,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-set-transpose",
+        "(seq-set-transpose step value)",
+        "Set the transpose parameter for a 1-based step.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_transpose);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let Some(EValue::Number(value)) = args.get(1) else {
+                return Err("expected transpose value".to_string());
+            };
+            state_for_transpose.set_step_param(
+                track_idx,
+                step_idx,
+                StepParam::Transpose,
+                *value as f32,
+            );
+            ctx.set_status(format!(
+                "track {} step {} transpose {}",
+                track_idx + 1,
+                step_idx + 1,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_adjust = Arc::clone(&state);
     let context_for_adjust = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-adjust-transpose", "(seq-adjust-transpose step delta)", "Adjust the transpose parameter for a 1-based step by a delta.", move |args, ctx| {
-        let track_idx = current_track(&context_for_adjust);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let Some(EValue::Number(value)) = args.get(1) else {
-            return Err("expected transpose delta".to_string());
-        };
-        state_for_adjust.adjust_step_param(track_idx, step_idx, StepParam::Transpose, *value as f32);
-        ctx.set_status(format!(
-            "track {} step {} transpose adjusted by {}",
-            track_idx + 1,
-            step_idx + 1,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-adjust-transpose",
+        "(seq-adjust-transpose step delta)",
+        "Adjust the transpose parameter for a 1-based step by a delta.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_adjust);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let Some(EValue::Number(value)) = args.get(1) else {
+                return Err("expected transpose delta".to_string());
+            };
+            state_for_adjust.adjust_step_param(
+                track_idx,
+                step_idx,
+                StepParam::Transpose,
+                *value as f32,
+            );
+            ctx.set_status(format!(
+                "track {} step {} transpose adjusted by {}",
+                track_idx + 1,
+                step_idx + 1,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_step = Arc::clone(&state);
     let context_for_step_native = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-step", "(seq-step step)", "Return a map snapshot for a 1-based step in the current track.", move |args, _ctx| {
-        let track_idx = current_track(&context_for_step_native);
-        let step_idx = parse_step_arg(&args, 0)?;
-        Ok(step_snapshot_to_value(
-            step_idx,
-            state_for_step.capture_step_snapshot(track_idx, step_idx),
-        ))
-    });
+    runtime.register_native_with_docs(
+        "seq-step",
+        "(seq-step step)",
+        "Return a map snapshot for a 1-based step in the current track.",
+        move |args, _ctx| {
+            let track_idx = current_track(&context_for_step_native);
+            let step_idx = parse_step_arg(&args, 0)?;
+            Ok(step_snapshot_to_value(
+                step_idx,
+                state_for_step.capture_step_snapshot(track_idx, step_idx),
+            ))
+        },
+    );
 
     let state_for_track_steps = Arc::clone(&state);
     let context_for_track_steps = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-track-steps", "(seq-track-steps)", "Return a list of step snapshot maps for the current track.", move |_args, _ctx| {
-        let track_idx = current_track(&context_for_track_steps);
-        let num_steps = state_for_track_steps.pattern.track_params[track_idx].get_num_steps();
-        let mut steps = Vec::with_capacity(num_steps);
-        for step_idx in 0..num_steps {
-            steps.push(step_snapshot_to_value(
-                step_idx,
-                state_for_track_steps.capture_step_snapshot(track_idx, step_idx),
-            ));
-        }
-        Ok(lisp_list(steps))
-    });
+    runtime.register_native_with_docs(
+        "seq-track-steps",
+        "(seq-track-steps)",
+        "Return a list of step snapshot maps for the current track.",
+        move |_args, _ctx| {
+            let track_idx = current_track(&context_for_track_steps);
+            let num_steps = state_for_track_steps.pattern.track_params[track_idx].get_num_steps();
+            let mut steps = Vec::with_capacity(num_steps);
+            for step_idx in 0..num_steps {
+                steps.push(step_snapshot_to_value(
+                    step_idx,
+                    state_for_track_steps.capture_step_snapshot(track_idx, step_idx),
+                ));
+            }
+            Ok(lisp_list(steps))
+        },
+    );
 
     let state_for_rotate = Arc::clone(&state);
     let context_for_rotate = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-rotate-track", "(seq-rotate-track amount)", "Rotate the current track by the given step amount.", move |args, ctx| {
-        let track_idx = current_track(&context_for_rotate);
-        let Some(EValue::Number(direction)) = args.first() else {
-            return Err("expected rotation direction".to_string());
-        };
-        let num_steps = state_for_rotate.pattern.track_params[track_idx].get_num_steps();
-        let steps: Vec<usize> = (0..num_steps).collect();
-        state_for_rotate.rotate_steps(track_idx, &steps, *direction as isize);
-        ctx.set_status(format!("track {} rotated by {}", track_idx + 1, *direction as isize));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-rotate-track",
+        "(seq-rotate-track amount)",
+        "Rotate the current track by the given step amount.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_rotate);
+            let Some(EValue::Number(direction)) = args.first() else {
+                return Err("expected rotation direction".to_string());
+            };
+            let num_steps = state_for_rotate.pattern.track_params[track_idx].get_num_steps();
+            let steps: Vec<usize> = (0..num_steps).collect();
+            state_for_rotate.rotate_steps(track_idx, &steps, *direction as isize);
+            ctx.set_status(format!(
+                "track {} rotated by {}",
+                track_idx + 1,
+                *direction as isize
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_step_plock = Arc::clone(&state);
     let context_for_step_plock = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-plock-step", "(seq-plock-step step :param value)", "Parameter-lock a step parameter using a keyword name.", move |args, ctx| {
-        let track_idx = current_track(&context_for_step_plock);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let param = parse_step_param_arg(&args, 1)?;
-        let value = parse_value_arg(&args, 2, "step param")?;
-        state_for_step_plock.set_step_param(track_idx, step_idx, param, value);
-        ctx.set_status(format!(
-            "track {} step {} {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            param.short_label(),
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-step",
+        "(seq-plock-step step :param value)",
+        "Parameter-lock a step parameter using a keyword name.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_step_plock);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let param = parse_step_param_arg(&args, 1)?;
+            let value = parse_value_arg(&args, 2, "step param")?;
+            state_for_step_plock.set_step_param(track_idx, step_idx, param, value);
+            ctx.set_status(format!(
+                "track {} step {} {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                param.short_label(),
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_timebase_plock = Arc::clone(&state);
     let context_for_timebase_plock = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-plock-timebase", "(seq-plock-timebase step :timebase)", "Set a timebase override for a 1-based step.", move |args, ctx| {
-        let track_idx = current_track(&context_for_timebase_plock);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let timebase = parse_timebase_arg(&args, 1)?;
-        state_for_timebase_plock.pattern.timebase_plocks[track_idx].set(step_idx, timebase);
-        ctx.set_status(format!(
-            "track {} step {} timebase {}",
-            track_idx + 1,
-            step_idx + 1,
-            timebase.label()
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-timebase",
+        "(seq-plock-timebase step :timebase)",
+        "Set a timebase override for a 1-based step.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_timebase_plock);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let timebase = parse_timebase_arg(&args, 1)?;
+            state_for_timebase_plock.pattern.timebase_plocks[track_idx].set(step_idx, timebase);
+            ctx.set_status(format!(
+                "track {} step {} timebase {}",
+                track_idx + 1,
+                step_idx + 1,
+                timebase.label()
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_effect_plock = Arc::clone(&state);
     let context_for_effect_plock = Arc::clone(&context);
@@ -1549,177 +1721,215 @@ fn register_sequencer_natives(
 
     let context_for_effect_param_names = Arc::clone(&context);
     let metadata_for_effect_names = Arc::clone(&metadata);
-    runtime.register_native_with_docs("seq-effect-param-names", "(seq-effect-param-names slot)", "Return a list of parameter names for a 1-based effect slot on the current track.", move |args, _ctx| {
-        let track_idx = current_track(&context_for_effect_param_names);
-        let slot_idx = parse_slot_arg(&args, 0)?;
-        let params = metadata_for_effect_names
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
-            .as_ref()
-            .and_then(|slots| slots.get(slot_idx))
-            .map(|desc| {
-                desc.params
-                    .iter()
-                    .map(|param| EValue::String(param.name.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| "effect slot out of range".to_string())?;
-        Ok(lisp_list(params))
-    });
+    runtime.register_native_with_docs(
+        "seq-effect-param-names",
+        "(seq-effect-param-names slot)",
+        "Return a list of parameter names for a 1-based effect slot on the current track.",
+        move |args, _ctx| {
+            let track_idx = current_track(&context_for_effect_param_names);
+            let slot_idx = parse_slot_arg(&args, 0)?;
+            let params = metadata_for_effect_names
+                .lock()
+                .ok()
+                .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
+                .as_ref()
+                .and_then(|slots| slots.get(slot_idx))
+                .map(|desc| {
+                    desc.params
+                        .iter()
+                        .map(|param| EValue::String(param.name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "effect slot out of range".to_string())?;
+            Ok(lisp_list(params))
+        },
+    );
 
-    runtime.register_native_with_docs("seq-plock-effect", "(seq-plock-effect step slot param-index normalized)", "Set an effect parameter lock for a 1-based step using a normalized 0.0..1.0 value.", move |args, ctx| {
-        let track_idx = current_track(&context_for_effect_plock);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let slot_idx = parse_slot_arg(&args, 1)?;
-        let param_idx = parse_param_index_arg(&args, 2)?;
-        let normalized = parse_normalized_arg(&args, 3, "effect p-lock")?;
-        let Some(slot) = state_for_effect_plock.pattern.effect_chains[track_idx].get(slot_idx) else {
-            return Err("effect slot out of range".to_string());
-        };
-        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
-        if param_idx >= num_params {
-            return Err("effect param index out of range".to_string());
-        }
-        let param_desc = metadata_for_effect_plock
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
-            .as_ref()
-            .and_then(|slots| slots.get(slot_idx))
-            .and_then(|desc| desc.params.get(param_idx))
-            .cloned()
-            .ok_or_else(|| "effect descriptor missing for parameter".to_string())?;
-        let value = param_desc.denormalize(normalized);
-        slot.plocks.set(step_idx, param_idx, value);
-        ctx.set_status(format!(
-            "track {} step {} effect {} param {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            slot_idx + 1,
-            param_idx,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-effect",
+        "(seq-plock-effect step slot param-index normalized)",
+        "Set an effect parameter lock for a 1-based step using a normalized 0.0..1.0 value.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_effect_plock);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let slot_idx = parse_slot_arg(&args, 1)?;
+            let param_idx = parse_param_index_arg(&args, 2)?;
+            let normalized = parse_normalized_arg(&args, 3, "effect p-lock")?;
+            let Some(slot) = state_for_effect_plock.pattern.effect_chains[track_idx].get(slot_idx)
+            else {
+                return Err("effect slot out of range".to_string());
+            };
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            if param_idx >= num_params {
+                return Err("effect param index out of range".to_string());
+            }
+            let param_desc = metadata_for_effect_plock
+                .lock()
+                .ok()
+                .and_then(|metadata| metadata.effect_descriptors.get(track_idx).cloned())
+                .as_ref()
+                .and_then(|slots| slots.get(slot_idx))
+                .and_then(|desc| desc.params.get(param_idx))
+                .cloned()
+                .ok_or_else(|| "effect descriptor missing for parameter".to_string())?;
+            let value = param_desc.denormalize(normalized);
+            slot.plocks.set(step_idx, param_idx, value);
+            ctx.set_status(format!(
+                "track {} step {} effect {} param {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                slot_idx + 1,
+                param_idx,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_effect_plock_raw = Arc::clone(&state);
     let context_for_effect_plock_raw = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-plock-effect-raw", "(seq-plock-effect-raw step slot param-index value)", "Set an effect parameter lock for a 1-based step using the stored engine value.", move |args, ctx| {
-        let track_idx = current_track(&context_for_effect_plock_raw);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let slot_idx = parse_slot_arg(&args, 1)?;
-        let param_idx = parse_param_index_arg(&args, 2)?;
-        let value = parse_value_arg(&args, 3, "effect p-lock")?;
-        let Some(slot) = state_for_effect_plock_raw.pattern.effect_chains[track_idx].get(slot_idx) else {
-            return Err("effect slot out of range".to_string());
-        };
-        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
-        if param_idx >= num_params {
-            return Err("effect param index out of range".to_string());
-        }
-        slot.plocks.set(step_idx, param_idx, value);
-        ctx.set_status(format!(
-            "track {} step {} effect {} param {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            slot_idx + 1,
-            param_idx,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-effect-raw",
+        "(seq-plock-effect-raw step slot param-index value)",
+        "Set an effect parameter lock for a 1-based step using the stored engine value.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_effect_plock_raw);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let slot_idx = parse_slot_arg(&args, 1)?;
+            let param_idx = parse_param_index_arg(&args, 2)?;
+            let value = parse_value_arg(&args, 3, "effect p-lock")?;
+            let Some(slot) =
+                state_for_effect_plock_raw.pattern.effect_chains[track_idx].get(slot_idx)
+            else {
+                return Err("effect slot out of range".to_string());
+            };
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            if param_idx >= num_params {
+                return Err("effect param index out of range".to_string());
+            }
+            slot.plocks.set(step_idx, param_idx, value);
+            ctx.set_status(format!(
+                "track {} step {} effect {} param {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                slot_idx + 1,
+                param_idx,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_instrument_plock = Arc::clone(&state);
     let context_for_instrument_plock = Arc::clone(&context);
     let metadata_for_instrument_plock = Arc::clone(&metadata);
     let context_for_instrument_param_name = Arc::clone(&context);
     let metadata_for_instrument_name = Arc::clone(&metadata);
-    runtime.register_native_with_docs("seq-instrument-param-name", "(seq-instrument-param-name param-index)", "Return the parameter name for a 0-based instrument parameter index on the current track.", move |args, _ctx| {
-        let track_idx = current_track(&context_for_instrument_param_name);
-        let param_idx = parse_param_index_arg(&args, 0)?;
-        let name = metadata_for_instrument_name
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
-            .as_ref()
-            .and_then(|desc| desc.params.get(param_idx))
-            .map(|param| param.name.clone())
-            .ok_or_else(|| "instrument parameter out of range".to_string())?;
-        Ok(EValue::String(name))
-    });
+    runtime.register_native_with_docs(
+        "seq-instrument-param-name",
+        "(seq-instrument-param-name param-index)",
+        "Return the parameter name for a 0-based instrument parameter index on the current track.",
+        move |args, _ctx| {
+            let track_idx = current_track(&context_for_instrument_param_name);
+            let param_idx = parse_param_index_arg(&args, 0)?;
+            let name = metadata_for_instrument_name
+                .lock()
+                .ok()
+                .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+                .as_ref()
+                .and_then(|desc| desc.params.get(param_idx))
+                .map(|param| param.name.clone())
+                .ok_or_else(|| "instrument parameter out of range".to_string())?;
+            Ok(EValue::String(name))
+        },
+    );
 
     let context_for_instrument_param_names = Arc::clone(&context);
     let metadata_for_instrument_names = Arc::clone(&metadata);
-    runtime.register_native_with_docs("seq-instrument-param-names", "(seq-instrument-param-names)", "Return a list of parameter names for the current track's instrument.", move |_args, _ctx| {
-        let track_idx = current_track(&context_for_instrument_param_names);
-        let params = metadata_for_instrument_names
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
-            .as_ref()
-            .map(|desc| {
-                desc.params
-                    .iter()
-                    .map(|param| EValue::String(param.name.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| "instrument descriptor missing".to_string())?;
-        Ok(lisp_list(params))
-    });
+    runtime.register_native_with_docs(
+        "seq-instrument-param-names",
+        "(seq-instrument-param-names)",
+        "Return a list of parameter names for the current track's instrument.",
+        move |_args, _ctx| {
+            let track_idx = current_track(&context_for_instrument_param_names);
+            let params = metadata_for_instrument_names
+                .lock()
+                .ok()
+                .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+                .as_ref()
+                .map(|desc| {
+                    desc.params
+                        .iter()
+                        .map(|param| EValue::String(param.name.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "instrument descriptor missing".to_string())?;
+            Ok(lisp_list(params))
+        },
+    );
 
-    runtime.register_native_with_docs("seq-plock-instrument", "(seq-plock-instrument step param-index normalized)", "Set an instrument parameter lock for a 1-based step using a normalized 0.0..1.0 value.", move |args, ctx| {
-        let track_idx = current_track(&context_for_instrument_plock);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let param_idx = parse_param_index_arg(&args, 1)?;
-        let normalized = parse_normalized_arg(&args, 2, "instrument p-lock")?;
-        let slot = &state_for_instrument_plock.pattern.instrument_slots[track_idx];
-        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
-        if param_idx >= num_params {
-            return Err("instrument param index out of range".to_string());
-        }
-        let param_desc = metadata_for_instrument_plock
-            .lock()
-            .ok()
-            .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
-            .as_ref()
-            .and_then(|desc| desc.params.get(param_idx))
-            .cloned()
-            .ok_or_else(|| "instrument descriptor missing for parameter".to_string())?;
-        let value = param_desc.denormalize(normalized);
-        slot.plocks.set(step_idx, param_idx, value);
-        ctx.set_status(format!(
-            "track {} step {} instrument param {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            param_idx,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-instrument",
+        "(seq-plock-instrument step param-index normalized)",
+        "Set an instrument parameter lock for a 1-based step using a normalized 0.0..1.0 value.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_instrument_plock);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let param_idx = parse_param_index_arg(&args, 1)?;
+            let normalized = parse_normalized_arg(&args, 2, "instrument p-lock")?;
+            let slot = &state_for_instrument_plock.pattern.instrument_slots[track_idx];
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            if param_idx >= num_params {
+                return Err("instrument param index out of range".to_string());
+            }
+            let param_desc = metadata_for_instrument_plock
+                .lock()
+                .ok()
+                .and_then(|metadata| metadata.instrument_descriptors.get(track_idx).cloned())
+                .as_ref()
+                .and_then(|desc| desc.params.get(param_idx))
+                .cloned()
+                .ok_or_else(|| "instrument descriptor missing for parameter".to_string())?;
+            let value = param_desc.denormalize(normalized);
+            slot.plocks.set(step_idx, param_idx, value);
+            ctx.set_status(format!(
+                "track {} step {} instrument param {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                param_idx,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 
     let state_for_instrument_plock_raw = Arc::clone(&state);
     let context_for_instrument_plock_raw = Arc::clone(&context);
-    runtime.register_native_with_docs("seq-plock-instrument-raw", "(seq-plock-instrument-raw step param-index value)", "Set an instrument parameter lock for a 1-based step using the stored engine value.", move |args, ctx| {
-        let track_idx = current_track(&context_for_instrument_plock_raw);
-        let step_idx = parse_step_arg(&args, 0)?;
-        let param_idx = parse_param_index_arg(&args, 1)?;
-        let value = parse_value_arg(&args, 2, "instrument p-lock")?;
-        let slot = &state_for_instrument_plock_raw.pattern.instrument_slots[track_idx];
-        let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
-        if param_idx >= num_params {
-            return Err("instrument param index out of range".to_string());
-        }
-        slot.plocks.set(step_idx, param_idx, value);
-        ctx.set_status(format!(
-            "track {} step {} instrument param {} {}",
-            track_idx + 1,
-            step_idx + 1,
-            param_idx,
-            value
-        ));
-        Ok(EValue::Bool(true))
-    });
+    runtime.register_native_with_docs(
+        "seq-plock-instrument-raw",
+        "(seq-plock-instrument-raw step param-index value)",
+        "Set an instrument parameter lock for a 1-based step using the stored engine value.",
+        move |args, ctx| {
+            let track_idx = current_track(&context_for_instrument_plock_raw);
+            let step_idx = parse_step_arg(&args, 0)?;
+            let param_idx = parse_param_index_arg(&args, 1)?;
+            let value = parse_value_arg(&args, 2, "instrument p-lock")?;
+            let slot = &state_for_instrument_plock_raw.pattern.instrument_slots[track_idx];
+            let num_params = slot.num_params.load(Ordering::Relaxed) as usize;
+            if param_idx >= num_params {
+                return Err("instrument param index out of range".to_string());
+            }
+            slot.plocks.set(step_idx, param_idx, value);
+            ctx.set_status(format!(
+                "track {} step {} instrument param {} {}",
+                track_idx + 1,
+                step_idx + 1,
+                param_idx,
+                value
+            ));
+            Ok(EValue::Bool(true))
+        },
+    );
 }
 
 fn fallback_effect_descriptors(track_count: usize) -> Vec<Vec<EffectDescriptor>> {
@@ -1801,6 +2011,7 @@ fn parse_step_param_arg(args: &[EValue], idx: usize) -> Result<StepParam, String
                 "auxa" | "aux-a" | "aux_a" | "axa" => Ok(StepParam::AuxA),
                 "auxb" | "aux-b" | "aux_b" | "axb" => Ok(StepParam::AuxB),
                 "transpose" | "trn" => Ok(StepParam::Transpose),
+                "pan" => Ok(StepParam::Pan),
                 "chop" | "chp" => Ok(StepParam::Chop),
                 "sync" | "syn" => Ok(StepParam::Sync),
                 _ => Err("unknown step param".to_string()),
@@ -1836,8 +2047,12 @@ fn parse_timebase_arg(args: &[EValue], idx: usize) -> Result<Timebase, String> {
                 "4t" | "quartertriplet" | "quarter-triplet" => Ok(Timebase::QuarterTriplet),
                 "8t" | "eighthtriplet" | "eighth-triplet" => Ok(Timebase::EighthTriplet),
                 "16t" | "sixteenthtriplet" | "sixteenth-triplet" => Ok(Timebase::SixteenthTriplet),
-                "32t" | "thirtysecondtriplet" | "thirty-second-triplet" => Ok(Timebase::ThirtySecondTriplet),
-                "64t" | "sixtyfourthtriplet" | "sixty-fourth-triplet" => Ok(Timebase::SixtyFourthTriplet),
+                "32t" | "thirtysecondtriplet" | "thirty-second-triplet" => {
+                    Ok(Timebase::ThirtySecondTriplet)
+                }
+                "64t" | "sixtyfourthtriplet" | "sixty-fourth-triplet" => {
+                    Ok(Timebase::SixtyFourthTriplet)
+                }
                 "prh" | "polyrhythm" => Ok(Timebase::Polyrhythm),
                 _ => Err("unknown timebase".to_string()),
             }
@@ -1864,7 +2079,8 @@ fn lisp_value(value: EValue) -> Rc<RefCell<EValue>> {
 
 fn lisp_list(items: Vec<EValue>) -> EValue {
     EValue::List(
-        items.into_iter()
+        items
+            .into_iter()
             .map(|value| Rc::new(RefCell::new(value)))
             .collect(),
     )
@@ -1889,6 +2105,10 @@ fn step_snapshot_to_value(step: usize, snapshot: StepSnapshot) -> EValue {
     map.insert(
         "transpose".to_string(),
         lisp_number(snapshot.params[StepParam::Transpose.index()] as f64),
+    );
+    map.insert(
+        "pan".to_string(),
+        lisp_number(snapshot.params[StepParam::Pan.index()] as f64),
     );
     map.insert(
         "chord".to_string(),
@@ -2028,7 +2248,8 @@ where
                             })
                         })
                         .unwrap_or_else(|| "untitled".to_string());
-                    let save_path = path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
+                    let save_path =
+                        path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
                     std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))).ok();
                     if let Err(error) = std::fs::write(&save_path, &source) {
                         editor.handle_host_event(HostEvent::Error(format!(
@@ -2066,7 +2287,8 @@ where
                             })
                         })
                         .unwrap_or_else(|| "untitled".to_string());
-                    let save_path = path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
+                    let save_path =
+                        path.unwrap_or_else(|| editor_file_path(kind.clone(), Some(&name)));
                     std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))).ok();
                     if let Err(error) = std::fs::write(&save_path, &source) {
                         editor.handle_host_event(HostEvent::Error(format!(
@@ -2259,13 +2481,16 @@ where
                     pending_job = Some(job);
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    editor.handle_host_event(HostEvent::Error("compile worker crashed".to_string()));
+                    editor
+                        .handle_host_event(HostEvent::Error("compile worker crashed".to_string()));
                 }
             }
         }
 
         if editor.needs_redraw() {
-            terminal.draw(|frame| eseq_tui::render(frame, &mut editor)).ok()?;
+            terminal
+                .draw(|frame| eseq_tui::render(frame, &mut editor))
+                .ok()?;
             editor.clear_needs_redraw();
         }
 
@@ -2279,7 +2504,9 @@ where
                     .path
                     .clone()
                     .unwrap_or_else(|| editor_file_path(kind.clone(), Some(&buffer.name)));
-                if let Err(error) = std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new("."))) {
+                if let Err(error) =
+                    std::fs::create_dir_all(save_path.parent().unwrap_or(Path::new(".")))
+                {
                     editor.handle_host_event(HostEvent::Error(format!(
                         "failed to create parent dir for '{}': {error}",
                         save_path.display()
@@ -2304,9 +2531,7 @@ where
                 if last_live_applied
                     .as_ref()
                     .map(|applied| {
-                        applied.kind == kind
-                            && applied.name == name
-                            && applied.source == source
+                        applied.kind == kind && applied.name == name && applied.source == source
                     })
                     .unwrap_or(false)
                 {
@@ -2628,14 +2853,14 @@ pub fn run_instrument_editor_flow(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScratchControlRuntime, fallback_effect_descriptors, fallback_instrument_descriptors,
-        new_eval_context, register_sequencer_natives, shared_native_metadata,
+        fallback_effect_descriptors, fallback_instrument_descriptors, new_eval_context,
+        register_sequencer_natives, shared_native_metadata, ScratchControlRuntime,
     };
     use crate::effects::EffectDescriptor;
-    use crate::sequencer::{StepParam, default_empty_effect_chain, SequencerState};
-    use eseqlisp::{BufferMode, Editor, EditorConfig, Runtime};
-    use eseqlisp::vm::Value;
+    use crate::sequencer::{default_empty_effect_chain, SequencerState, StepParam};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use eseqlisp::vm::Value;
+    use eseqlisp::{BufferMode, Editor, EditorConfig, Runtime};
     use std::sync::Arc;
 
     #[test]
@@ -2785,7 +3010,9 @@ mod tests {
             ),
         );
 
-        let result = runtime.eval_str("(seq-plock-step 2 :velocity 0.7)").unwrap();
+        let result = runtime
+            .eval_str("(seq-plock-step 2 :velocity 0.7)")
+            .unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
         assert_eq!(state.pattern.step_data[0].get(1, StepParam::Velocity), 0.7);
@@ -2808,7 +3035,10 @@ mod tests {
         let result = runtime.eval_str("(seq-plock-timebase 3 :8t)").unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
-        assert_eq!(state.pattern.timebase_plocks[0].get(2), Some(crate::sequencer::Timebase::EighthTriplet));
+        assert_eq!(
+            state.pattern.timebase_plocks[0].get(2),
+            Some(crate::sequencer::Timebase::EighthTriplet)
+        );
     }
 
     #[test]
@@ -2827,7 +3057,10 @@ mod tests {
         let result = runtime.eval_str("(seq-plock-effect 1 1 2 0.5)").unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
-        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 2), Some(expected));
+        assert_eq!(
+            state.pattern.effect_chains[0][0].plocks.get(0, 2),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -2844,10 +3077,15 @@ mod tests {
             ),
         );
 
-        let result = runtime.eval_str("(seq-plock-effect-raw 1 1 2 440.0)").unwrap();
+        let result = runtime
+            .eval_str("(seq-plock-effect-raw 1 1 2 440.0)")
+            .unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
-        assert_eq!(state.pattern.effect_chains[0][0].plocks.get(0, 2), Some(440.0));
+        assert_eq!(
+            state.pattern.effect_chains[0][0].plocks.get(0, 2),
+            Some(440.0)
+        );
     }
 
     #[test]
@@ -2918,7 +3156,10 @@ mod tests {
         let result = runtime.eval_str("(seq-plock-instrument 1 2 0.25)").unwrap();
 
         assert_eq!(result, Some(Value::Bool(true)));
-        assert_eq!(state.pattern.instrument_slots[0].plocks.get(0, 2), Some(expected));
+        assert_eq!(
+            state.pattern.instrument_slots[0].plocks.get(0, 2),
+            Some(expected)
+        );
     }
 
     #[test]

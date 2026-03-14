@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::sync::atomic::Ordering;
 
 use crate::sequencer::{SwingResolution, Timebase, MAX_STEPS};
@@ -10,13 +10,20 @@ use crate::accumulator::{AccumMode, ACCUMULATOR_REGISTRY};
 
 use super::{
     App, EffectTab, InputMode, Region, AC_FN, AC_LAST, AC_LIMIT, AC_MODE, TP_ATTACK, TP_FTS,
-    TP_GATE, TP_LAST, TP_MASTER, TP_POLY, TP_RELEASE, TP_SEND, TP_STEPS, TP_SWING,
+    TP_GATE, TP_LAST, TP_MASTER, TP_PAN, TP_POLY, TP_RELEASE, TP_SEND, TP_STEPS, TP_SWING,
     TP_SWING_RESOLUTION, TP_TIMEBASE, TP_VOLUME,
 };
 
 /// Static labels for the timebase dropdown (derived from Timebase::LABELS).
 const TIMEBASE_LABELS: [&str; Timebase::COUNT] = Timebase::LABELS;
 const SWING_RESOLUTION_LABELS: [&str; SwingResolution::COUNT] = SwingResolution::LABELS;
+const TOOLS_ROW_COUNT: usize = TP_LAST + AC_LAST + 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolRow {
+    Track(usize),
+    Accum(usize),
+}
 
 // ── App impl: params input ──
 
@@ -35,51 +42,41 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
-
-        match self.ui.params_column {
-            0 => self.handle_track_params_column(code),
-            1 => self.handle_effects_column(code, _modifiers),
-            _ => {}
-        }
+        self.handle_effects_column(code, _modifiers);
     }
 
     pub(super) fn handle_track_params_column(&mut self, code: KeyCode) {
-        if self.ui.track_params_tab == 1 {
-            self.handle_accum_params_column(code);
-            return;
-        }
-
         let tp = &self.state.pattern.track_params[self.ui.cursor_track];
 
         match code {
             KeyCode::Up => {
-                if self.ui.track_param_cursor > 0 {
-                    self.ui.track_param_cursor -= 1;
+                if self.ui.tools_cursor > 0 {
+                    self.ui.tools_cursor -= 1;
+                    self.sync_tools_cursor();
                 }
             }
             KeyCode::Down => {
-                if self.ui.track_param_cursor < TP_LAST {
-                    self.ui.track_param_cursor += 1;
+                if self.ui.tools_cursor + 1 < TOOLS_ROW_COUNT {
+                    self.ui.tools_cursor += 1;
+                    self.sync_tools_cursor();
                 }
             }
-            KeyCode::Right => {
-                // Track tab → Accum tab (not effects directly)
-                self.ui.track_params_tab = 1;
-            }
+            KeyCode::Right => {}
             KeyCode::Left => {} // Already at leftmost column
-            KeyCode::Enter => {
-                if self.ui.track_param_cursor == TP_GATE {
+            KeyCode::Enter => match self.active_tool_row() {
+                ToolRow::Track(TP_GATE) => {
                     self.for_each_selected_track(|app, track| {
                         app.state.pattern.track_params[track].toggle_gate();
                     });
-                } else if self.ui.track_param_cursor == TP_POLY {
+                }
+                ToolRow::Track(TP_POLY) => {
                     self.for_each_selected_track(|app, track| {
                         app.state.pattern.track_params[track].toggle_polyphonic();
                     });
-                } else if self.ui.track_param_cursor == TP_TIMEBASE {
+                }
+                ToolRow::Track(TP_TIMEBASE) => {
                     self.ui.dropdown_open = true;
                     self.ui.track_param_dropdown = true;
-                    // Show p-locked value for selected step, or track default
                     let current_tb = if self.has_selection() {
                         let step = self.selected_steps()[0];
                         self.state.pattern.timebase_plocks[self.ui.cursor_track]
@@ -90,72 +87,123 @@ impl App {
                     };
                     self.ui.dropdown_cursor = current_tb as u8 as usize;
                     self.ui.input_mode = InputMode::Dropdown;
-                } else if self.ui.track_param_cursor == TP_SWING_RESOLUTION {
+                }
+                ToolRow::Track(TP_SWING_RESOLUTION) => {
                     self.ui.dropdown_open = true;
                     self.ui.track_param_dropdown = true;
                     self.ui.dropdown_cursor = tp.get_swing_resolution() as usize;
                     self.ui.input_mode = InputMode::Dropdown;
-                } else if self.ui.track_param_cursor == TP_FTS {
+                }
+                ToolRow::Track(TP_FTS) => {
                     self.ui.dropdown_open = true;
                     self.ui.track_param_dropdown = true;
                     self.ui.dropdown_cursor = tp.get_fts_scale();
                     self.ui.input_mode = InputMode::Dropdown;
                 }
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => match self.ui.track_param_cursor {
-                TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() + 5.0),
-                TP_RELEASE => tp.set_release_ms(tp.get_release_ms() + 10.0),
-                TP_SWING => tp.set_swing(tp.get_swing() + 1.0),
-                TP_SWING_RESOLUTION => tp.next_swing_resolution(),
-                TP_STEPS => {
+                ToolRow::Accum(AC_FN) => {
+                    self.ui.dropdown_open = true;
+                    self.ui.track_param_dropdown = true;
+                    self.ui.dropdown_cursor = tp.get_accumulator_idx();
+                    self.ui.input_mode = InputMode::Dropdown;
+                }
+                ToolRow::Accum(AC_MODE) => {
+                    self.ui.dropdown_open = true;
+                    self.ui.track_param_dropdown = true;
+                    self.ui.dropdown_cursor = tp.get_accum_mode() as usize;
+                    self.ui.input_mode = InputMode::Dropdown;
+                }
+                _ => {}
+            },
+            KeyCode::Char('+') | KeyCode::Char('=') => match self.active_tool_row() {
+                ToolRow::Track(TP_ATTACK) => tp.set_attack_ms(tp.get_attack_ms() + 5.0),
+                ToolRow::Track(TP_RELEASE) => tp.set_release_ms(tp.get_release_ms() + 10.0),
+                ToolRow::Track(TP_SWING) => tp.set_swing(tp.get_swing() + 1.0),
+                ToolRow::Track(TP_SWING_RESOLUTION) => tp.next_swing_resolution(),
+                ToolRow::Track(TP_STEPS) => {
                     tp.set_num_steps(tp.get_num_steps() + 1);
                     self.clamp_cursor_to_steps();
                 }
-                TP_VOLUME => self.adjust_track_volume(0.05),
-                TP_TIMEBASE => tp.next_timebase(),
-                TP_SEND => self.adjust_track_send(0.05),
-                TP_MASTER => self.adjust_master_volume(0.05),
-                TP_FTS => {
+                ToolRow::Track(TP_VOLUME) => self.adjust_track_volume(0.05),
+                ToolRow::Track(TP_PAN) => self.adjust_track_pan(0.05),
+                ToolRow::Track(TP_TIMEBASE) => tp.next_timebase(),
+                ToolRow::Track(TP_SEND) => self.adjust_track_send(0.05),
+                ToolRow::Track(TP_MASTER) => self.adjust_master_volume(0.05),
+                ToolRow::Track(TP_FTS) => {
                     tp.set_fts_scale((tp.get_fts_scale() + 1).min(crate::scale::SCALES.len() - 1))
                 }
+                ToolRow::Accum(AC_LIMIT) => self.for_each_selected_track(|app, track| {
+                    let tp = &app.state.pattern.track_params[track];
+                    tp.set_accum_limit(tp.get_accum_limit() + 1.0);
+                }),
                 _ => {}
             },
-            KeyCode::Char('-') => match self.ui.track_param_cursor {
-                TP_ATTACK => tp.set_attack_ms(tp.get_attack_ms() - 5.0),
-                TP_RELEASE => tp.set_release_ms(tp.get_release_ms() - 10.0),
-                TP_SWING => tp.set_swing(tp.get_swing() - 1.0),
-                TP_SWING_RESOLUTION => tp.prev_swing_resolution(),
-                TP_STEPS => {
+            KeyCode::Char('-') => match self.active_tool_row() {
+                ToolRow::Track(TP_ATTACK) => tp.set_attack_ms(tp.get_attack_ms() - 5.0),
+                ToolRow::Track(TP_RELEASE) => tp.set_release_ms(tp.get_release_ms() - 10.0),
+                ToolRow::Track(TP_SWING) => tp.set_swing(tp.get_swing() - 1.0),
+                ToolRow::Track(TP_SWING_RESOLUTION) => tp.prev_swing_resolution(),
+                ToolRow::Track(TP_STEPS) => {
                     tp.set_num_steps(tp.get_num_steps().saturating_sub(1).max(1));
                     self.clamp_cursor_to_steps();
                 }
-                TP_VOLUME => self.adjust_track_volume(-0.05),
-                TP_TIMEBASE => tp.prev_timebase(),
-                TP_SEND => self.adjust_track_send(-0.05),
-                TP_MASTER => self.adjust_master_volume(-0.05),
-                TP_FTS => tp.set_fts_scale(tp.get_fts_scale().saturating_sub(1)),
+                ToolRow::Track(TP_VOLUME) => self.adjust_track_volume(-0.05),
+                ToolRow::Track(TP_PAN) => self.adjust_track_pan(-0.05),
+                ToolRow::Track(TP_TIMEBASE) => tp.prev_timebase(),
+                ToolRow::Track(TP_SEND) => self.adjust_track_send(-0.05),
+                ToolRow::Track(TP_MASTER) => self.adjust_master_volume(-0.05),
+                ToolRow::Track(TP_FTS) => tp.set_fts_scale(tp.get_fts_scale().saturating_sub(1)),
+                ToolRow::Accum(AC_LIMIT) => self.for_each_selected_track(|app, track| {
+                    let tp = &app.state.pattern.track_params[track];
+                    tp.set_accum_limit(tp.get_accum_limit() - 1.0);
+                }),
                 _ => {}
             },
             KeyCode::Backspace | KeyCode::Delete => {
-                // Clear timebase p-locks on selected steps
-                if self.ui.track_param_cursor == TP_TIMEBASE && self.has_selection() {
+                if self.active_tool_row() == ToolRow::Track(TP_TIMEBASE) && self.has_selection() {
                     for step in self.selected_steps() {
                         self.state.pattern.timebase_plocks[self.ui.cursor_track].clear(step);
                     }
                 }
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                if self.ui.track_param_cursor > TP_GATE
-                    && self.ui.track_param_cursor != TP_POLY
-                    && self.ui.track_param_cursor != TP_TIMEBASE
-                    && self.ui.track_param_cursor != TP_SWING_RESOLUTION
+            KeyCode::Char(c) if c.is_ascii_digit() => match self.active_tool_row() {
+                ToolRow::Track(idx)
+                    if idx > TP_GATE
+                        && idx != TP_POLY
+                        && idx != TP_TIMEBASE
+                        && idx != TP_SWING_RESOLUTION =>
                 {
                     self.ui.value_buffer.clear();
                     self.ui.value_buffer.push(c);
                     self.ui.input_mode = InputMode::ValueEntry;
                 }
-            }
+                ToolRow::Accum(AC_LIMIT) => {
+                    self.ui.value_buffer.clear();
+                    self.ui.value_buffer.push(c);
+                    self.ui.input_mode = InputMode::ValueEntry;
+                }
+                _ => {}
+            },
             _ => {}
+        }
+    }
+
+    pub(super) fn active_tool_row(&self) -> ToolRow {
+        if self.ui.tools_cursor <= TP_LAST {
+            ToolRow::Track(self.ui.tools_cursor)
+        } else {
+            ToolRow::Accum(self.ui.tools_cursor - (TP_LAST + 1))
+        }
+    }
+
+    pub(super) fn sync_tools_cursor(&mut self) {
+        self.ui.tools_cursor = self.ui.tools_cursor.min(TOOLS_ROW_COUNT.saturating_sub(1));
+        let visible = self.ui.layout.track_params_inner.height as usize;
+        if visible > 0 {
+            if self.ui.tools_cursor < self.ui.tools_scroll_offset {
+                self.ui.tools_scroll_offset = self.ui.tools_cursor;
+            } else if self.ui.tools_cursor >= self.ui.tools_scroll_offset + visible {
+                self.ui.tools_scroll_offset = self.ui.tools_cursor + 1 - visible;
+            }
         }
     }
 
@@ -185,9 +233,26 @@ impl App {
             crate::audiograph::params_push_wrapper(
                 self.graph.lg.0,
                 crate::audiograph::ParamMsg {
-                    idx: 0,
-                    logical_id: node.voice_sum_id as u64,
+                    idx: crate::stereo_panner::STEREO_PANNER_PARAM_VOLUME,
+                    logical_id: node.pan_id as u64,
                     fvalue: tp.get_volume(),
+                },
+            );
+        }
+    }
+
+    pub(super) fn push_track_pan(&self, track: usize) {
+        let Some(node) = self.graph.track_node_ids.get(track) else {
+            return;
+        };
+        let tp = &self.state.pattern.track_params[track];
+        unsafe {
+            crate::audiograph::params_push_wrapper(
+                self.graph.lg.0,
+                crate::audiograph::ParamMsg {
+                    idx: crate::stereo_panner::STEREO_PANNER_PARAM_PAN,
+                    logical_id: node.pan_id as u64,
+                    fvalue: tp.get_pan(),
                 },
             );
         }
@@ -209,81 +274,6 @@ impl App {
         }
     }
 
-    fn handle_accum_params_column(&mut self, code: KeyCode) {
-        let tp = &self.state.pattern.track_params[self.ui.cursor_track];
-        match code {
-            KeyCode::Up => {
-                if self.ui.accum_cursor > 0 {
-                    self.ui.accum_cursor -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.ui.accum_cursor < AC_LAST {
-                    self.ui.accum_cursor += 1;
-                }
-            }
-            KeyCode::Enter => match self.ui.accum_cursor {
-                AC_FN | AC_MODE => {
-                    self.ui.dropdown_open = true;
-                    self.ui.track_param_dropdown = true;
-                    self.ui.dropdown_cursor = if self.ui.accum_cursor == AC_FN {
-                        tp.get_accumulator_idx()
-                    } else {
-                        tp.get_accum_mode() as usize
-                    };
-                    self.ui.input_mode = InputMode::Dropdown;
-                }
-                _ => {}
-            },
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                if self.ui.accum_cursor == AC_LIMIT {
-                    self.for_each_selected_track(|app, track| {
-                        let tp = &app.state.pattern.track_params[track];
-                        tp.set_accum_limit(tp.get_accum_limit() + 1.0);
-                    });
-                }
-            }
-            KeyCode::Char('-') => {
-                if self.ui.accum_cursor == AC_LIMIT {
-                    self.for_each_selected_track(|app, track| {
-                        let tp = &app.state.pattern.track_params[track];
-                        tp.set_accum_limit(tp.get_accum_limit() - 1.0);
-                    });
-                }
-            }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                if self.ui.accum_cursor == AC_LIMIT {
-                    self.ui.value_buffer.clear();
-                    self.ui.value_buffer.push(c);
-                    self.ui.input_mode = InputMode::ValueEntry;
-                }
-            }
-            KeyCode::Left => {
-                self.ui.track_params_tab = 0;
-            }
-            KeyCode::Right => {
-                self.ui.params_column = 1;
-                if self.is_current_custom_track() {
-                    let visible = self.visible_effect_indices();
-                    if !matches!(self.ui.effect_tab, EffectTab::Slot(idx) if visible.contains(&idx))
-                        && !matches!(
-                            self.ui.effect_tab,
-                            EffectTab::Synth
-                                | EffectTab::Mod
-                                | EffectTab::Sources
-                                | EffectTab::Reverb
-                        )
-                    {
-                        self.ui.effect_tab = EffectTab::Synth;
-                        self.ui.instrument_param_cursor = 0;
-                        self.ui.synth_scroll_offset = 0;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn adjust_track_send(&mut self, delta: f32) {
         self.for_each_selected_track(|app, track| {
             let tp = &app.state.pattern.track_params[track];
@@ -297,6 +287,14 @@ impl App {
             let tp = &app.state.pattern.track_params[track];
             tp.set_volume(tp.get_volume() + delta);
             app.push_track_volume(track);
+        });
+    }
+
+    fn adjust_track_pan(&mut self, delta: f32) {
+        self.for_each_selected_track(|app, track| {
+            let tp = &app.state.pattern.track_params[track];
+            tp.set_pan(tp.get_pan() + delta);
+            app.push_track_pan(track);
         });
     }
 
@@ -339,21 +337,16 @@ impl App {
 
     fn dropdown_max_items(&self) -> usize {
         if self.ui.track_param_dropdown {
-            // Accum tab dropdowns
-            if self.ui.track_params_tab == 1 {
-                return match self.ui.accum_cursor {
-                    AC_FN => ACCUMULATOR_REGISTRY.len(),
-                    AC_MODE => AccumMode::COUNT,
-                    _ => 0,
-                };
+            match self.active_tool_row() {
+                ToolRow::Accum(AC_FN) => return ACCUMULATOR_REGISTRY.len(),
+                ToolRow::Accum(AC_MODE) => return AccumMode::COUNT,
+                ToolRow::Track(TP_FTS) => {
+                    return crate::scale::SCALES.len();
+                }
+                ToolRow::Track(TP_SWING_RESOLUTION) => return SwingResolution::COUNT,
+                ToolRow::Track(_) => return Timebase::COUNT,
+                _ => return 0,
             }
-            if self.ui.track_param_cursor == TP_FTS {
-                return crate::scale::SCALES.len();
-            }
-            if self.ui.track_param_cursor == TP_SWING_RESOLUTION {
-                return SwingResolution::COUNT;
-            }
-            return Timebase::COUNT;
         }
         // Synth tab dropdown
         if self.ui.effect_tab == EffectTab::Synth {
@@ -466,46 +459,47 @@ impl App {
 
     fn apply_dropdown_selection(&mut self) {
         if self.ui.track_param_dropdown {
-            if self.ui.track_params_tab == 1 {
-                self.for_each_selected_track(|app, track| {
-                    let tp = &app.state.pattern.track_params[track];
-                    match app.ui.accum_cursor {
-                        AC_FN => {
-                            tp.set_accumulator_idx(app.ui.dropdown_cursor);
-                            if let Some(def) = ACCUMULATOR_REGISTRY.get(app.ui.dropdown_cursor) {
-                                tp.set_accum_limit(def.default_limit);
+            match self.active_tool_row() {
+                ToolRow::Accum(row) => {
+                    self.for_each_selected_track(|app, track| {
+                        let tp = &app.state.pattern.track_params[track];
+                        match row {
+                            AC_FN => {
+                                tp.set_accumulator_idx(app.ui.dropdown_cursor);
+                                if let Some(def) = ACCUMULATOR_REGISTRY.get(app.ui.dropdown_cursor)
+                                {
+                                    tp.set_accum_limit(def.default_limit);
+                                }
                             }
+                            AC_MODE => tp.set_accum_mode(app.ui.dropdown_cursor as u32),
+                            _ => {}
                         }
-                        AC_MODE => tp.set_accum_mode(app.ui.dropdown_cursor as u32),
-                        _ => {}
-                    }
-                });
-                return;
-            }
-            if self.ui.track_param_cursor == TP_FTS {
-                let scale_idx = self.ui.dropdown_cursor;
-                self.for_each_selected_track(|app, track| {
-                    app.state.pattern.track_params[track].set_fts_scale(scale_idx);
-                });
-                return;
-            }
-            if self.ui.track_param_cursor == TP_SWING_RESOLUTION {
-                let resolution = SwingResolution::from_index(self.ui.dropdown_cursor as u32);
-                self.for_each_selected_track(|app, track| {
-                    app.state.pattern.track_params[track].set_swing_resolution(resolution);
-                });
-                return;
-            }
-            let tb = Timebase::from_index(self.ui.dropdown_cursor as u32);
-            if self.has_selection() {
-                // P-lock: set timebase override for selected steps
-                for step in self.selected_steps() {
-                    self.state.pattern.timebase_plocks[self.ui.cursor_track].set(step, tb);
+                    });
                 }
-            } else {
-                self.for_each_selected_track(|app, track| {
-                    app.state.pattern.track_params[track].set_timebase(tb);
-                });
+                ToolRow::Track(TP_FTS) => {
+                    let scale_idx = self.ui.dropdown_cursor;
+                    self.for_each_selected_track(|app, track| {
+                        app.state.pattern.track_params[track].set_fts_scale(scale_idx);
+                    });
+                }
+                ToolRow::Track(TP_SWING_RESOLUTION) => {
+                    let resolution = SwingResolution::from_index(self.ui.dropdown_cursor as u32);
+                    self.for_each_selected_track(|app, track| {
+                        app.state.pattern.track_params[track].set_swing_resolution(resolution);
+                    });
+                }
+                ToolRow::Track(_) => {
+                    let tb = Timebase::from_index(self.ui.dropdown_cursor as u32);
+                    if self.has_selection() {
+                        for step in self.selected_steps() {
+                            self.state.pattern.timebase_plocks[self.ui.cursor_track].set(step, tb);
+                        }
+                    } else {
+                        self.for_each_selected_track(|app, track| {
+                            app.state.pattern.track_params[track].set_timebase(tb);
+                        });
+                    }
+                }
             }
             return;
         }
@@ -595,99 +589,30 @@ impl App {
 
 pub(super) fn draw_params_region(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.ui.focused_region == Region::Params;
-
-    // Horizontal split: track params | effects
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40), // Track params column
-            Constraint::Percentage(60), // Effects column
-        ])
-        .split(area);
-
-    draw_track_params_column(frame, app, h_chunks[0], is_focused);
-    draw_effects_column(frame, app, h_chunks[1], is_focused);
+    draw_effects_column(frame, app, area, is_focused);
 }
 
-fn draw_track_params_column(frame: &mut Frame, app: &mut App, area: Rect, region_focused: bool) {
+pub(super) fn draw_track_params_column(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    region_focused: bool,
+) {
     let col_focused = region_focused && app.ui.params_column == 0;
-    let border_style = if col_focused {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(Color::Rgb(60, 60, 60))
-    };
+    app.ui.layout.track_params_inner = area;
 
-    let tab = app.ui.track_params_tab;
-
-    // Tab labels matching the effects column style
-    let track_selected = tab == 0;
-    let accum_selected = tab == 1;
-    let track_style = if track_selected && col_focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(100, 160, 220))
-            .bold()
-    } else if track_selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(50, 80, 110))
-    } else {
-        Style::default().fg(Color::Rgb(50, 80, 110))
-    };
-    let accum_style = if accum_selected && col_focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(200, 100, 140))
-            .bold()
-    } else if accum_selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(100, 50, 70))
-    } else {
-        Style::default().fg(Color::Rgb(100, 50, 70))
-    };
-    let track_label = if track_selected {
-        "[< Track >]"
-    } else {
-        "[  Track  ]"
-    };
-    let accum_label = if accum_selected {
-        "[< Accum >]"
-    } else {
-        "[  Accum  ]"
-    };
-
-    let title_spans = vec![
-        Span::styled(track_label, track_style),
-        Span::raw(" "),
-        Span::styled(accum_label, accum_style),
-    ];
-
-    let block = Block::default()
-        .title(Line::from(title_spans))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    app.ui.layout.track_params_inner = inner;
-
-    if app.tracks.is_empty() || inner.height < 1 {
+    if app.tracks.is_empty() || area.height < 1 {
         return;
     }
 
-    if tab == 1 {
-        draw_accum_tab(frame, app, inner, col_focused);
-    } else {
-        draw_track_tab(frame, app, inner, col_focused);
-    }
+    app.sync_tools_cursor();
+    draw_tools_list(frame, app, area, col_focused);
 
     if app.ui.dropdown_open && app.ui.track_param_dropdown && col_focused {
-        draw_track_param_dropdown(frame, app, inner);
+        draw_track_param_dropdown(frame, app, area);
     }
 }
-
-fn draw_track_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
+fn draw_tools_list(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
     let tp = &app.state.pattern.track_params[app.ui.cursor_track];
     let attack = tp.get_attack_ms();
     let release = tp.get_release_ms();
@@ -695,6 +620,7 @@ fn draw_track_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
     let swing_resolution = tp.get_swing_resolution();
     let steps = tp.get_num_steps();
     let volume = tp.get_volume();
+    let pan = tp.get_pan();
     let default_tb = tp.get_timebase();
     let timebase_display = if app.has_selection() {
         let step = app.selected_steps()[0];
@@ -708,7 +634,7 @@ fn draw_track_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
     let send = tp.get_send();
     let master = f32::from_bits(app.state.transport.master_volume.load(Ordering::Relaxed));
 
-    let params: Vec<(&str, String, Option<f32>)> = vec![
+    let mut params: Vec<(&str, String, Option<f32>)> = vec![
         (
             "gate",
             if tp.is_gate_on() {
@@ -736,6 +662,7 @@ fn draw_track_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
             Some(steps as f32 / MAX_STEPS as f32),
         ),
         ("vol", format!("{:.2}", volume), Some(volume)),
+        ("pan", format!("{:+.2}", pan), Some((pan + 1.0) * 0.5)),
         ("timebase", timebase_display, None),
         ("send", format!("{:.2}", send), Some(send)),
         ("master", format!("{:.2}", master), Some(master / 2.0)),
@@ -758,21 +685,6 @@ fn draw_track_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
             None,
         ),
     ];
-
-    let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
-    draw_param_rows(
-        frame,
-        app,
-        area,
-        col_focused,
-        &params,
-        app.ui.track_param_cursor,
-        is_entering_value,
-    );
-}
-
-fn draw_accum_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
-    let tp = &app.state.pattern.track_params[app.ui.cursor_track];
     let accum_idx = tp.get_accumulator_idx();
     let accum_name = ACCUMULATOR_REGISTRY
         .get(accum_idx)
@@ -781,11 +693,11 @@ fn draw_accum_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
     let limit = tp.get_accum_limit();
     let mode = AccumMode::from_u32(tp.get_accum_mode());
 
-    let params: Vec<(&str, String, Option<f32>)> = vec![
-        ("fn", accum_name.to_string(), None),
-        ("limit", format!("{:.0}", limit), Some(limit / 127.0)),
-        ("mode", mode.label().to_string(), None),
-    ];
+    params.extend_from_slice(&[
+        ("acc fn", accum_name.to_string(), None),
+        ("acc lim", format!("{:.0}", limit), Some(limit / 127.0)),
+        ("acc mode", mode.label().to_string(), None),
+    ]);
 
     let is_entering_value = col_focused && app.ui.input_mode == InputMode::ValueEntry;
     draw_param_rows(
@@ -794,7 +706,8 @@ fn draw_accum_tab(frame: &mut Frame, app: &App, area: Rect, col_focused: bool) {
         area,
         col_focused,
         &params,
-        app.ui.accum_cursor,
+        app.ui.tools_cursor,
+        app.ui.tools_scroll_offset,
         is_entering_value,
     );
 }
@@ -807,14 +720,10 @@ fn draw_param_rows(
     col_focused: bool,
     params: &[(&str, String, Option<f32>)],
     cursor: usize,
+    scroll: usize,
     is_entering_value: bool,
 ) {
     let visible = area.height as usize;
-    let scroll = if cursor >= visible {
-        cursor + 1 - visible
-    } else {
-        0
-    };
 
     for (i, (name, value, slider)) in params.iter().enumerate().skip(scroll) {
         let row = i - scroll;
@@ -957,52 +866,49 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_track_param_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    if app.ui.track_params_tab == 1 {
-        let anchor = app.ui.accum_cursor as u16;
-        match app.ui.accum_cursor {
-            AC_FN => {
-                let names: Vec<&str> = ACCUMULATOR_REGISTRY.iter().map(|d| d.name).collect();
-                draw_dropdown_items(frame, &names, app.ui.dropdown_cursor, area, anchor);
-            }
-            AC_MODE => {
-                draw_dropdown_items(
-                    frame,
-                    &AccumMode::LABELS,
-                    app.ui.dropdown_cursor,
-                    area,
-                    anchor,
-                );
-            }
-            _ => {}
+    let anchor = app
+        .ui
+        .tools_cursor
+        .saturating_sub(app.ui.tools_scroll_offset) as u16;
+    match app.active_tool_row() {
+        ToolRow::Accum(AC_FN) => {
+            let names: Vec<&str> = ACCUMULATOR_REGISTRY.iter().map(|d| d.name).collect();
+            draw_dropdown_items(frame, &names, app.ui.dropdown_cursor, area, anchor);
+            return;
         }
-        return;
-    }
-    if app.ui.track_param_cursor == TP_FTS {
-        let names: Vec<&str> = crate::scale::SCALES.iter().map(|s| s.name).collect();
-        draw_dropdown_items(
-            frame,
-            &names,
-            app.ui.dropdown_cursor,
-            area,
-            app.ui.track_param_cursor as u16,
-        );
-        return;
-    }
-    if app.ui.track_param_cursor == TP_SWING_RESOLUTION {
-        draw_dropdown_items(
-            frame,
-            &SWING_RESOLUTION_LABELS,
-            app.ui.dropdown_cursor,
-            area,
-            app.ui.track_param_cursor as u16,
-        );
-        return;
+        ToolRow::Accum(AC_MODE) => {
+            draw_dropdown_items(
+                frame,
+                &AccumMode::LABELS,
+                app.ui.dropdown_cursor,
+                area,
+                anchor,
+            );
+            return;
+        }
+        ToolRow::Track(TP_FTS) => {
+            let names: Vec<&str> = crate::scale::SCALES.iter().map(|s| s.name).collect();
+            draw_dropdown_items(frame, &names, app.ui.dropdown_cursor, area, anchor);
+            return;
+        }
+        ToolRow::Track(TP_SWING_RESOLUTION) => {
+            draw_dropdown_items(
+                frame,
+                &SWING_RESOLUTION_LABELS,
+                app.ui.dropdown_cursor,
+                area,
+                anchor,
+            );
+            return;
+        }
+        ToolRow::Accum(_) => return,
+        ToolRow::Track(_) => {}
     }
     draw_dropdown_items(
         frame,
         &TIMEBASE_LABELS,
         app.ui.dropdown_cursor,
         area,
-        app.ui.track_param_cursor as u16,
+        anchor,
     );
 }

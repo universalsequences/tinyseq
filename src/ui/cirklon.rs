@@ -216,6 +216,11 @@ impl App {
                 self.ui.value_buffer.push_str("0.");
                 self.ui.input_mode = InputMode::ValueEntry;
             }
+            KeyCode::Char('-') => {
+                self.ui.value_buffer.clear();
+                self.ui.value_buffer.push('-');
+                self.ui.input_mode = InputMode::ValueEntry;
+            }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 self.ui.value_buffer.clear();
                 self.ui.value_buffer.push(c);
@@ -226,7 +231,7 @@ impl App {
                 self.ui.value_buffer.clear();
                 self.ui.input_mode = InputMode::ValueEntry;
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('P') => {
                 self.ui.input_mode = InputMode::PatternSelect;
                 self.ui.value_buffer.clear();
                 self.ui.pattern_clone_pending = false;

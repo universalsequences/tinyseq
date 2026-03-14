@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::agent::actions::{AgentAppAction, AgentSessionContext};
+use crate::agent::network::AgentTurnResult;
+use crate::agent::protocol::AgentToolRuntime;
+use crate::agent::providers::{AgentMessage, AgentMessageRole, AgentProviderState};
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::EffectDescriptor;
 use crate::lisp_effect::{DGenManifest, LoadedDGenLib, ScratchControlRuntime};
@@ -40,6 +45,19 @@ pub enum EffectTab {
     Reverb,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SidebarTab {
+    Tools,
+    Agent,
+    Sounds,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(super) enum EffectPaneEntry {
+    Tab(EffectTab),
+    PlusButton,
+}
+
 #[derive(Clone, Debug)]
 pub enum PatternBtn {
     PrevPage,
@@ -57,11 +75,12 @@ const TP_SWING: usize = 3;
 const TP_SWING_RESOLUTION: usize = 4;
 const TP_STEPS: usize = 5;
 const TP_VOLUME: usize = 6;
-const TP_TIMEBASE: usize = 7;
-const TP_SEND: usize = 8;
-const TP_MASTER: usize = 9;
-const TP_POLY: usize = 10;
-const TP_FTS: usize = 11;
+const TP_PAN: usize = 7;
+const TP_TIMEBASE: usize = 8;
+const TP_SEND: usize = 9;
+const TP_MASTER: usize = 10;
+const TP_POLY: usize = 11;
+const TP_FTS: usize = 12;
 const TP_LAST: usize = TP_FTS;
 
 // Accumulator tab cursor indices
@@ -128,6 +147,11 @@ struct PendingCompile {
     tick: usize,
 }
 
+struct PendingAgentRequest {
+    receiver: Receiver<Result<AgentTurnResult, String>>,
+    started_at: Instant,
+}
+
 enum PendingProjectLoadPhase {
     ClearExisting,
     AddTrack(usize),
@@ -166,6 +190,12 @@ impl EngineRegistry {
 
     pub fn get(&self, engine_id: usize) -> Option<&EngineDescriptor> {
         self.engines.get(engine_id)
+    }
+
+    pub fn replace_at(&mut self, engine_id: usize, entry: EngineDescriptor) {
+        if engine_id < self.engines.len() {
+            self.engines[engine_id] = entry;
+        }
     }
 
     pub fn upsert(&mut self, entry: EngineDescriptor) -> usize {
@@ -240,6 +270,25 @@ pub struct PresetBrowserState {
     pub scroll_offset: usize,
 }
 
+pub struct AgentTranscriptEntry {
+    pub role: String,
+    pub text: String,
+}
+
+pub struct AgentPanelState {
+    pub provider_state: AgentProviderState,
+    pub transcript: Vec<AgentTranscriptEntry>,
+    pub conversation: Vec<AgentMessage>,
+    pub input_buffer: String,
+    pub input_cursor: usize,
+    pub scroll_offset: usize,
+    pub auto_retry_budget: usize,
+    pub model_dropdown_open: bool,
+    pub model_dropdown_cursor: usize,
+    pending_request: Option<PendingAgentRequest>,
+    pub load_error: Option<String>,
+}
+
 pub struct GraphState {
     pub lg: LiveGraphPtr,
     pub track_node_ids: Vec<TrackNodeIds>,
@@ -301,8 +350,8 @@ pub enum Region {
 impl Region {
     fn next(self) -> Region {
         match self {
-            Region::Cirklon => Region::Params,
-            Region::Sidebar => Region::Cirklon, // Tab exits sidebar to Cirklon
+            Region::Cirklon => Region::Sidebar,
+            Region::Sidebar => Region::Params,
             Region::Params => Region::Cirklon,
         }
     }
@@ -310,8 +359,8 @@ impl Region {
     fn prev(self) -> Region {
         match self {
             Region::Cirklon => Region::Params,
-            Region::Sidebar => Region::Cirklon, // BackTab exits sidebar to Cirklon
-            Region::Params => Region::Cirklon,
+            Region::Sidebar => Region::Cirklon,
+            Region::Params => Region::Sidebar,
         }
     }
 }
@@ -324,6 +373,7 @@ pub struct LayoutRects {
     pub bars: ratatui::prelude::Rect,
     pub trigger_row: ratatui::prelude::Rect,
     pub track_params_inner: ratatui::prelude::Rect,
+    pub effects_tabs: ratatui::prelude::Rect,
     pub effects_inner: ratatui::prelude::Rect,
     pub effects_block: ratatui::prelude::Rect,
     pub info_bar: ratatui::prelude::Rect,
@@ -331,6 +381,7 @@ pub struct LayoutRects {
     pub master_rec_button: ratatui::prelude::Rect,
     pub pattern_buttons_area: ratatui::prelude::Rect,
     pub page_blocks_area: ratatui::prelude::Rect,
+    pub sidebar_tabs: ratatui::prelude::Rect,
     pub sidebar_inner: ratatui::prelude::Rect,
     pub piano_area: ratatui::prelude::Rect,
 }
@@ -340,7 +391,8 @@ pub struct LayoutRects {
 #[allow(dead_code)]
 pub struct TrackNodeIds {
     pub sampler_ids: Vec<i32>, // up to MAX_VOICES
-    pub voice_sum_id: i32,     // dedicated sum node
+    pub voice_sum_id: i32,     // mono voice sum before panning
+    pub pan_id: i32,
     pub filter_id: i32,
     pub delay_id: i32,
     pub send_id: i32,
@@ -366,12 +418,13 @@ pub struct UiState {
     pub visual_steps: HashSet<usize>,
     pub should_quit: bool,
     pub focused_region: Region,
+    pub sidebar_tab: SidebarTab,
     pub sidebar_mode: SidebarMode,
     pub params_column: usize,
-    pub track_params_tab: usize,
-    pub track_param_cursor: usize,
-    pub accum_cursor: usize,
+    pub tools_cursor: usize,
+    pub tools_scroll_offset: usize,
     pub effect_tab: EffectTab,
+    pub effect_tab_cursor: usize,
     pub effect_param_cursor: usize,
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
@@ -420,6 +473,7 @@ pub struct App {
     pub editor: EditorState,
     pub browser: BrowserState,
     pub preset_browser: PresetBrowserState,
+    pub agent_panel: AgentPanelState,
     pub graph: GraphState,
     pub master_recorder: Arc<MasterRecorder>,
     pub pending_recording_take: Option<RecordingTake>,
@@ -445,7 +499,16 @@ impl App {
         } else {
             SidebarMode::InstrumentPicker
         };
-
+        let sidebar_tab = if has_tracks {
+            SidebarTab::Tools
+        } else {
+            SidebarTab::Sounds
+        };
+        let provider_state = AgentProviderState::from_env();
+        let load_error = match AgentToolRuntime::load_default() {
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
         let browser_tree = BrowserNode::scan_root("samples");
 
         Self {
@@ -466,12 +529,13 @@ impl App {
                 visual_steps: HashSet::new(),
                 should_quit: false,
                 focused_region,
+                sidebar_tab,
                 sidebar_mode,
-                params_column: 0,
-                track_params_tab: 0,
-                track_param_cursor: 0,
-                accum_cursor: 0,
+                params_column: 1,
+                tools_cursor: 0,
+                tools_scroll_offset: 0,
                 effect_tab: EffectTab::Slot(0),
+                effect_tab_cursor: 0,
                 effect_param_cursor: 0,
                 dropdown_open: false,
                 dropdown_cursor: 0,
@@ -538,6 +602,19 @@ impl App {
                 cursor: 0,
                 filter: String::new(),
                 scroll_offset: 0,
+            },
+            agent_panel: AgentPanelState {
+                provider_state,
+                transcript: Vec::new(),
+                conversation: Vec::new(),
+                input_buffer: String::new(),
+                input_cursor: 0,
+                scroll_offset: 0,
+                auto_retry_budget: 0,
+                model_dropdown_open: false,
+                model_dropdown_cursor: 0,
+                pending_request: None,
+                load_error,
             },
             master_recorder,
             pending_recording_take: None,
@@ -608,6 +685,412 @@ impl App {
                 } else {
                     SidebarMode::Audition
                 }
+            }
+        }
+    }
+
+    pub(super) fn focus_sidebar_sounds(&mut self) {
+        self.ui.sidebar_tab = SidebarTab::Sounds;
+        self.ui.focused_region = Region::Sidebar;
+    }
+
+    pub(super) fn selected_agent_provider(
+        &self,
+    ) -> Option<&crate::agent::providers::ProviderAvailability> {
+        self.agent_panel
+            .provider_state
+            .providers
+            .iter()
+            .find(|entry| entry.provider == self.agent_panel.provider_state.selected_provider)
+    }
+
+    pub(super) fn agent_model_options(
+        &self,
+    ) -> Vec<(crate::agent::providers::AgentProviderKind, String)> {
+        let mut flattened = Vec::new();
+        for provider in &self.agent_panel.provider_state.providers {
+            for model in &provider.available_models {
+                flattened.push((provider.provider, model.id.clone()));
+            }
+        }
+        flattened
+    }
+
+    pub(super) fn selected_agent_model_index(&self) -> Option<usize> {
+        let state = &self.agent_panel.provider_state;
+        self.agent_model_options()
+            .iter()
+            .position(|(provider, model)| {
+                *provider == state.selected_provider
+                    && state
+                        .providers
+                        .iter()
+                        .find(|entry| entry.provider == *provider)
+                        .map(|entry| entry.selected_model == *model)
+                        .unwrap_or(false)
+            })
+    }
+
+    pub(super) fn select_agent_model_index(&mut self, index: usize) {
+        let flattened = self.agent_model_options();
+        let Some((provider_kind, model_id)) = flattened.get(index) else {
+            return;
+        };
+        let state = &mut self.agent_panel.provider_state;
+        state.selected_provider = *provider_kind;
+        if let Some(provider) = state
+            .providers
+            .iter_mut()
+            .find(|entry| entry.provider == *provider_kind)
+        {
+            provider.selected_model = model_id.clone();
+        }
+        self.agent_panel.model_dropdown_cursor = index;
+    }
+
+    pub(super) fn submit_agent_prompt(&mut self) -> Result<(), String> {
+        if self.agent_panel.pending_request.is_some() {
+            return Err("Agent request already in flight.".to_string());
+        }
+        let prompt = self.agent_panel.input_buffer.trim().to_string();
+        if prompt.is_empty() {
+            return Err("Agent prompt is empty.".to_string());
+        }
+
+        if prompt == "/new" {
+            self.clear_agent_session();
+            return Ok(());
+        }
+
+        self.agent_panel.transcript.push(AgentTranscriptEntry {
+            role: "user".to_string(),
+            text: prompt.clone(),
+        });
+        self.agent_panel.scroll_offset = 0;
+        self.agent_panel.conversation.push(AgentMessage {
+            role: AgentMessageRole::User,
+            content: prompt.clone(),
+            tool_name: None,
+        });
+        self.agent_panel.input_buffer.clear();
+        self.agent_panel.input_cursor = 0;
+        self.agent_panel.auto_retry_budget = 1;
+
+        self.start_agent_request()
+    }
+
+    fn current_agent_system_prompt(&self) -> String {
+        "You help design DGenLisp instruments and effects for this sequencer. Prefer using tools instead of pasting full code into chat. Use create_instrument_track to make new synth/instrument tracks. Use read_current_instrument_source before iterating on an existing custom synth when you need the current code. Use update_current_instrument to replace the current custom instrument track in place. For effects, use apply_effect_to_current_track only when the user wants a brand new effect added to the chain. Use read_current_effect_source and update_current_effect when the user is asking to tweak, refine, or iterate on the currently selected custom effect. If no current track exists for an effect, tell the user to create a track first. Be concise and action-oriented.\n\nDGenLisp instrument rules:\n- Instrument definitions must use the actual local DGenLisp instrument syntax used by examples in this repo.\n- Instrument params must follow the sequencer's modulation metadata rules.\n- Any instrument param that can be modulation-targeted must declare a valid @mod-mode.\n- If the patch declares modulatable params, it must also declare at least one input marked with @modulator, following the style used by local examples.\n- If the instrument does not need modulation inputs, do not mark params as modulation-targetable.\n- When adding or changing params, preserve the modulation annotation style used by existing local instruments.\n- If you are unsure about instrument param/modulation structure or instrument declaration syntax, inspect local examples or the current instrument source first.\n\nDGenLisp effect rules:\n- Effects do not use synth-style modulators.\n- Do not declare @modulator inputs or synth-style modulation metadata in effects.\n- The only modulation-like routing allowed in effects is sidechaining, following the local effect examples and manifest conventions.\n- If the user asks to change an existing effect, prefer replacing the selected custom effect instead of adding a second effect.\n- If generated code fails to compile or reload, revise the code to satisfy the instrument/effect rules instead of asking the user to fix it manually.".to_string()
+    }
+
+    fn current_agent_session_context(&self) -> AgentSessionContext {
+        let current_track_index = (!self.tracks.is_empty()).then_some(self.ui.cursor_track);
+        let current_track_name = self.tracks.get(self.ui.cursor_track).cloned();
+        let current_instrument_name = current_track_index.and_then(|track| {
+            if self.graph.track_instrument_types.get(track) != Some(&InstrumentType::Custom) {
+                return None;
+            }
+            self.graph
+                .track_engine_ids
+                .get(track)
+                .and_then(|engine_id| *engine_id)
+                .and_then(|engine_id| self.editor.engine_registry.get(engine_id))
+                .map(|engine| engine.name.clone())
+                .or_else(|| current_track_name.clone())
+        });
+        let current_instrument_source = current_instrument_name
+            .as_deref()
+            .and_then(|name| crate::lisp_effect::load_instrument_source(name).ok());
+        let current_effect_slot = self
+            .selected_effect_slot()
+            .filter(|slot| !self.tracks.is_empty() && *slot >= crate::effects::BUILTIN_SLOT_COUNT);
+        let current_effect_name = current_effect_slot.and_then(|slot| {
+            self.graph
+                .effect_descriptors
+                .get(self.ui.cursor_track)
+                .and_then(|descs| descs.get(slot))
+                .map(|desc| desc.name.clone())
+        });
+        let current_effect_source = current_effect_name
+            .as_deref()
+            .and_then(|name| crate::lisp_effect::load_effect_source(name).ok());
+        AgentSessionContext {
+            has_tracks: !self.tracks.is_empty(),
+            current_track_name,
+            current_track_index,
+            can_apply_effect_to_current_track: self.next_free_custom_slot().is_some(),
+            current_effect_name,
+            current_effect_source: current_effect_source.clone(),
+            current_effect_slot,
+            can_update_current_effect: current_effect_source.is_some(),
+            can_update_current_instrument: current_instrument_source.is_some(),
+            current_instrument_name,
+            current_instrument_source,
+        }
+    }
+
+    fn start_agent_request(&mut self) -> Result<(), String> {
+        if self.agent_panel.pending_request.is_some() {
+            return Err("Agent request already in flight.".to_string());
+        }
+
+        let selected = self
+            .selected_agent_provider()
+            .ok_or_else(|| "No agent model selected.".to_string())?;
+        let provider = selected.provider;
+        let model = selected.selected_model.clone();
+        let system_prompt = self.current_agent_system_prompt();
+        let conversation = self.agent_panel.conversation.clone();
+        let session_context = self.current_agent_session_context();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                crate::agent::network::AgentNetworkClient::load_default().and_then(|client| {
+                    client.execute_turn(
+                        provider,
+                        &model,
+                        &system_prompt,
+                        &conversation,
+                        session_context,
+                    )
+                });
+            let _ = tx.send(result);
+        });
+        self.agent_panel.pending_request = Some(PendingAgentRequest {
+            receiver: rx,
+            started_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    pub(super) fn poll_agent_request(&mut self) {
+        let Some(pending) = self.agent_panel.pending_request.as_ref() else {
+            return;
+        };
+        match pending.receiver.try_recv() {
+            Ok(Ok(result)) => {
+                self.agent_panel.pending_request = None;
+                let tool_count = result.tool_outcomes.len();
+                let action_results = result
+                    .pending_actions
+                    .into_iter()
+                    .map(|action| self.apply_agent_action(action))
+                    .collect::<Vec<_>>();
+                let action_errors = action_results
+                    .iter()
+                    .filter_map(|result| result.as_ref().err().cloned())
+                    .collect::<Vec<_>>();
+                let mut action_result_idx = 0usize;
+                for outcome in &result.tool_outcomes {
+                    let action_count = outcome.pending_actions.len();
+                    let mut tool_ok = outcome.ok;
+                    let mut details = vec![outcome.summary.clone()];
+
+                    if !outcome.content.trim().is_empty()
+                        && outcome.content.trim() != outcome.summary.trim()
+                    {
+                        details.push(outcome.content.clone());
+                    }
+
+                    if action_count > 0 {
+                        let end = action_result_idx + action_count;
+                        let related_results = &action_results[action_result_idx..end];
+                        action_result_idx = end;
+
+                        tool_ok = related_results.iter().all(|result| result.is_ok());
+                        for result in related_results {
+                            match result {
+                                Ok(message) => details.push(message.clone()),
+                                Err(error) => details.push(error.clone()),
+                            }
+                        }
+                    }
+
+                    let tool_text = format!(
+                        "{} [{}]\n{}",
+                        outcome.name,
+                        if tool_ok { "ok" } else { "error" },
+                        details.join("\n\n")
+                    );
+                    self.agent_panel.conversation.push(AgentMessage {
+                        role: AgentMessageRole::Tool,
+                        content: tool_text.clone(),
+                        tool_name: Some(outcome.name.clone()),
+                    });
+                    self.agent_panel.transcript.push(AgentTranscriptEntry {
+                        role: "tool".to_string(),
+                        text: tool_text,
+                    });
+                }
+                if !result.text.trim().is_empty() {
+                    self.agent_panel.transcript.push(AgentTranscriptEntry {
+                        role: "assistant".to_string(),
+                        text: result.text.clone(),
+                    });
+                    self.agent_panel.scroll_offset = 0;
+                    self.agent_panel.conversation.push(AgentMessage {
+                        role: AgentMessageRole::Assistant,
+                        content: result.text,
+                        tool_name: None,
+                    });
+                }
+                self.editor.status_message = Some((
+                    format!(
+                        "Agent response received{}",
+                        if tool_count > 0 {
+                            format!(" ({tool_count} tools)")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    Instant::now(),
+                ));
+                for action_result in action_results {
+                    let (role, text) = match action_result {
+                        Ok(message) => ("system".to_string(), message),
+                        Err(error) => ("error".to_string(), error),
+                    };
+                    self.agent_panel.conversation.push(AgentMessage {
+                        role: AgentMessageRole::System,
+                        content: text.clone(),
+                        tool_name: None,
+                    });
+                    self.agent_panel
+                        .transcript
+                        .push(AgentTranscriptEntry { role, text });
+                }
+                self.agent_panel.scroll_offset = 0;
+
+                if !action_errors.is_empty() && self.agent_panel.auto_retry_budget > 0 {
+                    self.agent_panel.auto_retry_budget -= 1;
+                    let repair_message = format!(
+                        "Applying your last generated change failed with these errors:\n{}\nRevise the code and try again using the appropriate tool. Do not claim success unless the tool actually succeeds.",
+                        action_errors.join("\n")
+                    );
+                    self.agent_panel.conversation.push(AgentMessage {
+                        role: AgentMessageRole::System,
+                        content: repair_message.clone(),
+                        tool_name: None,
+                    });
+                    self.agent_panel.transcript.push(AgentTranscriptEntry {
+                        role: "system".to_string(),
+                        text: repair_message,
+                    });
+                    if let Err(error) = self.start_agent_request() {
+                        self.editor.status_message =
+                            Some((format!("Agent retry failed: {error}"), Instant::now()));
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                self.agent_panel.pending_request = None;
+                self.agent_panel.transcript.push(AgentTranscriptEntry {
+                    role: "error".to_string(),
+                    text: error.clone(),
+                });
+                self.agent_panel.scroll_offset = 0;
+                self.editor.status_message =
+                    Some((format!("Agent error: {error}"), Instant::now()));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.agent_panel.pending_request = None;
+                self.editor.status_message =
+                    Some(("Agent worker crashed".to_string(), Instant::now()));
+            }
+        }
+    }
+
+    pub(super) fn scroll_agent_transcript(&mut self, delta: isize) {
+        if delta > 0 {
+            self.agent_panel.scroll_offset = self
+                .agent_panel
+                .scroll_offset
+                .saturating_add(delta as usize);
+        } else if delta < 0 {
+            self.agent_panel.scroll_offset = self
+                .agent_panel
+                .scroll_offset
+                .saturating_sub((-delta) as usize);
+        }
+    }
+
+    pub(super) fn cancel_agent_request(&mut self) {
+        if self.agent_panel.pending_request.take().is_some() {
+            self.agent_panel.auto_retry_budget = 0;
+            self.agent_panel.transcript.push(AgentTranscriptEntry {
+                role: "system".to_string(),
+                text: "Interrupted agent request.".to_string(),
+            });
+            self.agent_panel.scroll_offset = 0;
+            self.editor.status_message =
+                Some(("Agent request interrupted".to_string(), Instant::now()));
+        }
+    }
+
+    fn clear_agent_session(&mut self) {
+        self.agent_panel.pending_request = None;
+        self.agent_panel.transcript.clear();
+        self.agent_panel.conversation.clear();
+        self.agent_panel.input_buffer.clear();
+        self.agent_panel.input_cursor = 0;
+        self.agent_panel.scroll_offset = 0;
+        self.agent_panel.auto_retry_budget = 0;
+        self.agent_panel.model_dropdown_open = false;
+        self.editor.status_message = Some(("Cleared agent session".to_string(), Instant::now()));
+    }
+
+    fn apply_agent_action(&mut self, action: AgentAppAction) -> Result<String, String> {
+        match action {
+            AgentAppAction::CreateInstrumentTrack { name, source } => {
+                crate::lisp_effect::save_instrument(&name, &source)
+                    .map_err(|error| format!("Failed to save instrument '{}': {error}", name))?;
+                let track_idx = self.add_saved_instrument_track_sync(&name)?;
+                Ok(format!(
+                    "Created instrument track '{}' at track {}.",
+                    name,
+                    track_idx + 1
+                ))
+            }
+            AgentAppAction::ApplyEffectToCurrentTrack { name, source } => {
+                if self.tracks.is_empty() {
+                    return Err(
+                        "No current track is available. Create a track first, then apply the effect."
+                            .to_string(),
+                    );
+                }
+                let track = self.ui.cursor_track;
+                let slot_idx = self.next_free_custom_slot().ok_or_else(|| {
+                    format!(
+                        "Track '{}' has no free custom effect slot.",
+                        self.tracks
+                            .get(track)
+                            .cloned()
+                            .unwrap_or_else(|| "current track".to_string())
+                    )
+                })?;
+                crate::lisp_effect::save_effect(&name, &source)
+                    .map_err(|error| format!("Failed to save effect '{}': {error}", name))?;
+                self.load_saved_effect_to_slot_sync(track, slot_idx, &name)?;
+                Ok(format!(
+                    "Applied effect '{}' to track '{}' in slot {}.",
+                    name,
+                    self.tracks
+                        .get(track)
+                        .cloned()
+                        .unwrap_or_else(|| "current track".to_string()),
+                    slot_idx + 1
+                ))
+            }
+            AgentAppAction::UpdateCurrentEffect { name, source } => {
+                self.replace_current_effect_sync(&name, &source)?;
+                Ok(format!("Updated current effect to '{}'.", name))
+            }
+            AgentAppAction::UpdateCurrentInstrument { name, source } => {
+                crate::lisp_effect::save_instrument(&name, &source)
+                    .map_err(|error| format!("Failed to save instrument '{}': {error}", name))?;
+                self.replace_current_custom_instrument_sync(&name, &source)?;
+                Ok(format!("Updated current instrument track to '{}'.", name))
             }
         }
     }

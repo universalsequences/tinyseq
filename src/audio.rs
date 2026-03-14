@@ -860,6 +860,20 @@ fn fire_resolved(
         data.state.pattern.instrument_base_note_offsets[track_idx].load(Ordering::Relaxed),
     );
     let step_transpose = data.state.pattern.step_data[track_idx].get(step, StepParam::Transpose);
+    let pan_lid = data.state.runtime.pan_lids[track_idx].load(Ordering::Acquire);
+    if pan_lid != 0 {
+        let effective_pan = (tp.get_pan() + resolved.pan).clamp(-1.0, 1.0);
+        unsafe {
+            crate::audiograph::params_push_wrapper(
+                data.lg.0,
+                crate::audiograph::ParamMsg {
+                    idx: crate::stereo_panner::STEREO_PANNER_PARAM_PAN,
+                    logical_id: pan_lid,
+                    fvalue: effective_pan,
+                },
+            );
+        }
+    }
 
     // Fit to Scale: quantize the final transpose to the nearest scale degree.
     // Keep the pre-FTS value so chord notes can be individually quantized.

@@ -9,8 +9,8 @@ use crate::effects::{
 };
 use crate::lisp_effect::{self, MAX_CUSTOM_FX};
 use crate::sequencer::InstrumentType;
+use eseqlisp::vm::{format_lisp_source, Value as LispValue};
 use eseqlisp::Editor as LispEditor;
-use eseqlisp::vm::{Value as LispValue, format_lisp_source};
 
 use super::{
     App, CompileTarget, EffectTab, HookCallback, HookUnit, InputMode, PendingCompile,
@@ -96,6 +96,63 @@ impl App {
         }
     }
 
+    pub(super) fn replace_current_custom_instrument_sync(
+        &mut self,
+        name: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        if self.tracks.is_empty() {
+            return Err("No current track is available.".to_string());
+        }
+        let track = self.ui.cursor_track;
+        if self.graph.track_instrument_types.get(track) != Some(&InstrumentType::Custom) {
+            return Err("The current track is not a custom instrument track.".to_string());
+        }
+        let runtime_engine_id = self
+            .graph
+            .track_engine_ids
+            .get(track)
+            .and_then(|engine_id| *engine_id)
+            .ok_or_else(|| {
+                "The current custom instrument track has no engine binding.".to_string()
+            })?;
+
+        let result = lisp_effect::compile_and_load_instrument(source, self.graph.sample_rate)?;
+        let cache_idx = self.cache_instrument_engine(name, source, &result.manifest, result.lib);
+        let manifest = self.editor.engine_registry.engines[cache_idx]
+            .manifest
+            .clone();
+        let lib_index = self.editor.engine_registry.engines[cache_idx].lib_index;
+        let lib_ptr: *const lisp_effect::LoadedDGenLib = &self.editor.instrument_libs[lib_index];
+        unsafe {
+            self.graph_controller()
+                .hot_reload_instrument(track, &manifest, &*lib_ptr)
+        }
+        .map_err(|e| e.to_string())?;
+        self.editor.engine_registry.replace_at(
+            runtime_engine_id,
+            super::EngineDescriptor {
+                name: name.to_string(),
+                source: source.to_string(),
+                manifest: manifest.clone(),
+                lib_index,
+            },
+        );
+
+        self.tracks[track] = name.to_string();
+        if let Some(sound) = self
+            .state
+            .pattern
+            .track_sound_state
+            .lock()
+            .unwrap()
+            .get_mut(track)
+        {
+            sound.engine_id = Some(runtime_engine_id);
+        }
+        Ok(())
+    }
+
     fn cached_instrument_engine_idx(&self, name: &str, source: &str) -> Option<usize> {
         self.editor
             .engine_registry
@@ -163,43 +220,50 @@ impl App {
         None
     }
 
-    fn find_custom_slot_predecessor(&self, track: usize, offset: usize) -> i32 {
+    fn find_custom_slot_predecessor(&self, track: usize, offset: usize) -> (i32, usize) {
         let chain = &self.state.pattern.effect_chains[track];
         for i in (0..offset).rev() {
             let idx = BUILTIN_SLOT_COUNT + i;
             if idx < chain.len() {
                 let nid = chain[idx].node_id.load(Ordering::Relaxed);
                 if nid != 0 {
-                    return nid as i32;
+                    let channels = self.graph.effect_descriptors[track][idx]
+                        .output_channels
+                        .max(1);
+                    return (nid as i32, channels);
                 }
             }
         }
-        self.graph.track_node_ids[track].voice_sum_id
+        (self.graph.track_node_ids[track].pan_id, 2)
     }
 
-    fn find_custom_slot_successor(&self, track: usize, offset: usize) -> i32 {
+    fn find_custom_slot_successor(&self, track: usize, offset: usize) -> (i32, usize) {
         let chain = &self.state.pattern.effect_chains[track];
         for i in (offset + 1)..MAX_CUSTOM_FX {
             let idx = BUILTIN_SLOT_COUNT + i;
             if idx < chain.len() {
                 let nid = chain[idx].node_id.load(Ordering::Relaxed);
                 if nid != 0 {
-                    return nid as i32;
+                    let channels = self.graph.effect_descriptors[track][idx]
+                        .input_channels
+                        .max(1);
+                    return (nid as i32, channels);
                 }
             }
         }
-        self.graph.track_node_ids[track].filter_id
+        (self.graph.track_node_ids[track].filter_id, 2)
     }
 
     fn resolve_custom_slot_wiring(
         &self,
         track: usize,
         slot_idx: usize,
-    ) -> (usize, i32, i32, Option<i32>) {
+    ) -> (usize, i32, usize, i32, usize, Option<i32>) {
         let offset = slot_idx - BUILTIN_SLOT_COUNT;
         let slot_id = track * MAX_CUSTOM_FX + offset;
-        let predecessor_id = self.find_custom_slot_predecessor(track, offset);
-        let successor_id = self.find_custom_slot_successor(track, offset);
+        let (predecessor_id, predecessor_outputs) =
+            self.find_custom_slot_predecessor(track, offset);
+        let (successor_id, successor_inputs) = self.find_custom_slot_successor(track, offset);
         let existing_node = self.state.pattern.effect_chains[track]
             .get(slot_idx)
             .map(|slot| slot.node_id.load(Ordering::Relaxed))
@@ -209,7 +273,14 @@ impl App {
         } else {
             None
         };
-        (slot_id, predecessor_id, successor_id, existing)
+        (
+            slot_id,
+            predecessor_id,
+            predecessor_outputs,
+            successor_id,
+            successor_inputs,
+            existing,
+        )
     }
 
     pub(super) fn effect_sidechain_labels(&self, track: usize) -> Vec<String> {
@@ -249,7 +320,12 @@ impl App {
         name: &str,
         manifest: &lisp_effect::DGenManifest,
     ) -> EffectDescriptor {
-        let mut desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
+        let mut desc = EffectDescriptor::from_lisp_manifest(
+            name,
+            &manifest.params,
+            manifest.n_inputs,
+            manifest.n_outputs,
+        );
         for param in &mut desc.params {
             param.node_param_idx += lisp_effect::HEADER_SLOTS as u32;
         }
@@ -329,11 +405,12 @@ impl App {
 
         let old_selection = slot.defaults.get(param_idx).round().max(0.0) as usize;
         if let Some(old_track) = self.effect_sidechain_source_track(track, old_selection) {
+            let source_port = (*input_channel).min(1) as i32;
             unsafe {
                 crate::audiograph::graph_disconnect(
                     self.graph.lg.0,
                     self.graph.track_node_ids[old_track].delay_id,
-                    0,
+                    source_port,
                     node_id,
                     *input_channel as i32,
                 );
@@ -341,11 +418,12 @@ impl App {
         }
 
         if let Some(new_track) = self.effect_sidechain_source_track(track, selection) {
+            let source_port = (*input_channel).min(1) as i32;
             unsafe {
                 crate::audiograph::graph_connect(
                     self.graph.lg.0,
                     self.graph.track_node_ids[new_track].delay_id,
-                    0,
+                    source_port,
                     node_id,
                     *input_channel as i32,
                 );
@@ -400,8 +478,14 @@ impl App {
             return;
         }
         let track = self.ui.cursor_track;
-        let (slot_id, predecessor_id, successor_id, existing) =
-            self.resolve_custom_slot_wiring(track, slot_idx);
+        let (
+            slot_id,
+            predecessor_id,
+            predecessor_outputs,
+            successor_id,
+            successor_inputs,
+            existing,
+        ) = self.resolve_custom_slot_wiring(track, slot_idx);
 
         let result = lisp_effect::run_embedded_effect_editor_flow(
             self.graph.sample_rate,
@@ -422,7 +506,9 @@ impl App {
                     &r.manifest,
                     &r.lib,
                     predecessor_id,
+                    predecessor_outputs,
                     successor_id,
+                    successor_inputs,
                     existing,
                 )
             } {
@@ -435,8 +521,7 @@ impl App {
                     self.editor.lisp_libs.push(r.lib);
                 }
                 Err(error) => {
-                    self.editor.status_message =
-                        Some((format!("Error: {error}"), Instant::now()));
+                    self.editor.status_message = Some((format!("Error: {error}"), Instant::now()));
                 }
             }
         }
@@ -474,7 +559,8 @@ impl App {
         slot_idx: usize,
         track: usize,
     ) {
-        let (slot_id, pred, succ, existing) = self.resolve_custom_slot_wiring(track, slot_idx);
+        let (slot_id, pred, pred_outputs, succ, succ_inputs, existing) =
+            self.resolve_custom_slot_wiring(track, slot_idx);
 
         match unsafe {
             lisp_effect::add_effect_to_chain_at(
@@ -483,7 +569,9 @@ impl App {
                 &result.manifest,
                 &result.lib,
                 pred,
+                pred_outputs,
                 succ,
+                succ_inputs,
                 existing,
             )
         } {
@@ -510,7 +598,8 @@ impl App {
     ) -> Result<(), String> {
         let source = lisp_effect::load_effect_source(name).map_err(|e| e.to_string())?;
         let result = lisp_effect::compile_and_load(&source, self.graph.sample_rate)?;
-        let (slot_id, pred, succ, existing) = self.resolve_custom_slot_wiring(track, slot_idx);
+        let (slot_id, pred, pred_outputs, succ, succ_inputs, existing) =
+            self.resolve_custom_slot_wiring(track, slot_idx);
         let node_id = unsafe {
             lisp_effect::add_effect_to_chain_at(
                 self.graph.lg.0,
@@ -518,12 +607,35 @@ impl App {
                 &result.manifest,
                 &result.lib,
                 pred,
+                pred_outputs,
                 succ,
+                succ_inputs,
                 existing,
             )
         }?;
         self.apply_effect_to_slot(track, slot_idx, node_id, name, &result.manifest);
         self.editor.lisp_libs.push(result.lib);
+        Ok(())
+    }
+
+    pub(super) fn replace_current_effect_sync(
+        &mut self,
+        name: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        if self.tracks.is_empty() {
+            return Err("No current track is available.".to_string());
+        }
+        let track = self.ui.cursor_track;
+        let slot_idx = self
+            .selected_effect_slot()
+            .ok_or_else(|| "No current custom effect slot is selected.".to_string())?;
+        if slot_idx < BUILTIN_SLOT_COUNT {
+            return Err("The selected effect slot is not a custom effect slot.".to_string());
+        }
+        crate::lisp_effect::save_effect(name, source).map_err(|e| e.to_string())?;
+        self.load_saved_effect_to_slot_sync(track, slot_idx, name)?;
+        self.ui.effect_tab = EffectTab::Slot(slot_idx);
         Ok(())
     }
 
@@ -563,13 +675,15 @@ impl App {
             Some(self.ui.cursor_track),
             existing_name.as_deref(),
             |_, result, name, source| {
-                let is_existing_custom =
-                    self.ui.cursor_track < self.graph.track_instrument_types.len()
-                        && self.graph.track_instrument_types[self.ui.cursor_track]
-                            == InstrumentType::Custom;
+                let is_existing_custom = self.ui.cursor_track
+                    < self.graph.track_instrument_types.len()
+                    && self.graph.track_instrument_types[self.ui.cursor_track]
+                        == InstrumentType::Custom;
 
                 if is_existing_custom {
                     let track = self.ui.cursor_track;
+                    let runtime_engine_id =
+                        self.graph.track_engine_ids.get(track).and_then(|id| *id);
                     let cache_idx =
                         self.cache_instrument_engine(name, source, &result.manifest, result.lib);
                     let manifest = self.editor.engine_registry.engines[cache_idx]
@@ -583,10 +697,18 @@ impl App {
                             .hot_reload_instrument(track, &manifest, &*lib_ptr)
                     }
                     .map_err(|e| e.to_string())?;
-                    self.tracks[self.ui.cursor_track] = name.to_string();
-                    if track < self.graph.track_engine_ids.len() {
-                        self.graph.track_engine_ids[track] = Some(cache_idx);
+                    if let Some(runtime_engine_id) = runtime_engine_id {
+                        self.editor.engine_registry.replace_at(
+                            runtime_engine_id,
+                            super::EngineDescriptor {
+                                name: name.to_string(),
+                                source: source.to_string(),
+                                manifest: manifest.clone(),
+                                lib_index,
+                            },
+                        );
                     }
+                    self.tracks[self.ui.cursor_track] = name.to_string();
                     if let Some(sound) = self
                         .state
                         .pattern
@@ -595,7 +717,7 @@ impl App {
                         .unwrap()
                         .get_mut(track)
                     {
-                        sound.engine_id = Some(cache_idx);
+                        sound.engine_id = runtime_engine_id;
                     }
                     self.editor.status_message =
                         Some((format!("Reloaded instrument '{}'", name), Instant::now()));
@@ -613,6 +735,7 @@ impl App {
 
             if is_existing_custom {
                 let track = self.ui.cursor_track;
+                let runtime_engine_id = self.graph.track_engine_ids.get(track).and_then(|id| *id);
                 let cache_idx =
                     self.cache_instrument_engine(&r.name, &r.source, &r.manifest, r.lib);
                 let manifest = self.editor.engine_registry.engines[cache_idx]
@@ -626,10 +749,18 @@ impl App {
                         .hot_reload_instrument(track, &manifest, &*lib_ptr)
                 } {
                     Ok(()) => {
-                        self.tracks[self.ui.cursor_track] = r.name.clone();
-                        if track < self.graph.track_engine_ids.len() {
-                            self.graph.track_engine_ids[track] = Some(cache_idx);
+                        if let Some(runtime_engine_id) = runtime_engine_id {
+                            self.editor.engine_registry.replace_at(
+                                runtime_engine_id,
+                                super::EngineDescriptor {
+                                    name: r.name.clone(),
+                                    source: r.source.clone(),
+                                    manifest: manifest.clone(),
+                                    lib_index,
+                                },
+                            );
                         }
+                        self.tracks[self.ui.cursor_track] = r.name.clone();
                         if let Some(sound) = self
                             .state
                             .pattern
@@ -638,7 +769,7 @@ impl App {
                             .unwrap()
                             .get_mut(track)
                         {
-                            sound.engine_id = Some(cache_idx);
+                            sound.engine_id = runtime_engine_id;
                         }
                         self.editor.status_message =
                             Some((format!("Reloaded instrument '{}'", r.name), Instant::now()));
@@ -685,19 +816,15 @@ impl App {
         let scratch_cursor = self.editor.scratch_cursor;
         let track = self.ui.cursor_track;
         let cursor_step = self.ui.cursor_step;
-        let mut runtime = self
-            .editor
-            .scratch_runtime
-            .take()
-            .unwrap_or_else(|| {
-                lisp_effect::ScratchControlRuntime::new(
-                    Arc::clone(&self.state),
-                    self.graph.effect_descriptors.clone(),
-                    self.graph.instrument_descriptors.clone(),
-                    track,
-                    cursor_step,
-                )
-            });
+        let mut runtime = self.editor.scratch_runtime.take().unwrap_or_else(|| {
+            lisp_effect::ScratchControlRuntime::new(
+                Arc::clone(&self.state),
+                self.graph.effect_descriptors.clone(),
+                self.graph.instrument_descriptors.clone(),
+                track,
+                cursor_step,
+            )
+        });
         runtime.sync_descriptors(
             self.graph.effect_descriptors.clone(),
             self.graph.instrument_descriptors.clone(),

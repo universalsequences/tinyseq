@@ -85,6 +85,7 @@ unsafe extern "C" fn delay_process(
     let nf = nframes as usize;
 
     let in0 = *inp.add(0);
+    let in1 = *inp.add(1);
     let out0 = *out.add(0); // L output
     let out1 = *out.add(1); // R output
 
@@ -145,7 +146,8 @@ unsafe extern "C" fn delay_process(
         smooth_damp += smooth_coeff * (target_damp - smooth_damp);
         smooth_width += smooth_coeff * (target_width - smooth_width);
 
-        let input = *in0.add(i);
+        let input_l = *in0.add(i);
+        let input_r = *in1.add(i);
         let delay_l = smooth_time;
         let delay_r = (smooth_time * smooth_width).clamp(1.0, (MAX_DELAY_SAMPLES - 1) as f32);
 
@@ -172,13 +174,13 @@ unsafe extern "C" fn delay_process(
         damp_state_r += smooth_damp * (delayed_r - damp_state_r);
 
         // Write to buffer
-        *buf_l.add(write_pos_l) = input + smooth_fb * damp_state_l;
-        *buf_r.add(write_pos_r) = input + smooth_fb * damp_state_r;
+        *buf_l.add(write_pos_l) = input_l + smooth_fb * damp_state_l;
+        *buf_r.add(write_pos_r) = input_r + smooth_fb * damp_state_r;
 
         // Output: dry/wet mix
         let dry = 1.0 - smooth_wet;
-        *out0.add(i) = input * dry + delayed_l * smooth_wet;
-        *out1.add(i) = input * dry + delayed_r * smooth_wet;
+        *out0.add(i) = input_l * dry + delayed_l * smooth_wet;
+        *out1.add(i) = input_r * dry + delayed_r * smooth_wet;
 
         write_pos_l = (write_pos_l + 1) % MAX_DELAY_SAMPLES;
         write_pos_r = (write_pos_r + 1) % MAX_DELAY_SAMPLES;

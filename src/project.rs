@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::effects::EffectSlotSnapshot;
 use crate::sequencer::{
@@ -54,6 +54,7 @@ pub enum ProjectTrack {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProjectPattern {
     pub track_bits: Vec<[u64; TRACK_PATTERN_WORDS]>,
+    #[serde(deserialize_with = "deserialize_step_data")]
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<ProjectTrackParams>,
     pub effect_slots: Vec<Vec<ProjectEffectSlot>>,
@@ -78,6 +79,8 @@ pub struct ProjectTrackParams {
     pub num_steps: usize,
     #[serde(default = "default_track_volume")]
     pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
     pub send: f32,
     pub polyphonic: bool,
     pub timebase: u8,
@@ -176,6 +179,7 @@ impl From<TrackParamsSnapshot> for ProjectTrackParams {
             swing_resolution: value.swing_resolution as u8,
             num_steps: value.num_steps,
             volume: value.volume,
+            pan: value.pan,
             send: value.send,
             polyphonic: value.polyphonic,
             timebase: value.timebase as u8,
@@ -197,6 +201,7 @@ impl From<ProjectTrackParams> for TrackParamsSnapshot {
             swing_resolution: SwingResolution::from_index(value.swing_resolution as u32),
             num_steps: value.num_steps,
             volume: value.volume,
+            pan: value.pan,
             send: value.send,
             polyphonic: value.polyphonic,
             timebase: Timebase::from_index(value.timebase as u32),
@@ -340,6 +345,40 @@ pub fn project_file_version() -> u32 {
     PROJECT_FILE_VERSION
 }
 
+fn deserialize_step_data<'de, D>(deserializer: D) -> Result<Vec<Vec<[f32; NUM_PARAMS]>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<Vec<Vec<f32>>>::deserialize(deserializer)?;
+    let mut tracks = Vec::with_capacity(raw.len());
+    for track in raw {
+        let mut steps = Vec::with_capacity(track.len());
+        for values in track {
+            let mut params = [0.0; NUM_PARAMS];
+            for (idx, param) in crate::sequencer::StepParam::ALL.into_iter().enumerate() {
+                params[idx] = param.default_value();
+            }
+            if values.len() == NUM_PARAMS - 1 {
+                for (idx, value) in values.into_iter().enumerate() {
+                    let target_idx = if idx >= crate::sequencer::StepParam::Pan.index() {
+                        idx + 1
+                    } else {
+                        idx
+                    };
+                    params[target_idx] = value;
+                }
+            } else {
+                for (idx, value) in values.into_iter().enumerate().take(NUM_PARAMS) {
+                    params[idx] = value;
+                }
+            }
+            steps.push(params);
+        }
+        tracks.push(steps);
+    }
+    Ok(tracks)
+}
+
 fn default_accum_limit() -> f32 {
     48.0
 }
@@ -392,7 +431,7 @@ mod tests {
             },
             patterns: vec![ProjectPattern {
                 track_bits: vec![[0b1011, 0, 0, 0], [0b0101, 1, 0, 0]],
-                step_data: vec![vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; 256]; 2],
+                step_data: vec![vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]; 256]; 2],
                 track_params: vec![
                     ProjectTrackParams {
                         gate: true,
@@ -402,6 +441,7 @@ mod tests {
                         swing_resolution: SwingResolution::Sixteenth as u8,
                         num_steps: 64,
                         volume: 0.8,
+                        pan: -0.25,
                         send: 0.25,
                         polyphonic: true,
                         timebase: Timebase::Sixteenth as u8,
@@ -418,6 +458,7 @@ mod tests {
                         swing_resolution: SwingResolution::Quarter as u8,
                         num_steps: 128,
                         volume: 1.1,
+                        pan: 0.4,
                         send: 0.5,
                         polyphonic: false,
                         timebase: Timebase::Eighth as u8,
@@ -484,5 +525,55 @@ mod tests {
         assert_eq!(restored.patterns[0].track_params[0].accumulator_idx, 1);
         assert_eq!(restored.patterns[0].track_params[0].accum_limit, 24.0);
         assert_eq!(restored.patterns[0].track_params[0].accum_mode, 2);
+    }
+
+    #[test]
+    fn legacy_step_data_without_pan_deserializes() {
+        let json = r#"{
+            "version": 1,
+            "name": "legacy",
+            "bpm": 120,
+            "master_volume": 1.0,
+            "current_pattern": 0,
+            "reverb": {"size": 0.2, "brightness": 0.8, "replace": 0.3},
+            "tracks": [{"kind": "sampler", "sample_path": "samples/kick.wav"}],
+            "custom_effects": [[]],
+            "scratch": {"buffer": "", "cursor_row": 0, "cursor_col": 0},
+            "patterns": [{
+                "track_bits": [[0,0,0,0]],
+                "step_data": [[[1.0, 0.5, 1.0, 0.0, 0.0, 7.0, 1.0, 0.0]]],
+                "track_params": [{
+                    "gate": true,
+                    "attack_ms": 0.0,
+                    "release_ms": 0.0,
+                    "swing": 50.0,
+                    "swing_resolution": 4,
+                    "num_steps": 16,
+                    "volume": 1.0,
+                    "send": 0.0,
+                    "polyphonic": true,
+                    "timebase": 4,
+                    "accumulator_idx": 0,
+                    "accum_limit": 48.0,
+                    "accum_mode": 0,
+                    "fts_scale": 0
+                }],
+                "effect_slots": [[]],
+                "instrument_slots": [{"num_params":0,"defaults":[],"plocks":[],"param_node_indices":[]}],
+                "instrument_base_note_offsets": [0.0],
+                "track_sound_states": [{"loaded_preset": null, "dirty": false}],
+                "chord_snapshots": [[[]]],
+                "timebase_plock_snapshots": [[null]],
+                "instrument_types": ["sampler"],
+                "sample_paths": ["samples/kick.wav"],
+                "sample_names": ["kick"]
+            }]
+        }"#;
+
+        let project: ProjectFile = serde_json::from_str(json).expect("deserialize legacy project");
+        let step = project.patterns[0].step_data[0][0];
+        assert_eq!(step[crate::sequencer::StepParam::Transpose.index()], 7.0);
+        assert_eq!(step[crate::sequencer::StepParam::Pan.index()], 0.0);
+        assert_eq!(step[crate::sequencer::StepParam::Chop.index()], 1.0);
     }
 }

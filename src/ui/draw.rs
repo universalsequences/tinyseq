@@ -12,7 +12,10 @@ use super::effects_draw::{
     draw_project_loading_overlay,
 };
 use super::params::draw_params_region;
-use super::{App, InputMode, Region, SidebarMode};
+use super::{App, InputMode, Region, SidebarMode, SidebarTab};
+
+const SIDEBAR_BASE_WIDTH: u16 = 30;
+const AGENT_SIDEBAR_WIDTH_MULTIPLIER: u16 = 2;
 
 pub(super) fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
@@ -24,6 +27,7 @@ pub(super) fn param_color(param: StepParam) -> Color {
         StepParam::Velocity => Color::Rgb(220, 160, 40), // amber
         StepParam::AuxA => Color::Rgb(200, 80, 120),     // rose
         StepParam::Transpose => Color::Rgb(160, 100, 220), // violet
+        StepParam::Pan => Color::Rgb(90, 180, 210),      // cyan
         StepParam::Sync => Color::Rgb(60, 190, 150),     // teal
         _ => Color::White,
     }
@@ -50,6 +54,11 @@ pub(super) fn region_border_style(app: &App, region: Region) -> Style {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let sidebar_width = if app.ui.sidebar_tab == SidebarTab::Agent {
+        SIDEBAR_BASE_WIDTH * AGENT_SIDEBAR_WIDTH_MULTIPLIER
+    } else {
+        SIDEBAR_BASE_WIDTH
+    };
 
     // Global info bar + Cirklon+Sidebar row + Params + Help
     let chunks = Layout::default()
@@ -66,8 +75,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(30), // Sidebar
-            Constraint::Min(40),    // Cirklon
+            Constraint::Length(sidebar_width), // Sidebar
+            Constraint::Min(40),               // Cirklon
         ])
         .split(chunks[1]);
 
@@ -397,20 +406,27 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Rgb(220, 180, 100)),
         ))]
     } else if app.ui.focused_region == Region::Sidebar {
-        let hint_text = match app.effective_sidebar_mode() {
-            SidebarMode::InstrumentPicker => {
-                "  \u{2191}\u{2193}: navigate  Enter: select instrument  Esc: back".to_string()
-            }
-            SidebarMode::Presets => {
-                "  Type to filter  \u{2191}\u{2193}: navigate  Enter: load  Ctrl+S: save new  Ctrl+O: overwrite  Ctrl+R: revert  Esc: back".to_string()
-            }
-            _ => {
-                let action = match app.ui.sidebar_mode {
-                    SidebarMode::AddTrack => "Enter: add track",
-                    SidebarMode::Audition => "Enter: swap sample",
-                    _ => unreachable!(),
-                };
-                format!("  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  {}  Esc: back", action)
+        let hint_text = if app.ui.sidebar_tab == SidebarTab::Tools {
+            "  \u{2191}\u{2193}: param  \u{2190}\u{2192}: tab  Shift+\u{2191}\u{2193}: adjust  Enter: toggle/select  Tab: region".to_string()
+        } else if app.ui.sidebar_tab == SidebarTab::Agent {
+            "  Type: prompt  Enter: send  \u{2190}\u{2192}: model  Mouse wheel: scroll  Esc: return"
+                .to_string()
+        } else {
+            match app.effective_sidebar_mode() {
+                SidebarMode::InstrumentPicker => {
+                    "  \u{2191}\u{2193}: navigate  Enter: select instrument  Esc: tools".to_string()
+                }
+                SidebarMode::Presets => {
+                    "  Type to filter  \u{2191}\u{2193}: navigate  Enter: load  Ctrl+S: save new  Ctrl+O: overwrite  Ctrl+R: revert  Esc: tools".to_string()
+                }
+                _ => {
+                    let action = match app.ui.sidebar_mode {
+                        SidebarMode::AddTrack => "Enter: add track",
+                        SidebarMode::Audition => "Enter: swap sample",
+                        _ => unreachable!(),
+                    };
+                    format!("  Type to filter  \u{2191}\u{2193}: navigate  \u{2190}\u{2192}: collapse/expand  {}  Esc: tools", action)
+                }
             }
         };
         vec![Line::from(Span::styled(
@@ -453,14 +469,14 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
                         "  \u{2191}\u{2193}: select  Enter: confirm  Esc: cancel",
                         Style::default().fg(Color::Yellow),
                     ))]
-                } else if app.ui.params_column == 1 {
+                } else if app.ui.params_column == 0 {
                     vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  [/]: step  Enter: toggle  Tab: region",
-                    Style::default().fg(Color::DarkGray),
-                ))]
+                        "  \u{2191}\u{2193}: choose tab  \u{2192}/Enter: edit  \u{2190}: sidebar  Tab: region",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
                 } else {
                     vec![Line::from(Span::styled(
-                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  Enter: toggle  Tab: region",
+                    "  \u{2190}\u{2192}: column/effect  \u{2191}\u{2193}: param  S-\u{2191}\u{2193}: adjust  -/0-9: type  [/]: step  Enter: toggle  Tab: region",
                     Style::default().fg(Color::DarkGray),
                 ))]
                 }

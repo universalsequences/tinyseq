@@ -12,6 +12,7 @@ use super::{App, EngineNodeIds, TrackNodeIds};
 
 struct TrackShell {
     voice_sum_id: i32,
+    pan_id: i32,
     filter_id: i32,
     delay_id: i32,
     send_id: i32,
@@ -251,6 +252,7 @@ impl GraphController<'_> {
                 crate::audiograph::delete_node(self.app.graph.lg.0, track.send_id);
                 crate::audiograph::delete_node(self.app.graph.lg.0, track.delay_id);
                 crate::audiograph::delete_node(self.app.graph.lg.0, track.filter_id);
+                crate::audiograph::delete_node(self.app.graph.lg.0, track.pan_id);
                 crate::audiograph::delete_node(self.app.graph.lg.0, track.voice_sum_id);
             }
         }
@@ -322,7 +324,7 @@ impl GraphController<'_> {
                 }
             }
         }
-        self.app.graph.track_node_ids[track].voice_sum_id
+        self.app.graph.track_node_ids[track].pan_id
     }
 
     fn find_custom_slot_successor(&self, track: usize, offset: usize) -> i32 {
@@ -345,6 +347,20 @@ impl GraphController<'_> {
             crate::audiograph::live_add_gain(self.app.graph.lg.0, 1.0, sum_name.as_ptr())
         };
 
+        let pan_name = CString::new(format!("{}_pan", name)).unwrap();
+        let pan_id = unsafe {
+            crate::audiograph::add_node(
+                self.app.graph.lg.0,
+                crate::stereo_panner::stereo_panner_vtable(),
+                crate::stereo_panner::STEREO_PANNER_STATE_SIZE * std::mem::size_of::<f32>(),
+                pan_name.as_ptr(),
+                1,
+                2,
+                std::ptr::null(),
+                0,
+            )
+        };
+
         let filter_name = CString::new(format!("{}_filter", name)).unwrap();
         let filter_id = unsafe {
             crate::audiograph::add_node(
@@ -352,8 +368,8 @@ impl GraphController<'_> {
                 crate::filter::filter_vtable(),
                 crate::filter::FILTER_STATE_SIZE * std::mem::size_of::<f32>(),
                 filter_name.as_ptr(),
-                1,
-                1,
+                2,
+                2,
                 std::ptr::null(),
                 0,
             )
@@ -366,7 +382,7 @@ impl GraphController<'_> {
                 crate::delay::delay_vtable(),
                 crate::delay::DELAY_STATE_SIZE * std::mem::size_of::<f32>(),
                 delay_name.as_ptr(),
-                1,
+                2,
                 2,
                 std::ptr::null(),
                 0,
@@ -379,8 +395,11 @@ impl GraphController<'_> {
         };
 
         unsafe {
-            crate::audiograph::graph_connect(self.app.graph.lg.0, voice_sum_id, 0, filter_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, voice_sum_id, 0, pan_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, pan_id, 0, filter_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, pan_id, 1, filter_id, 1);
             crate::audiograph::graph_connect(self.app.graph.lg.0, filter_id, 0, delay_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, filter_id, 1, delay_id, 1);
             crate::audiograph::graph_connect(
                 self.app.graph.lg.0,
                 delay_id,
@@ -395,7 +414,8 @@ impl GraphController<'_> {
                 self.app.graph.bus_r_id,
                 0,
             );
-            crate::audiograph::graph_connect(self.app.graph.lg.0, voice_sum_id, 0, send_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, pan_id, 0, send_id, 0);
+            crate::audiograph::graph_connect(self.app.graph.lg.0, pan_id, 1, send_id, 0);
             crate::audiograph::graph_connect(
                 self.app.graph.lg.0,
                 send_id,
@@ -407,6 +427,7 @@ impl GraphController<'_> {
 
         TrackShell {
             voice_sum_id,
+            pan_id,
             filter_id,
             delay_id,
             send_id,
@@ -880,6 +901,7 @@ impl GraphController<'_> {
         self.app.state.runtime.voice_counts[idx].store(voice_lids.len() as u32, Ordering::Release);
         self.app.state.runtime.sampler_lids[idx]
             .store(voice_lids.first().copied().unwrap_or(0), Ordering::Release);
+        self.app.state.runtime.pan_lids[idx].store(shell.pan_id as u64, Ordering::Release);
         self.app.state.runtime.delay_lids[idx].store(shell.delay_id as u64, Ordering::Release);
         self.app.state.runtime.send_lids[idx].store(shell.send_id as u64, Ordering::Release);
         self.app.state.runtime.instrument_type_flags[idx].store(
@@ -923,6 +945,7 @@ impl GraphController<'_> {
                 self.app.graph.track_node_ids.push(TrackNodeIds {
                     sampler_ids,
                     voice_sum_id: shell.voice_sum_id,
+                    pan_id: shell.pan_id,
                     filter_id: shell.filter_id,
                     delay_id: shell.delay_id,
                     send_id: shell.send_id,
@@ -956,6 +979,7 @@ impl GraphController<'_> {
                 self.app.graph.track_node_ids.push(TrackNodeIds {
                     sampler_ids: Vec::new(),
                     voice_sum_id: shell.voice_sum_id,
+                    pan_id: shell.pan_id,
                     filter_id: shell.filter_id,
                     delay_id: shell.delay_id,
                     send_id: shell.send_id,
@@ -991,7 +1015,12 @@ impl GraphController<'_> {
     }
 
     fn initialize_instrument_slot(&mut self, track: usize, name: &str, manifest: &DGenManifest) {
-        let mut inst_desc = EffectDescriptor::from_lisp_manifest(name, &manifest.params);
+        let mut inst_desc = EffectDescriptor::from_lisp_manifest(
+            name,
+            &manifest.params,
+            manifest.n_inputs,
+            manifest.n_outputs,
+        );
         for param in &mut inst_desc.params {
             if param.node_param_idx < crate::voice_modulator::MOD_PARAM_BASE {
                 param.node_param_idx += lisp_effect::HEADER_SLOTS as u32;

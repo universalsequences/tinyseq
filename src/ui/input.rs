@@ -12,20 +12,16 @@ use super::browser::BrowserNode;
 use super::cirklon::track_list_row_layout;
 use super::draw::rect_contains;
 use super::{
-    App, BrowserState, CompileTarget, EffectTab, InputMode, ParamMouseDrag, ParamMouseDragTarget,
-    PendingEditor, Region, SidebarMode, COL_WIDTH,
+    App, BrowserState, CompileTarget, EffectPaneEntry, EffectTab, InputMode, ParamMouseDrag,
+    ParamMouseDragTarget, PendingEditor, Region, SidebarMode, SidebarTab, COL_WIDTH,
 };
-
-enum EffectTabHit {
-    Tab(EffectTab),
-    PlusButton,
-}
 
 // ── App impl: input handling ──
 
 impl App {
     pub fn handle_input(&mut self) -> std::io::Result<()> {
         self.tick_control_hooks();
+        self.poll_agent_request();
 
         if self.editor.pending_project_load.is_some() {
             let result = self.advance_project_load();
@@ -286,28 +282,28 @@ impl App {
                 return;
             }
             KeyCode::Tab => {
-                let leaving_sidebar = self.ui.focused_region == Region::Sidebar;
                 self.ui.focused_region = self.ui.focused_region.next();
-                if !leaving_sidebar
-                    && self.ui.focused_region == Region::Sidebar
-                    && !self.tracks.is_empty()
-                {
-                    self.ui.sidebar_mode = self.effective_sidebar_mode();
-                } else if leaving_sidebar && !self.tracks.is_empty() {
-                    self.ui.sidebar_mode = SidebarMode::Audition;
+                if self.ui.focused_region == Region::Sidebar {
+                    self.ui.sidebar_tab = if self.tracks.is_empty() {
+                        SidebarTab::Sounds
+                    } else {
+                        self.ui.sidebar_tab
+                    };
+                } else if self.ui.focused_region == Region::Params {
+                    self.ui.params_column = 1;
                 }
                 return;
             }
             KeyCode::BackTab => {
-                let leaving_sidebar = self.ui.focused_region == Region::Sidebar;
                 self.ui.focused_region = self.ui.focused_region.prev();
-                if !leaving_sidebar
-                    && self.ui.focused_region == Region::Sidebar
-                    && !self.tracks.is_empty()
-                {
-                    self.ui.sidebar_mode = self.effective_sidebar_mode();
-                } else if leaving_sidebar && !self.tracks.is_empty() {
-                    self.ui.sidebar_mode = SidebarMode::Audition;
+                if self.ui.focused_region == Region::Sidebar {
+                    self.ui.sidebar_tab = if self.tracks.is_empty() {
+                        SidebarTab::Sounds
+                    } else {
+                        self.ui.sidebar_tab
+                    };
+                } else if self.ui.focused_region == Region::Params {
+                    self.ui.params_column = 1;
                 }
                 return;
             }
@@ -315,6 +311,12 @@ impl App {
                 if self.has_selection() {
                     self.ui.selection_anchor = None;
                     self.ui.visual_steps.clear();
+                    if self.ui.focused_region != Region::Sidebar {
+                        return;
+                    }
+                }
+                if self.ui.focused_region == Region::Sidebar {
+                    BrowserState::handle_sidebar_input(self, KeyCode::Esc);
                 }
                 return;
             }
@@ -382,7 +384,7 @@ impl App {
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.ui.instrument_picker_cursor = 0;
                 self.ui.sidebar_mode = SidebarMode::InstrumentPicker;
-                self.ui.focused_region = Region::Sidebar;
+                self.focus_sidebar_sounds();
                 return;
             }
             KeyCode::Char('s')
@@ -420,11 +422,17 @@ impl App {
             }
             // / → disarm all tracks and focus sidebar search
             KeyCode::Char('/') => {
+                if self.ui.focused_region == Region::Sidebar
+                    && self.ui.sidebar_tab == SidebarTab::Agent
+                {
+                    BrowserState::handle_sidebar_input(self, code);
+                    return;
+                }
                 for armed in self.graph.record_armed.iter_mut() {
                     *armed = false;
                 }
                 self.ui.recording = false;
-                self.ui.focused_region = Region::Sidebar;
+                self.focus_sidebar_sounds();
                 return;
             }
             _ => {}
@@ -568,12 +576,134 @@ impl App {
         }
 
         // Sidebar: click selects item and focuses sidebar
-        if rect_contains(l.sidebar_inner, col, row) {
-            if self.ui.focused_region != Region::Sidebar && !self.tracks.is_empty() {
-                self.ui.sidebar_mode = self.effective_sidebar_mode();
-            }
+        if rect_contains(l.sidebar_tabs, col, row) {
             self.ui.focused_region = Region::Sidebar;
-            if self.effective_sidebar_mode() == SidebarMode::Presets {
+            let x_rel = col.saturating_sub(l.sidebar_tabs.x);
+            let tools_start = 0;
+            let tools_end = 7; // " Tools "
+            let agent_start = 8; // after " Tools " + " "
+            let agent_end = agent_start + 7; // " Agent "
+            let sounds_start = 16; // after tools + gap + agent + gap
+            let sounds_end = sounds_start + 8; // " Sounds "
+            if x_rel >= tools_start && x_rel < tools_end && !self.tracks.is_empty() {
+                self.ui.sidebar_tab = SidebarTab::Tools;
+            } else if x_rel >= agent_start && x_rel < agent_end {
+                self.ui.sidebar_tab = SidebarTab::Agent;
+            } else if x_rel >= sounds_start && x_rel < sounds_end {
+                self.ui.sidebar_tab = SidebarTab::Sounds;
+            }
+            return;
+        }
+
+        if rect_contains(l.sidebar_inner, col, row) {
+            self.ui.focused_region = Region::Sidebar;
+            if self.ui.sidebar_tab == SidebarTab::Tools {
+                if rect_contains(l.track_params_inner, col, row) {
+                    let row_idx =
+                        self.ui.tools_scroll_offset + (row - l.track_params_inner.y) as usize;
+                    self.ui.tools_cursor = row_idx;
+                    self.sync_tools_cursor();
+                    self.ui.params_column = 0;
+                    match row_idx {
+                        idx if idx <= super::TP_LAST => {
+                            let start_display_value = match idx {
+                                super::TP_ATTACK => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_attack_ms(),
+                                ),
+                                super::TP_RELEASE => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_release_ms(),
+                                ),
+                                super::TP_SWING => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_swing(),
+                                ),
+                                super::TP_STEPS => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_num_steps() as f32,
+                                ),
+                                super::TP_VOLUME => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_volume(),
+                                ),
+                                super::TP_PAN => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track].get_pan(),
+                                ),
+                                super::TP_SEND => Some(
+                                    self.state.pattern.track_params[self.ui.cursor_track]
+                                        .get_send(),
+                                ),
+                                super::TP_MASTER => Some(f32::from_bits(
+                                    self.state.transport.master_volume.load(Ordering::Relaxed),
+                                )),
+                                _ => None,
+                            };
+                            if let Some(start_display_value) = start_display_value {
+                                self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                                    track: self.ui.cursor_track,
+                                    target: ParamMouseDragTarget::TrackParam { row_idx: idx },
+                                    start_col: col,
+                                    start_display_value,
+                                });
+                            }
+                        }
+                        idx => {
+                            let accum_idx = idx.saturating_sub(super::TP_LAST + 1);
+                            if accum_idx == super::AC_LIMIT {
+                                let start_display_value = self.state.pattern.track_params
+                                    [self.ui.cursor_track]
+                                    .get_accum_limit();
+                                self.ui.param_mouse_drag = Some(ParamMouseDrag {
+                                    track: self.ui.cursor_track,
+                                    target: ParamMouseDragTarget::AccumParam { row_idx: accum_idx },
+                                    start_col: col,
+                                    start_display_value,
+                                });
+                            }
+                        }
+                    }
+                    return;
+                }
+            } else if self.ui.sidebar_tab == SidebarTab::Agent {
+                let model_row_y = l.sidebar_inner.y;
+                let dropdown_x = l.sidebar_inner.x + 7;
+                let dropdown_width = l.sidebar_inner.width.saturating_sub(7).min(28).max(16);
+                let options = self.agent_model_options();
+                let visible_count = options
+                    .len()
+                    .min(l.sidebar_inner.height.saturating_sub(1) as usize);
+                let scroll = self
+                    .agent_panel
+                    .model_dropdown_cursor
+                    .saturating_sub(visible_count.saturating_sub(1));
+
+                if self.agent_panel.model_dropdown_open
+                    && col >= dropdown_x
+                    && col < dropdown_x + dropdown_width
+                    && row > model_row_y
+                    && row <= model_row_y + visible_count as u16
+                {
+                    let idx = scroll + (row - model_row_y - 1) as usize;
+                    if idx < options.len() {
+                        self.select_agent_model_index(idx);
+                    }
+                    self.agent_panel.model_dropdown_open = false;
+                    return;
+                }
+
+                if row == model_row_y {
+                    self.agent_panel.model_dropdown_open = !self.agent_panel.model_dropdown_open;
+                    if self.agent_panel.model_dropdown_open {
+                        self.agent_panel.model_dropdown_cursor =
+                            self.selected_agent_model_index().unwrap_or(0);
+                    }
+                    return;
+                }
+
+                self.agent_panel.model_dropdown_open = false;
+                return;
+            } else if self.effective_sidebar_mode() == SidebarMode::Presets {
                 let list_start_y = l.sidebar_inner.y + 3;
                 if row >= list_start_y {
                     let vi = (row - list_start_y) as usize;
@@ -799,124 +929,22 @@ impl App {
             return;
         }
 
-        // Track params title row: click on Track / Accum tab labels
-        let track_params_title_row = l.track_params_inner.y.saturating_sub(1);
-        if row == track_params_title_row
-            && col >= l.track_params_inner.x
-            && col < l.track_params_inner.x + l.track_params_inner.width
-        {
-            let x_rel = col - l.track_params_inner.x;
-            // "[< Track >]" = 11 chars at offset 0, " " at 11, "[< Accum >]" = 11 chars at offset 12
-            if x_rel < 11 {
-                self.ui.track_params_tab = 0;
-                self.ui.focused_region = Region::Params;
-                self.ui.params_column = 0;
-            } else if x_rel >= 12 && x_rel < 23 {
-                self.ui.track_params_tab = 1;
-                self.ui.focused_region = Region::Params;
-                self.ui.params_column = 0;
-            }
-            return;
-        }
-
-        // Track params inner: click selects param row
-        if rect_contains(l.track_params_inner, col, row) {
-            let row_idx = (row - l.track_params_inner.y) as usize;
-            self.ui.focused_region = Region::Params;
-            self.ui.params_column = 0;
-            if self.ui.track_params_tab == 1 {
-                // Accum tab
-                if row_idx <= super::AC_LAST {
-                    self.ui.accum_cursor = row_idx;
-                    if row_idx == super::AC_LIMIT {
-                        let start_display_value =
-                            self.state.pattern.track_params[self.ui.cursor_track].get_accum_limit();
-                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
-                            track: self.ui.cursor_track,
-                            target: ParamMouseDragTarget::AccumParam { row_idx },
-                            start_col: col,
-                            start_display_value,
-                        });
-                    }
-                }
-            } else {
-                // Track tab
-                if row_idx <= super::TP_LAST {
-                    self.ui.track_param_cursor = row_idx;
-                    let start_display_value = match row_idx {
-                        super::TP_ATTACK => Some(
-                            self.state.pattern.track_params[self.ui.cursor_track].get_attack_ms(),
-                        ),
-                        super::TP_RELEASE => Some(
-                            self.state.pattern.track_params[self.ui.cursor_track].get_release_ms(),
-                        ),
-                        super::TP_SWING => {
-                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_swing())
-                        }
-                        super::TP_STEPS => Some(
-                            self.state.pattern.track_params[self.ui.cursor_track].get_num_steps()
-                                as f32,
-                        ),
-                        super::TP_VOLUME => {
-                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_volume())
-                        }
-                        super::TP_SEND => {
-                            Some(self.state.pattern.track_params[self.ui.cursor_track].get_send())
-                        }
-                        super::TP_MASTER => Some(f32::from_bits(
-                            self.state.transport.master_volume.load(Ordering::Relaxed),
-                        )),
-                        _ => None,
-                    };
-                    if let Some(start_display_value) = start_display_value {
-                        self.ui.param_mouse_drag = Some(ParamMouseDrag {
-                            track: self.ui.cursor_track,
-                            target: ParamMouseDragTarget::TrackParam { row_idx },
-                            start_col: col,
-                            start_display_value,
-                        });
-                    }
-                }
-            }
-            return;
-        }
-
-        // Effects block title row: click on effect slot tab
-        if row == l.effects_block.y
-            && col >= l.effects_block.x
-            && col < l.effects_block.x + l.effects_block.width
-        {
-            if let Some(hit) = self.effect_tab_from_click_x(col) {
-                if matches!(hit, EffectTabHit::PlusButton) {
-                    // Open effect picker (same as Ctrl+L)
-                    if !self.tracks.is_empty() {
+        if rect_contains(l.effects_tabs, col, row) {
+            let idx = (row - l.effects_tabs.y) as usize;
+            let entries = self.effect_pane_entries();
+            if idx < entries.len() {
+                self.ui.effect_tab_cursor = idx;
+                match entries[idx] {
+                    EffectPaneEntry::Tab(tab) => self.select_effect_tab(tab),
+                    EffectPaneEntry::PlusButton => {
                         self.editor.picker_items = lisp_effect::list_saved_effects();
                         self.editor.picker_cursor = 0;
                         self.editor.picker_filter.clear();
                         self.ui.input_mode = InputMode::EffectPicker;
                     }
-                } else {
-                    let EffectTabHit::Tab(tab) = hit else {
-                        return;
-                    };
-                    self.ui.effect_tab = tab;
-                    if tab == EffectTab::Synth {
-                        self.ui.instrument_param_cursor = 0;
-                        self.ui.synth_scroll_offset = 0;
-                    } else if tab == EffectTab::Mod {
-                        self.ui.mod_param_cursor = 0;
-                        self.ui.mod_scroll_offset = 0;
-                    } else if tab == EffectTab::Sources {
-                        self.ui.source_param_cursor = 0;
-                        self.ui.source_scroll_offset = 0;
-                    } else if tab == EffectTab::Reverb {
-                        self.ui.reverb_param_cursor = 0;
-                    } else {
-                        self.ui.effect_param_cursor = 0;
-                    }
-                    self.ui.focused_region = Region::Params;
-                    self.ui.params_column = 1;
                 }
+                self.ui.focused_region = Region::Params;
+                self.ui.params_column = 0;
             }
             return;
         }
@@ -1133,7 +1161,9 @@ impl App {
     fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: isize) {
         let l = &self.ui.layout;
         if rect_contains(l.sidebar_inner, col, row) {
-            if self.effective_sidebar_mode() == SidebarMode::Presets {
+            if self.ui.sidebar_tab == SidebarTab::Agent {
+                self.scroll_agent_transcript(-delta);
+            } else if self.effective_sidebar_mode() == SidebarMode::Presets {
                 let items = self.visible_preset_items();
                 let max_visible = self.preset_max_visible();
                 let max_scroll = items.len().saturating_sub(max_visible);
@@ -1154,11 +1184,13 @@ impl App {
 
         if rect_contains(l.effects_inner, col, row) {
             if self.ui.effect_tab == EffectTab::Synth {
-                let visible = self.synth_visible_capacity(l.effects_inner);
-                if visible == 0 {
+                let visible_rows = self.synth_rows_per_column(l.effects_inner);
+                if visible_rows == 0 {
                     return;
                 }
-                let max_scroll = self.synth_row_count().saturating_sub(visible);
+                let partition_rows = self
+                    .instrument_partition_rows_per_column(l.effects_inner, self.synth_row_count());
+                let max_scroll = partition_rows.saturating_sub(visible_rows);
                 if delta < 0 {
                     self.ui.synth_scroll_offset = self
                         .ui
@@ -1169,11 +1201,13 @@ impl App {
                         (self.ui.synth_scroll_offset + delta as usize).min(max_scroll);
                 }
             } else if self.ui.effect_tab == EffectTab::Mod {
-                let visible = self.synth_visible_capacity(l.effects_inner);
-                if visible == 0 {
+                let visible_rows = self.synth_rows_per_column(l.effects_inner);
+                if visible_rows == 0 {
                     return;
                 }
-                let max_scroll = self.mod_row_count().saturating_sub(visible);
+                let partition_rows = self
+                    .instrument_partition_rows_per_column(l.effects_inner, self.mod_row_count());
+                let max_scroll = partition_rows.saturating_sub(visible_rows);
                 if delta < 0 {
                     self.ui.mod_scroll_offset =
                         self.ui.mod_scroll_offset.saturating_sub((-delta) as usize);
@@ -1182,11 +1216,13 @@ impl App {
                         (self.ui.mod_scroll_offset + delta as usize).min(max_scroll);
                 }
             } else if self.ui.effect_tab == EffectTab::Sources {
-                let visible = self.synth_visible_capacity(l.effects_inner);
-                if visible == 0 {
+                let visible_rows = self.synth_rows_per_column(l.effects_inner);
+                if visible_rows == 0 {
                     return;
                 }
-                let max_scroll = self.source_row_count().saturating_sub(visible);
+                let partition_rows = self
+                    .instrument_partition_rows_per_column(l.effects_inner, self.source_row_count());
+                let max_scroll = partition_rows.saturating_sub(visible_rows);
                 if delta < 0 {
                     self.ui.source_scroll_offset = self
                         .ui
@@ -1268,63 +1304,6 @@ impl App {
         }
     }
 
-    /// Returns the slot index for a click on the effect tab bar, or None.
-    /// Returns `Some(PLUS_BUTTON)` when the [+] button is clicked.
-    fn effect_tab_from_click_x(&self, col: u16) -> Option<EffectTabHit> {
-        let visible = self.visible_effect_indices();
-        let descs = self.graph.effect_descriptors.get(self.ui.cursor_track)?;
-        let mut x = self.ui.layout.effects_block.x + 1;
-
-        // Synth tab (prepended for custom instrument tracks)
-        if self.is_current_custom_track() {
-            let synth_width: u16 = 11; // "[< Synth >]" or "[  Synth  ]"
-            if col >= x && col < x + synth_width {
-                return Some(EffectTabHit::Tab(EffectTab::Synth));
-            }
-            x += synth_width + 1; // matches the " " separator in rendering
-
-            let mod_width: u16 = 11; // "[< Mod >]" or "[  Mod  ]"
-            if col >= x && col < x + mod_width {
-                return Some(EffectTabHit::Tab(EffectTab::Mod));
-            }
-            x += mod_width + 1;
-
-            let sources_width: u16 = 13; // "[< Sources >]" or "[  Sources  ]"
-            if col >= x && col < x + sources_width {
-                return Some(EffectTabHit::Tab(EffectTab::Sources));
-            }
-            x += sources_width + 1;
-        }
-
-        for &i in &visible {
-            if i >= descs.len() {
-                continue;
-            }
-            let desc = &descs[i];
-            let label_len = desc.name.len() as u16;
-            let tab_width = label_len + 6;
-            if col >= x && col < x + tab_width {
-                return Some(EffectTabHit::Tab(EffectTab::Slot(i)));
-            }
-            x += tab_width + 1; // matches the " " separator in rendering
-        }
-        // Check [+] button
-        if self.can_add_custom_effect() {
-            let plus_width: u16 = 3; // "[+]"
-            if col >= x && col < x + plus_width {
-                return Some(EffectTabHit::PlusButton);
-            }
-            x += plus_width;
-        }
-        // Check Reverb tab (after " " separator)
-        x += 1;
-        let reverb_width: u16 = 12; // "[  Reverb  ]" or "[< Reverb >]"
-        if col >= x && col < x + reverb_width {
-            return Some(EffectTabHit::Tab(EffectTab::Reverb));
-        }
-        None
-    }
-
     fn handle_value_entry(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -1389,56 +1368,62 @@ impl App {
                     );
                 }
             }
-            Region::Params => {
-                if self.ui.params_column == 0 {
-                    if self.ui.track_params_tab == 1 {
-                        // Accum tab value entry
-                        if self.ui.accum_cursor == super::AC_LIMIT {
+            Region::Params | Region::Sidebar => {
+                if self.ui.focused_region == Region::Sidebar || self.ui.params_column == 0 {
+                    match self.active_tool_row() {
+                        super::params::ToolRow::Accum(super::AC_LIMIT) => {
                             self.for_each_selected_track(|app, track| {
                                 app.state.pattern.track_params[track].set_accum_limit(val.max(0.0));
                             });
                         }
-                    } else {
-                        match self.ui.track_param_cursor {
-                            super::TP_ATTACK => self.for_each_selected_track(|app, track| {
+                        super::params::ToolRow::Track(super::TP_ATTACK) => {
+                            self.for_each_selected_track(|app, track| {
                                 app.state.pattern.track_params[track].set_attack_ms(val);
-                            }),
-                            super::TP_RELEASE => self.for_each_selected_track(|app, track| {
-                                app.state.pattern.track_params[track].set_release_ms(val);
-                            }),
-                            super::TP_SWING => self.for_each_selected_track(|app, track| {
-                                app.state.pattern.track_params[track].set_swing(val);
-                            }),
-                            super::TP_STEPS => {
-                                self.for_each_selected_track(|app, track| {
-                                    app.state.pattern.track_params[track]
-                                        .set_num_steps(val as usize);
-                                });
-                                self.clamp_cursor_to_steps();
-                            }
-                            super::TP_VOLUME => {
-                                self.for_each_selected_track(|app, track| {
-                                    app.state.pattern.track_params[track]
-                                        .set_volume(val.clamp(0.0, 1.0));
-                                    app.push_track_volume(track);
-                                });
-                            }
-                            super::TP_SEND => {
-                                self.for_each_selected_track(|app, track| {
-                                    app.state.pattern.track_params[track]
-                                        .set_send(val.clamp(0.0, 1.0));
-                                    app.push_send_gain(track);
-                                });
-                            }
-                            super::TP_MASTER => {
-                                self.state
-                                    .transport
-                                    .master_volume
-                                    .store(val.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
-                                self.push_master_volume();
-                            }
-                            _ => {}
+                            });
                         }
+                        super::params::ToolRow::Track(super::TP_RELEASE) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_release_ms(val);
+                            });
+                        }
+                        super::params::ToolRow::Track(super::TP_SWING) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_swing(val);
+                            });
+                        }
+                        super::params::ToolRow::Track(super::TP_STEPS) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_num_steps(val as usize);
+                            });
+                            self.clamp_cursor_to_steps();
+                        }
+                        super::params::ToolRow::Track(super::TP_VOLUME) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track]
+                                    .set_volume(val.clamp(0.0, 1.0));
+                                app.push_track_volume(track);
+                            });
+                        }
+                        super::params::ToolRow::Track(super::TP_PAN) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_pan(val.clamp(-1.0, 1.0));
+                                app.push_track_pan(track);
+                            });
+                        }
+                        super::params::ToolRow::Track(super::TP_SEND) => {
+                            self.for_each_selected_track(|app, track| {
+                                app.state.pattern.track_params[track].set_send(val.clamp(0.0, 1.0));
+                                app.push_send_gain(track);
+                            });
+                        }
+                        super::params::ToolRow::Track(super::TP_MASTER) => {
+                            self.state
+                                .transport
+                                .master_volume
+                                .store(val.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+                            self.push_master_volume();
+                        }
+                        _ => {}
                     }
                 } else if self.ui.effect_tab == EffectTab::Reverb {
                     self.set_reverb_param(self.ui.reverb_param_cursor, val);
@@ -1547,7 +1532,6 @@ impl App {
                     }
                 }
             }
-            Region::Sidebar => {} // No value entry in sidebar
         }
     }
 

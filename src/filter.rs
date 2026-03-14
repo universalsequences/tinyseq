@@ -6,12 +6,14 @@ const STATE_ENABLED: usize = 0;
 const STATE_MODE: usize = 1; // 0=LP, 1=HP, 2=BP
 const STATE_CUTOFF: usize = 2; // Hz
 const STATE_RESONANCE: usize = 3;
-const STATE_IC1EQ: usize = 4; // SVF integrator state
-const STATE_IC2EQ: usize = 5;
-const STATE_SMOOTH_CUTOFF: usize = 6;
-const STATE_SMOOTH_RESO: usize = 7;
-const STATE_SAMPLE_RATE: usize = 8;
-pub const FILTER_STATE_SIZE: usize = 9;
+const STATE_IC1EQ_L: usize = 4; // SVF integrator state
+const STATE_IC2EQ_L: usize = 5;
+const STATE_IC1EQ_R: usize = 6;
+const STATE_IC2EQ_R: usize = 7;
+const STATE_SMOOTH_CUTOFF: usize = 8;
+const STATE_SMOOTH_RESO: usize = 9;
+const STATE_SAMPLE_RATE: usize = 10;
+pub const FILTER_STATE_SIZE: usize = 11;
 
 // Param indices for external control
 pub const FILTER_PARAM_ENABLED: u64 = STATE_ENABLED as u64;
@@ -31,8 +33,10 @@ unsafe extern "C" fn filter_init(
     *s.add(STATE_MODE) = 0.0;
     *s.add(STATE_CUTOFF) = 1000.0;
     *s.add(STATE_RESONANCE) = 1.0;
-    *s.add(STATE_IC1EQ) = 0.0;
-    *s.add(STATE_IC2EQ) = 0.0;
+    *s.add(STATE_IC1EQ_L) = 0.0;
+    *s.add(STATE_IC2EQ_L) = 0.0;
+    *s.add(STATE_IC1EQ_R) = 0.0;
+    *s.add(STATE_IC2EQ_R) = 0.0;
     *s.add(STATE_SMOOTH_CUTOFF) = 1000.0;
     *s.add(STATE_SMOOTH_RESO) = 1.0;
     *s.add(STATE_SAMPLE_RATE) = sample_rate as f32;
@@ -50,14 +54,19 @@ unsafe extern "C" fn filter_process(
     let nf = nframes as usize;
 
     let in0 = *inp.add(0);
+    let in1 = *inp.add(1);
     let out0 = *out.add(0);
+    let out1 = *out.add(1);
 
     if enabled <= 0.5 {
         // Bypass: pass-through and reset integrator state to avoid click on re-enable
-        *s.add(STATE_IC1EQ) = 0.0;
-        *s.add(STATE_IC2EQ) = 0.0;
+        *s.add(STATE_IC1EQ_L) = 0.0;
+        *s.add(STATE_IC2EQ_L) = 0.0;
+        *s.add(STATE_IC1EQ_R) = 0.0;
+        *s.add(STATE_IC2EQ_R) = 0.0;
         for i in 0..nf {
             *out0.add(i) = *in0.add(i);
+            *out1.add(i) = *in1.add(i);
         }
         return;
     }
@@ -68,8 +77,10 @@ unsafe extern "C" fn filter_process(
     let sr = *s.add(STATE_SAMPLE_RATE);
     let mut smooth_cutoff = *s.add(STATE_SMOOTH_CUTOFF);
     let mut smooth_reso = *s.add(STATE_SMOOTH_RESO);
-    let mut ic1eq = *s.add(STATE_IC1EQ);
-    let mut ic2eq = *s.add(STATE_IC2EQ);
+    let mut ic1eq_l = *s.add(STATE_IC1EQ_L);
+    let mut ic2eq_l = *s.add(STATE_IC2EQ_L);
+    let mut ic1eq_r = *s.add(STATE_IC1EQ_R);
+    let mut ic2eq_r = *s.add(STATE_IC2EQ_R);
 
     // One-pole smoothing coefficient (~20Hz)
     let smooth_coeff = 1.0 - (-2.0 * std::f32::consts::PI * 20.0 / sr).exp();
@@ -87,26 +98,38 @@ unsafe extern "C" fn filter_process(
         let a2 = g * a1;
         let a3 = g * a2;
 
-        let v0 = *in0.add(i);
-        let v3 = v0 - ic2eq;
-        let v1 = a1 * ic1eq + a2 * v3;
-        let v2 = ic2eq + a2 * ic1eq + a3 * v3;
+        let input_l = *in0.add(i);
+        let v3_l = input_l - ic2eq_l;
+        let v1_l = a1 * ic1eq_l + a2 * v3_l;
+        let v2_l = ic2eq_l + a2 * ic1eq_l + a3 * v3_l;
+        ic1eq_l = 2.0 * v1_l - ic1eq_l;
+        ic2eq_l = 2.0 * v2_l - ic2eq_l;
 
-        ic1eq = 2.0 * v1 - ic1eq;
-        ic2eq = 2.0 * v2 - ic2eq;
+        let input_r = *in1.add(i);
+        let v3_r = input_r - ic2eq_r;
+        let v1_r = a1 * ic1eq_r + a2 * v3_r;
+        let v2_r = ic2eq_r + a2 * ic1eq_r + a3 * v3_r;
+        ic1eq_r = 2.0 * v1_r - ic1eq_r;
+        ic2eq_r = 2.0 * v2_r - ic2eq_r;
 
-        let output = match mode {
-            0 => v2,               // lowpass
-            1 => v0 - k * v1 - v2, // highpass
-            2 => v1,               // bandpass
-            _ => v2,
+        *out0.add(i) = match mode {
+            0 => v2_l,
+            1 => input_l - k * v1_l - v2_l,
+            2 => v1_l,
+            _ => v2_l,
         };
-
-        *out0.add(i) = output;
+        *out1.add(i) = match mode {
+            0 => v2_r,
+            1 => input_r - k * v1_r - v2_r,
+            2 => v1_r,
+            _ => v2_r,
+        };
     }
 
-    *s.add(STATE_IC1EQ) = ic1eq;
-    *s.add(STATE_IC2EQ) = ic2eq;
+    *s.add(STATE_IC1EQ_L) = ic1eq_l;
+    *s.add(STATE_IC2EQ_L) = ic2eq_l;
+    *s.add(STATE_IC1EQ_R) = ic1eq_r;
+    *s.add(STATE_IC2EQ_R) = ic2eq_r;
     *s.add(STATE_SMOOTH_CUTOFF) = smooth_cutoff;
     *s.add(STATE_SMOOTH_RESO) = smooth_reso;
 }

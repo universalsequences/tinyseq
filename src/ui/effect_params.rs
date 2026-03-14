@@ -6,9 +6,85 @@ use crate::effects::{
 };
 use crate::reverb;
 
-use super::{App, EffectTab, InputMode, ParamMouseDragTarget};
+use super::{App, EffectPaneEntry, EffectTab, InputMode, ParamMouseDragTarget};
 
 impl App {
+    pub(super) fn effect_pane_entries(&self) -> Vec<EffectPaneEntry> {
+        let mut entries = Vec::new();
+        if self.is_current_custom_track() {
+            entries.push(EffectPaneEntry::Tab(EffectTab::Synth));
+            entries.push(EffectPaneEntry::Tab(EffectTab::Mod));
+            entries.push(EffectPaneEntry::Tab(EffectTab::Sources));
+        }
+        for slot_idx in self.visible_effect_indices() {
+            entries.push(EffectPaneEntry::Tab(EffectTab::Slot(slot_idx)));
+        }
+        entries.push(EffectPaneEntry::Tab(EffectTab::Reverb));
+        if self.can_add_custom_effect() {
+            entries.push(EffectPaneEntry::PlusButton);
+        }
+        entries
+    }
+
+    pub(super) fn sync_effect_tab_cursor(&mut self) {
+        let entries = self.effect_pane_entries();
+        if let Some(idx) = entries.iter().position(
+            |entry| matches!(entry, EffectPaneEntry::Tab(tab) if *tab == self.ui.effect_tab),
+        ) {
+            self.ui.effect_tab_cursor = idx;
+        } else {
+            self.ui.effect_tab_cursor = self
+                .ui
+                .effect_tab_cursor
+                .min(entries.len().saturating_sub(1));
+        }
+    }
+
+    pub(super) fn select_effect_tab(&mut self, tab: EffectTab) {
+        self.ui.effect_tab = tab;
+        if tab == EffectTab::Synth {
+            self.ui.instrument_param_cursor = 0;
+            self.ui.synth_scroll_offset = 0;
+        } else if tab == EffectTab::Mod {
+            self.ui.mod_param_cursor = 0;
+            self.ui.mod_scroll_offset = 0;
+        } else if tab == EffectTab::Sources {
+            self.ui.source_param_cursor = 0;
+            self.ui.source_scroll_offset = 0;
+        } else if tab == EffectTab::Reverb {
+            self.ui.reverb_param_cursor = 0;
+        } else {
+            self.ui.effect_param_cursor = 0;
+        }
+        self.sync_effect_tab_cursor();
+    }
+
+    fn activate_effect_pane_cursor_entry(&mut self) {
+        let entries = self.effect_pane_entries();
+        let Some(entry) = entries.get(self.ui.effect_tab_cursor).copied() else {
+            return;
+        };
+        match entry {
+            EffectPaneEntry::Tab(tab) => self.select_effect_tab(tab),
+            EffectPaneEntry::PlusButton => {
+                self.editor.picker_items = crate::lisp_effect::list_saved_effects();
+                self.editor.picker_cursor = 0;
+                self.editor.picker_filter.clear();
+                self.ui.input_mode = InputMode::EffectPicker;
+            }
+        }
+    }
+
+    fn preview_effect_pane_cursor_entry(&mut self) {
+        let entries = self.effect_pane_entries();
+        let Some(entry) = entries.get(self.ui.effect_tab_cursor).copied() else {
+            return;
+        };
+        if let EffectPaneEntry::Tab(tab) = entry {
+            self.select_effect_tab(tab);
+        }
+    }
+
     pub(super) fn current_slot_descriptor(&self) -> Option<&EffectDescriptor> {
         if self.tracks.is_empty() {
             return None;
@@ -52,6 +128,37 @@ impl App {
     }
 
     pub(super) fn handle_effects_column(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.sync_effect_tab_cursor();
+
+        if self.ui.params_column == 0 {
+            let entries = self.effect_pane_entries();
+            match code {
+                KeyCode::Left => {}
+                KeyCode::Right | KeyCode::Enter => {
+                    self.activate_effect_pane_cursor_entry();
+                    if self.ui.input_mode == InputMode::Normal {
+                        self.ui.params_column = 1;
+                    }
+                }
+                KeyCode::Up => {
+                    if self.ui.effect_tab_cursor > 0 {
+                        self.ui.effect_tab_cursor -= 1;
+                        self.preview_effect_pane_cursor_entry();
+                        self.ui.params_column = 0;
+                    }
+                }
+                KeyCode::Down => {
+                    if self.ui.effect_tab_cursor + 1 < entries.len() {
+                        self.ui.effect_tab_cursor += 1;
+                        self.preview_effect_pane_cursor_entry();
+                        self.ui.params_column = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.ui.effect_tab == EffectTab::Synth {
             self.handle_synth_tab_input(code, modifiers);
             return;
@@ -77,18 +184,8 @@ impl App {
         let shift = modifiers.contains(KeyModifiers::SHIFT);
         match code {
             KeyCode::Left => {
-                let visible = self.visible_effect_indices();
-                if let Some(&last) = visible.last() {
-                    self.ui.effect_tab = EffectTab::Slot(last);
-                    self.ui.effect_param_cursor = 0;
-                } else if self.is_current_custom_track() {
-                    self.ui.effect_tab = EffectTab::Sources;
-                    self.ui.source_param_cursor = 0;
-                    self.ui.source_scroll_offset = 0;
-                } else {
-                    self.ui.params_column = 0;
-                    self.ui.track_params_tab = 1;
-                }
+                self.ui.params_column = 0;
+                self.sync_effect_tab_cursor();
             }
             KeyCode::Right => {}
             KeyCode::Up => {
@@ -133,52 +230,14 @@ impl App {
     }
 
     fn handle_effect_slot_input(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        let visible = self.visible_effect_indices();
         let shift = modifiers.contains(KeyModifiers::SHIFT);
 
         match code {
             KeyCode::Left => {
-                if let Some(pos) = visible
-                    .iter()
-                    .position(|&i| self.ui.effect_tab == EffectTab::Slot(i))
-                {
-                    if pos > 0 {
-                        self.ui.effect_tab = EffectTab::Slot(visible[pos - 1]);
-                        self.ui.effect_param_cursor = 0;
-                    } else if self.is_current_custom_track() {
-                        self.ui.effect_tab = EffectTab::Sources;
-                        self.ui.source_param_cursor = 0;
-                        self.ui.source_scroll_offset = 0;
-                    } else {
-                        self.ui.params_column = 0;
-                        self.ui.track_params_tab = 1;
-                    }
-                } else if self.is_current_custom_track() {
-                    self.ui.effect_tab = EffectTab::Sources;
-                    self.ui.source_param_cursor = 0;
-                    self.ui.source_scroll_offset = 0;
-                } else {
-                    self.ui.params_column = 0;
-                    self.ui.track_params_tab = 1;
-                }
+                self.ui.params_column = 0;
+                self.sync_effect_tab_cursor();
             }
-            KeyCode::Right => {
-                if let Some(pos) = visible
-                    .iter()
-                    .position(|&i| self.ui.effect_tab == EffectTab::Slot(i))
-                {
-                    if pos + 1 < visible.len() {
-                        self.ui.effect_tab = EffectTab::Slot(visible[pos + 1]);
-                        self.ui.effect_param_cursor = 0;
-                    } else {
-                        self.ui.effect_tab = EffectTab::Reverb;
-                        self.ui.reverb_param_cursor = 0;
-                    }
-                } else {
-                    self.ui.effect_tab = EffectTab::Reverb;
-                    self.ui.reverb_param_cursor = 0;
-                }
-            }
+            KeyCode::Right => {}
             KeyCode::Up => {
                 if shift {
                     self.adjust_slot_param(1.0);
@@ -492,10 +551,12 @@ impl App {
         param_desc: &crate::effects::ParamDescriptor,
         start_display_value: f32,
         dx: i32,
+        cells_for_full_range: f32,
     ) -> f32 {
         let display_min = param_desc.stored_to_user(param_desc.min);
         let display_max = param_desc.stored_to_user(param_desc.max);
         let display_range = (display_max - display_min).abs();
+        let cells_for_full_range = cells_for_full_range.max(8.0);
         match &param_desc.kind {
             ParamKind::Boolean => {
                 if dx >= 2 {
@@ -512,13 +573,18 @@ impl App {
             }
             ParamKind::Continuous { .. } => {
                 let sensitivity = if display_range > 0.0 {
-                    display_range / 48.0
+                    display_range / cells_for_full_range
                 } else {
                     0.0
                 };
                 (start_display_value + dx as f32 * sensitivity).clamp(display_min, display_max)
             }
         }
+    }
+
+    fn instrument_drag_cells_for_full_range(&self, total_rows: usize) -> f32 {
+        self.instrument_column_width(self.ui.layout.effects_inner, total_rows)
+            .max(8) as f32
     }
 
     pub(super) fn effect_row_display_value(
@@ -601,6 +667,14 @@ impl App {
                         app.push_track_volume(track);
                     });
                 }
+                super::TP_PAN => {
+                    self.for_each_selected_track(|app, track| {
+                        app.state.pattern.track_params[track].set_pan(
+                            (drag.start_display_value + dx as f32 * 0.01).clamp(-1.0, 1.0),
+                        );
+                        app.push_track_pan(track);
+                    });
+                }
                 super::TP_SEND => {
                     self.for_each_selected_track(|app, track| {
                         app.state.pattern.track_params[track].set_send(
@@ -629,8 +703,11 @@ impl App {
                 }
             }
             ParamMouseDragTarget::SynthParam { row_idx } => {
+                let drag_scale = self.instrument_drag_cells_for_full_range(self.synth_row_count());
                 if row_idx == 0 {
-                    let new_val = (drag.start_display_value + dx as f32 * 0.5).clamp(-48.0, 48.0);
+                    let sensitivity = 96.0 / drag_scale;
+                    let new_val =
+                        (drag.start_display_value + dx as f32 * sensitivity).clamp(-48.0, 48.0);
                     self.set_instrument_base_note_offset(drag.track, new_val);
                     return;
                 }
@@ -645,12 +722,17 @@ impl App {
                 let Some(param_desc) = desc.params.get(param_idx) else {
                     return;
                 };
-                let new_display =
-                    self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
+                let new_display = self.scrub_param_display_value(
+                    param_desc,
+                    drag.start_display_value,
+                    dx,
+                    drag_scale,
+                );
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
             ParamMouseDragTarget::ModParam { row_idx } => {
+                let drag_scale = self.instrument_drag_cells_for_full_range(self.mod_row_count());
                 let mod_indices = self.mod_param_indices(drag.track);
                 let Some(&param_idx) = mod_indices.get(row_idx) else {
                     return;
@@ -661,12 +743,17 @@ impl App {
                 let Some(param_desc) = desc.params.get(param_idx) else {
                     return;
                 };
-                let new_display =
-                    self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
+                let new_display = self.scrub_param_display_value(
+                    param_desc,
+                    drag.start_display_value,
+                    dx,
+                    drag_scale,
+                );
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
             ParamMouseDragTarget::SourceParam { row_idx } => {
+                let drag_scale = self.instrument_drag_cells_for_full_range(self.source_row_count());
                 let source_indices = self.source_param_actual_indices(drag.track);
                 let Some(&param_idx) = source_indices.get(row_idx) else {
                     return;
@@ -677,8 +764,12 @@ impl App {
                 let Some(param_desc) = desc.params.get(param_idx) else {
                     return;
                 };
-                let new_display =
-                    self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
+                let new_display = self.scrub_param_display_value(
+                    param_desc,
+                    drag.start_display_value,
+                    dx,
+                    drag_scale,
+                );
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 self.set_instrument_param_or_plock(drag.track, param_idx, new_stored);
             }
@@ -698,7 +789,7 @@ impl App {
                     return;
                 };
                 let new_display =
-                    self.scrub_param_display_value(param_desc, drag.start_display_value, dx);
+                    self.scrub_param_display_value(param_desc, drag.start_display_value, dx, 48.0);
                 let new_stored = param_desc.clamp(param_desc.user_input_to_stored(new_display));
                 let Some(slot) = self
                     .state

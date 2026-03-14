@@ -1,8 +1,8 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use eseqlisp::Editor as LispEditor;
 use eseqlisp::vm::format_lisp_value;
+use eseqlisp::Editor as LispEditor;
 
 use super::{App, HookCallback, HookUnit, PendingHookInvocation, SequencerHook};
 
@@ -69,7 +69,10 @@ impl App {
             return;
         }
 
-        let last = self.editor.last_hook_step_16th.unwrap_or(current.saturating_sub(1));
+        let last = self
+            .editor
+            .last_hook_step_16th
+            .unwrap_or(current.saturating_sub(1));
         if current <= last {
             self.editor.last_hook_step_16th = Some(current);
             return;
@@ -110,8 +113,9 @@ impl App {
                 break;
             };
             let local_step = if invocation.track < self.tracks.len() {
-                let num_steps =
-                    self.state.pattern.track_params[invocation.track].get_num_steps().max(1);
+                let num_steps = self.state.pattern.track_params[invocation.track]
+                    .get_num_steps()
+                    .max(1);
                 (invocation.step_16th as usize) % num_steps
             } else {
                 0
@@ -124,7 +128,11 @@ impl App {
                         self.editor.status_message = Some((status, Instant::now()));
                     } else {
                         self.editor.status_message = Some((
-                            format!("Hook #{} => {}", invocation.hook_id, format_lisp_value(&value)),
+                            format!(
+                                "Hook #{} => {}",
+                                invocation.hook_id,
+                                format_lisp_value(&value)
+                            ),
                             Instant::now(),
                         ));
                     }
@@ -150,15 +158,19 @@ impl App {
                 break;
             };
             let local_step = if invocation.track < self.tracks.len() {
-                let num_steps =
-                    self.state.pattern.track_params[invocation.track].get_num_steps().max(1);
+                let num_steps = self.state.pattern.track_params[invocation.track]
+                    .get_num_steps()
+                    .max(1);
                 (invocation.step_16th as usize) % num_steps
             } else {
                 0
             };
 
             let runtime = editor.runtime_mut();
-            let _ = runtime.eval_str(&format!("(__host-set-current-track {})", invocation.track + 1));
+            let _ = runtime.eval_str(&format!(
+                "(__host-set-current-track {})",
+                invocation.track + 1
+            ));
             let _ = runtime.eval_str(&format!("(__host-set-current-step {})", local_step + 1));
 
             match runtime.eval_str(&invocation.code) {
@@ -167,7 +179,11 @@ impl App {
                         self.editor.status_message = Some((status, Instant::now()));
                     } else {
                         self.editor.status_message = Some((
-                            format!("Hook #{} => {}", invocation.hook_id, format_lisp_value(&value)),
+                            format!(
+                                "Hook #{} => {}",
+                                invocation.hook_id,
+                                format_lisp_value(&value)
+                            ),
                             Instant::now(),
                         ));
                     }
@@ -190,7 +206,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{HookUnit, hook_should_fire};
+    use super::{hook_should_fire, HookUnit};
 
     #[test]
     fn step_hooks_fire_on_matching_interval() {

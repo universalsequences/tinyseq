@@ -83,6 +83,7 @@ impl PatternSnapshot {
                 swing_resolution: tp.get_swing_resolution(),
                 num_steps: tp.get_num_steps(),
                 volume: tp.get_volume(),
+                pan: tp.get_pan(),
                 send: tp.get_send(),
                 polyphonic: tp.is_polyphonic(),
                 timebase: tp.get_timebase(),
@@ -168,6 +169,7 @@ impl PatternSnapshot {
             tp.set_swing_resolution(snap.swing_resolution);
             tp.set_num_steps(snap.num_steps);
             tp.set_volume(snap.volume);
+            tp.set_pan(snap.pan);
             tp.set_send(snap.send);
             tp.polyphonic.store(snap.polyphonic, Ordering::Relaxed);
             tp.set_timebase(snap.timebase);
@@ -349,6 +351,7 @@ pub struct TransportState {
 
 pub struct RuntimeBindingState {
     pub sampler_lids: Vec<AtomicU64>,
+    pub pan_lids: Vec<AtomicU64>,
     pub delay_lids: Vec<AtomicU64>,
     pub send_lids: Vec<AtomicU64>,
     pub voice_lids: Vec<[AtomicU64; MAX_VOICES]>,
@@ -429,6 +432,7 @@ impl SequencerState {
             },
             runtime: RuntimeBindingState {
                 sampler_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
+                pan_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
                 delay_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
                 send_lids: (0..MAX_TRACKS).map(|_| AtomicU64::new(0)).collect(),
                 voice_lids: (0..MAX_TRACKS)

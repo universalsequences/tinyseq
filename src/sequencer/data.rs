@@ -5,7 +5,7 @@ use crate::voice::MAX_VOICES;
 pub const MAX_TRACKS: usize = 64;
 pub const MAX_STEPS: usize = 256;
 pub const STEPS_PER_PAGE: usize = 16;
-pub const NUM_PARAMS: usize = 8;
+pub const NUM_PARAMS: usize = 9;
 pub const DEFAULT_BPM: u32 = 120;
 pub const TRACK_PATTERN_WORDS: usize = MAX_STEPS / 64;
 
@@ -198,8 +198,9 @@ pub enum StepParam {
     AuxA = 3,
     AuxB = 4,
     Transpose = 5,
-    Chop = 6,
-    Sync = 7,
+    Pan = 6,
+    Chop = 7,
+    Sync = 8,
 }
 
 impl StepParam {
@@ -210,15 +211,17 @@ impl StepParam {
         StepParam::AuxA,
         StepParam::AuxB,
         StepParam::Transpose,
+        StepParam::Pan,
         StepParam::Chop,
         StepParam::Sync,
     ];
 
-    pub const VISIBLE: [StepParam; 5] = [
+    pub const VISIBLE: [StepParam; 6] = [
         StepParam::Duration,
         StepParam::Velocity,
         StepParam::AuxA,
         StepParam::Transpose,
+        StepParam::Pan,
         StepParam::Sync,
     ];
 
@@ -230,6 +233,7 @@ impl StepParam {
             StepParam::AuxA => 0.0,
             StepParam::AuxB => 0.0,
             StepParam::Transpose => 0.0,
+            StepParam::Pan => 0.0,
             StepParam::Chop => 1.0,
             StepParam::Sync => 0.0,
         }
@@ -243,6 +247,7 @@ impl StepParam {
             StepParam::AuxA => 0.0,
             StepParam::AuxB => 0.0,
             StepParam::Transpose => -48.0,
+            StepParam::Pan => -1.0,
             StepParam::Chop => 1.0,
             StepParam::Sync => 0.0,
         }
@@ -256,6 +261,7 @@ impl StepParam {
             StepParam::AuxA => 16.0,
             StepParam::AuxB => 1.0,
             StepParam::Transpose => 48.0,
+            StepParam::Pan => 1.0,
             StepParam::Chop => 8.0,
             StepParam::Sync => (SYNC_COUNT - 1) as f32,
         }
@@ -269,6 +275,7 @@ impl StepParam {
             StepParam::AuxA => 1.0,
             StepParam::AuxB => 0.05,
             StepParam::Transpose => 1.0,
+            StepParam::Pan => 0.05,
             StepParam::Chop => 1.0,
             StepParam::Sync => 1.0,
         }
@@ -282,6 +289,7 @@ impl StepParam {
             StepParam::AuxA => "Aux A",
             StepParam::AuxB => "Aux B",
             StepParam::Transpose => "Transpose",
+            StepParam::Pan => "Pan",
             StepParam::Chop => "Chop",
             StepParam::Sync => "Sync",
         }
@@ -295,6 +303,7 @@ impl StepParam {
             StepParam::AuxA => "axA",
             StepParam::AuxB => "axB",
             StepParam::Transpose => "trn",
+            StepParam::Pan => "pan",
             StepParam::Chop => "chp",
             StepParam::Sync => "syn",
         }
@@ -312,6 +321,7 @@ impl StepParam {
     pub fn format_value(self, val: f32) -> String {
         match self {
             StepParam::Transpose => format!("{:+.0}", val),
+            StepParam::Pan => format!("{:+.2}", val),
             StepParam::Chop => format!("{:.0}", val),
             StepParam::Sync => {
                 let idx = val.round() as usize;
@@ -351,6 +361,7 @@ impl StepParam {
             StepParam::AuxA => 'a',
             StepParam::AuxB => 'b',
             StepParam::Transpose => 't',
+            StepParam::Pan => 'p',
             StepParam::Chop => 'c',
             StepParam::Sync => 'y',
         }
@@ -363,6 +374,7 @@ impl StepParam {
             's' => Some(StepParam::Speed),
             'a' => Some(StepParam::AuxA),
             't' => Some(StepParam::Transpose),
+            'p' => Some(StepParam::Pan),
             'y' => Some(StepParam::Sync),
             _ => None,
         }
@@ -376,6 +388,7 @@ impl StepParam {
             StepParam::AuxA => ("", "a", "xA"),
             StepParam::AuxB => ("ax", "B", ""),
             StepParam::Transpose => ("", "t", "rn"),
+            StepParam::Pan => ("", "p", "an"),
             StepParam::Chop => ("", "c", "hp"),
             StepParam::Sync => ("s", "y", "n"),
         }
@@ -472,6 +485,7 @@ pub struct TrackParams {
     pub swing_resolution: AtomicU32,
     pub num_steps: AtomicU32,
     pub volume: AtomicU32,
+    pub pan: AtomicU32,
     pub send: AtomicU32,
     pub polyphonic: AtomicBool,
     pub timebase: AtomicU32,
@@ -491,6 +505,7 @@ impl TrackParams {
             swing_resolution: AtomicU32::new(SwingResolution::Sixteenth as u32),
             num_steps: AtomicU32::new(STEPS_PER_PAGE as u32),
             volume: AtomicU32::new(1.0_f32.to_bits()),
+            pan: AtomicU32::new(0.0_f32.to_bits()),
             send: AtomicU32::new(0.0_f32.to_bits()),
             polyphonic: AtomicBool::new(true),
             timebase: AtomicU32::new(Timebase::Sixteenth as u32),
@@ -554,6 +569,13 @@ impl TrackParams {
     pub fn set_volume(&self, val: f32) {
         self.volume
             .store(val.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    pub fn get_pan(&self) -> f32 {
+        f32::from_bits(self.pan.load(Ordering::Relaxed))
+    }
+    pub fn set_pan(&self, val: f32) {
+        self.pan
+            .store(val.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
     }
     pub fn get_send(&self) -> f32 {
         f32::from_bits(self.send.load(Ordering::Relaxed))
@@ -624,6 +646,7 @@ pub struct TrackParamsSnapshot {
     pub swing_resolution: SwingResolution,
     pub num_steps: usize,
     pub volume: f32,
+    pub pan: f32,
     pub send: f32,
     pub polyphonic: bool,
     pub timebase: Timebase,
@@ -643,6 +666,7 @@ impl Default for TrackParamsSnapshot {
             swing_resolution: SwingResolution::Sixteenth,
             num_steps: STEPS_PER_PAGE,
             volume: 1.0,
+            pan: 0.0,
             send: 0.0,
             polyphonic: false,
             timebase: Timebase::Sixteenth,

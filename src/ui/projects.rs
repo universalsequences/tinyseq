@@ -6,12 +6,12 @@ use crossterm::event::KeyCode;
 
 use crate::effects::BUILTIN_SLOT_COUNT;
 use crate::project::{
-    self, ProjectScratchState, chord_snapshot_from_steps, project_file_version, ProjectFile, ProjectPattern,
-    ProjectReverbState, ProjectTrack,
+    self, chord_snapshot_from_steps, project_file_version, ProjectFile, ProjectPattern,
+    ProjectReverbState, ProjectScratchState, ProjectTrack,
 };
 use crate::sequencer::{InstrumentType, PatternSnapshot, MAX_STEPS};
 
-use super::{App, InputMode, Region, SidebarMode};
+use super::{App, InputMode, Region, SidebarMode, SidebarTab};
 
 impl App {
     pub(super) fn open_project_name_prompt(&mut self) {
@@ -465,6 +465,11 @@ impl App {
         } else {
             Region::Cirklon
         };
+        self.ui.sidebar_tab = if self.tracks.is_empty() {
+            SidebarTab::Sounds
+        } else {
+            SidebarTab::Tools
+        };
         self.ui.sidebar_mode = if self.tracks.is_empty() {
             SidebarMode::InstrumentPicker
         } else {
@@ -685,6 +690,7 @@ impl App {
         self.push_master_volume();
         for track_idx in 0..self.tracks.len() {
             self.push_track_volume(track_idx);
+            self.push_track_pan(track_idx);
             self.push_send_gain(track_idx);
             for slot_idx in 0..self.state.pattern.effect_chains[track_idx].len() {
                 let slot = &self.state.pattern.effect_chains[track_idx][slot_idx];

@@ -4,9 +4,9 @@ use std::sync::atomic::Ordering;
 
 use crate::effects::EffectDescriptor;
 
-use super::{App, EffectTab, InputMode};
+use super::{App, InputMode};
 
-pub(super) const SYNTH_TWO_COLUMN_MIN_WIDTH: u16 = 88;
+pub(super) const SYNTH_MIN_COLUMN_WIDTH: u16 = 42;
 pub(super) const SYNTH_COLUMN_GAP: u16 = 2;
 
 impl App {
@@ -334,60 +334,80 @@ impl App {
         self.source_display_row_count()
     }
 
-    pub(super) fn synth_column_count(&self, area: Rect) -> usize {
+    pub(super) fn instrument_column_count(&self, area: Rect, total_rows: usize) -> usize {
         if area.height == 0 {
             return 1;
         }
-        if area.width >= SYNTH_TWO_COLUMN_MIN_WIDTH && self.synth_row_count() > area.height as usize
-        {
-            2
-        } else {
-            1
-        }
+        let rows = total_rows.max(1);
+        let needed_columns = rows.div_ceil(area.height as usize).max(1);
+        let max_columns = ((area.width + SYNTH_COLUMN_GAP)
+            / (SYNTH_MIN_COLUMN_WIDTH + SYNTH_COLUMN_GAP))
+            .max(1) as usize;
+        needed_columns.min(max_columns).max(1)
     }
 
     pub(super) fn synth_rows_per_column(&self, area: Rect) -> usize {
         area.height as usize
     }
 
-    pub(super) fn synth_visible_capacity(&self, area: Rect) -> usize {
-        self.synth_rows_per_column(area) * self.synth_column_count(area)
+    pub(super) fn instrument_partition_rows_per_column(
+        &self,
+        area: Rect,
+        total_rows: usize,
+    ) -> usize {
+        let columns = self.instrument_column_count(area, total_rows);
+        total_rows.div_ceil(columns).max(1)
+    }
+
+    pub(super) fn instrument_column_width(&self, area: Rect, total_rows: usize) -> u16 {
+        let columns = self.instrument_column_count(area, total_rows) as u16;
+        if columns <= 1 {
+            area.width
+        } else {
+            let total_gap = SYNTH_COLUMN_GAP.saturating_mul(columns.saturating_sub(1));
+            area.width.saturating_sub(total_gap) / columns
+        }
     }
 
     pub(super) fn clamp_synth_scroll(&mut self, area: Rect) {
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.synth_scroll_offset = 0;
             return;
         }
-        let max_scroll = self.synth_row_count().saturating_sub(visible);
+        let rows_per_column =
+            self.instrument_partition_rows_per_column(area, self.synth_row_count());
+        let max_scroll = rows_per_column.saturating_sub(visible_rows);
         self.ui.synth_scroll_offset = self.ui.synth_scroll_offset.min(max_scroll);
     }
 
     pub(super) fn clamp_mod_scroll(&mut self, area: Rect) {
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.mod_scroll_offset = 0;
             return;
         }
-        let max_scroll = self.mod_row_count().saturating_sub(visible);
+        let rows_per_column = self.instrument_partition_rows_per_column(area, self.mod_row_count());
+        let max_scroll = rows_per_column.saturating_sub(visible_rows);
         self.ui.mod_scroll_offset = self.ui.mod_scroll_offset.min(max_scroll);
     }
 
     pub(super) fn clamp_source_scroll(&mut self, area: Rect) {
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.source_scroll_offset = 0;
             return;
         }
-        let max_scroll = self.source_row_count().saturating_sub(visible);
+        let rows_per_column =
+            self.instrument_partition_rows_per_column(area, self.source_row_count());
+        let max_scroll = rows_per_column.saturating_sub(visible_rows);
         self.ui.source_scroll_offset = self.ui.source_scroll_offset.min(max_scroll);
     }
 
     pub(super) fn ensure_synth_cursor_visible(&mut self) {
         let area = self.ui.layout.effects_inner;
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.synth_scroll_offset = 0;
             return;
         }
@@ -396,10 +416,13 @@ impl App {
         self.ui.instrument_param_cursor = self.ui.instrument_param_cursor.min(max_cursor);
         self.clamp_synth_scroll(area);
 
-        if self.ui.instrument_param_cursor < self.ui.synth_scroll_offset {
-            self.ui.synth_scroll_offset = self.ui.instrument_param_cursor;
-        } else if self.ui.instrument_param_cursor >= self.ui.synth_scroll_offset + visible {
-            self.ui.synth_scroll_offset = self.ui.instrument_param_cursor + 1 - visible;
+        let rows_per_column =
+            self.instrument_partition_rows_per_column(area, self.synth_row_count());
+        let row_in_column = self.ui.instrument_param_cursor % rows_per_column;
+        if row_in_column < self.ui.synth_scroll_offset {
+            self.ui.synth_scroll_offset = row_in_column;
+        } else if row_in_column >= self.ui.synth_scroll_offset + visible_rows {
+            self.ui.synth_scroll_offset = row_in_column + 1 - visible_rows;
         }
 
         self.clamp_synth_scroll(area);
@@ -407,8 +430,8 @@ impl App {
 
     pub(super) fn ensure_mod_cursor_visible(&mut self) {
         let area = self.ui.layout.effects_inner;
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.mod_scroll_offset = 0;
             return;
         }
@@ -417,10 +440,12 @@ impl App {
         self.ui.mod_param_cursor = self.ui.mod_param_cursor.min(max_cursor);
         self.clamp_mod_scroll(area);
 
-        if self.ui.mod_param_cursor < self.ui.mod_scroll_offset {
-            self.ui.mod_scroll_offset = self.ui.mod_param_cursor;
-        } else if self.ui.mod_param_cursor >= self.ui.mod_scroll_offset + visible {
-            self.ui.mod_scroll_offset = self.ui.mod_param_cursor + 1 - visible;
+        let rows_per_column = self.instrument_partition_rows_per_column(area, self.mod_row_count());
+        let row_in_column = self.ui.mod_param_cursor % rows_per_column;
+        if row_in_column < self.ui.mod_scroll_offset {
+            self.ui.mod_scroll_offset = row_in_column;
+        } else if row_in_column >= self.ui.mod_scroll_offset + visible_rows {
+            self.ui.mod_scroll_offset = row_in_column + 1 - visible_rows;
         }
 
         self.clamp_mod_scroll(area);
@@ -428,8 +453,8 @@ impl App {
 
     pub(super) fn ensure_source_cursor_visible(&mut self) {
         let area = self.ui.layout.effects_inner;
-        let visible = self.synth_visible_capacity(area);
-        if visible == 0 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             self.ui.source_scroll_offset = 0;
             return;
         }
@@ -439,10 +464,13 @@ impl App {
         self.clamp_source_scroll(area);
 
         let display_row = self.source_display_row_for_param_row(self.ui.source_param_cursor);
-        if display_row < self.ui.source_scroll_offset {
-            self.ui.source_scroll_offset = display_row;
-        } else if display_row >= self.ui.source_scroll_offset + visible {
-            self.ui.source_scroll_offset = display_row + 1 - visible;
+        let rows_per_column =
+            self.instrument_partition_rows_per_column(area, self.source_row_count());
+        let row_in_column = display_row % rows_per_column;
+        if row_in_column < self.ui.source_scroll_offset {
+            self.ui.source_scroll_offset = row_in_column;
+        } else if row_in_column >= self.ui.source_scroll_offset + visible_rows {
+            self.ui.source_scroll_offset = row_in_column + 1 - visible_rows;
         }
 
         self.clamp_source_scroll(area);
@@ -477,35 +505,38 @@ impl App {
             return None;
         }
 
-        let columns = self.synth_column_count(area);
-        let rows_per_column = self.synth_rows_per_column(area);
-        if rows_per_column == 0 {
+        let total = match row_kind {
+            TabRowKind::Synth => self.synth_row_count(),
+            TabRowKind::Mod => self.mod_row_count(),
+            TabRowKind::Sources => self.source_row_count(),
+        };
+        let columns = self.instrument_column_count(area, total);
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
             return None;
         }
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total);
 
-        let column_width = if columns == 1 {
-            area.width
-        } else {
-            area.width.saturating_sub(SYNTH_COLUMN_GAP) / 2
-        };
+        let column_width = self.instrument_column_width(area, total);
         if column_width == 0 {
             return None;
         }
 
         let rel_x = col - area.x;
-        let column = if columns == 1 {
-            0
-        } else if rel_x < column_width {
-            0
-        } else if rel_x >= column_width + SYNTH_COLUMN_GAP
-            && rel_x < (column_width * 2) + SYNTH_COLUMN_GAP
-        {
-            1
-        } else {
+        let stride = column_width + SYNTH_COLUMN_GAP;
+        let column = (rel_x / stride) as usize;
+        if column >= columns {
             return None;
-        };
+        }
+        let local_x = rel_x.saturating_sub(column as u16 * stride);
+        if local_x >= column_width {
+            return None;
+        }
 
         let rel_y = (row - area.y) as usize;
+        if rel_y >= visible_rows {
+            return None;
+        }
         let (scroll, total) = match row_kind {
             TabRowKind::Synth => (self.ui.synth_scroll_offset, self.synth_row_count()),
             TabRowKind::Mod => (self.ui.mod_scroll_offset, self.mod_row_count()),
@@ -520,24 +551,9 @@ impl App {
         match code {
             KeyCode::Left => {
                 self.ui.params_column = 0;
-                self.ui.track_params_tab = 1;
+                self.sync_effect_tab_cursor();
             }
-            KeyCode::Right => {
-                if self.is_current_custom_track() {
-                    self.ui.effect_tab = EffectTab::Mod;
-                    self.ui.mod_param_cursor = 0;
-                    self.ui.mod_scroll_offset = 0;
-                    return;
-                }
-                let visible = self.visible_effect_indices();
-                if let Some(&first) = visible.first() {
-                    self.ui.effect_tab = EffectTab::Slot(first);
-                    self.ui.effect_param_cursor = 0;
-                } else {
-                    self.ui.effect_tab = EffectTab::Reverb;
-                    self.ui.reverb_param_cursor = 0;
-                }
-            }
+            KeyCode::Right => {}
             KeyCode::Up => {
                 if shift {
                     if self.ui.instrument_param_cursor == 0 {
@@ -635,15 +651,10 @@ impl App {
         let shift = modifiers.contains(KeyModifiers::SHIFT);
         match code {
             KeyCode::Left => {
-                self.ui.effect_tab = EffectTab::Synth;
-                self.ui.instrument_param_cursor = 0;
-                self.ui.synth_scroll_offset = 0;
+                self.ui.params_column = 0;
+                self.sync_effect_tab_cursor();
             }
-            KeyCode::Right => {
-                self.ui.effect_tab = EffectTab::Sources;
-                self.ui.source_param_cursor = 0;
-                self.ui.source_scroll_offset = 0;
-            }
+            KeyCode::Right => {}
             KeyCode::Up => {
                 if shift {
                     self.adjust_mod_param(1.0);
@@ -703,20 +714,10 @@ impl App {
         let shift = modifiers.contains(KeyModifiers::SHIFT);
         match code {
             KeyCode::Left => {
-                self.ui.effect_tab = EffectTab::Mod;
-                self.ui.mod_param_cursor = 0;
-                self.ui.mod_scroll_offset = 0;
+                self.ui.params_column = 0;
+                self.sync_effect_tab_cursor();
             }
-            KeyCode::Right => {
-                let visible = self.visible_effect_indices();
-                if let Some(&first) = visible.first() {
-                    self.ui.effect_tab = EffectTab::Slot(first);
-                    self.ui.effect_param_cursor = 0;
-                } else {
-                    self.ui.effect_tab = EffectTab::Reverb;
-                    self.ui.reverb_param_cursor = 0;
-                }
-            }
+            KeyCode::Right => {}
             KeyCode::Up => {
                 if shift {
                     self.adjust_source_param(1.0);
@@ -794,6 +795,8 @@ impl App {
         Some(EffectDescriptor {
             name: "Mod".to_string(),
             params,
+            input_channels: 0,
+            output_channels: 0,
         })
     }
 
@@ -842,6 +845,8 @@ impl App {
         Some(EffectDescriptor {
             name: "Sources".to_string(),
             params,
+            input_channels: 0,
+            output_channels: 0,
         })
     }
 

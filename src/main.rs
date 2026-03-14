@@ -1,4 +1,6 @@
 mod accumulator;
+#[allow(dead_code)]
+mod agent;
 mod audio;
 mod audiograph;
 #[allow(dead_code)]
@@ -19,6 +21,8 @@ mod sampler;
 mod scale;
 #[allow(dead_code)]
 mod sequencer;
+#[allow(dead_code)]
+mod stereo_panner;
 mod ui;
 #[allow(dead_code)]
 mod voice;

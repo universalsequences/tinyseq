@@ -11,6 +11,7 @@ pub struct ResolvedStep {
     #[allow(dead_code)]
     pub aux_b: f32,
     pub transpose: f32,
+    pub pan: f32,
     pub chop: f32,
 }
 
@@ -23,6 +24,7 @@ impl ResolvedStep {
             aux_a: sd.get(step, StepParam::AuxA),
             aux_b: sd.get(step, StepParam::AuxB),
             transpose: sd.get(step, StepParam::Transpose),
+            pan: sd.get(step, StepParam::Pan),
             chop: sd.get(step, StepParam::Chop),
         }
     }
