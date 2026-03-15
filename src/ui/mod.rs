@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent::actions::{AgentAppAction, AgentSessionContext};
-use crate::agent::network::AgentTurnResult;
-use crate::agent::protocol::AgentToolRuntime;
+use crate::agent::network::{AgentTurnError, AgentTurnResult};
+use crate::agent::protocol::{AgentToolRuntime, ToolCallOutcome};
 use crate::agent::providers::{AgentMessage, AgentMessageRole, AgentProviderState};
 use crate::audiograph::LiveGraphPtr;
 use crate::effects::EffectDescriptor;
@@ -148,7 +148,7 @@ struct PendingCompile {
 }
 
 struct PendingAgentRequest {
-    receiver: Receiver<Result<AgentTurnResult, String>>,
+    receiver: Receiver<Result<AgentTurnResult, AgentTurnError>>,
     started_at: Instant,
 }
 
@@ -426,6 +426,7 @@ pub struct UiState {
     pub effect_tab: EffectTab,
     pub effect_tab_cursor: usize,
     pub effect_param_cursor: usize,
+    pub effect_scroll_offset: usize,
     pub dropdown_open: bool,
     pub dropdown_cursor: usize,
     pub track_param_dropdown: bool,
@@ -537,6 +538,7 @@ impl App {
                 effect_tab: EffectTab::Slot(0),
                 effect_tab_cursor: 0,
                 effect_param_cursor: 0,
+                effect_scroll_offset: 0,
                 dropdown_open: false,
                 dropdown_cursor: 0,
                 track_param_dropdown: false,
@@ -844,16 +846,19 @@ impl App {
         let session_context = self.current_agent_session_context();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result =
-                crate::agent::network::AgentNetworkClient::load_default().and_then(|client| {
-                    client.execute_turn(
-                        provider,
-                        &model,
-                        &system_prompt,
-                        &conversation,
-                        session_context,
-                    )
-                });
+            let result = match crate::agent::network::AgentNetworkClient::load_default() {
+                Ok(client) => client.execute_turn(
+                    provider,
+                    &model,
+                    &system_prompt,
+                    &conversation,
+                    session_context,
+                ),
+                Err(error) => Err(AgentTurnError {
+                    message: error,
+                    tool_outcomes: Vec::new(),
+                }),
+            };
             let _ = tx.send(result);
         });
         self.agent_panel.pending_request = Some(PendingAgentRequest {
@@ -880,48 +885,7 @@ impl App {
                     .iter()
                     .filter_map(|result| result.as_ref().err().cloned())
                     .collect::<Vec<_>>();
-                let mut action_result_idx = 0usize;
-                for outcome in &result.tool_outcomes {
-                    let action_count = outcome.pending_actions.len();
-                    let mut tool_ok = outcome.ok;
-                    let mut details = vec![outcome.summary.clone()];
-
-                    if !outcome.content.trim().is_empty()
-                        && outcome.content.trim() != outcome.summary.trim()
-                    {
-                        details.push(outcome.content.clone());
-                    }
-
-                    if action_count > 0 {
-                        let end = action_result_idx + action_count;
-                        let related_results = &action_results[action_result_idx..end];
-                        action_result_idx = end;
-
-                        tool_ok = related_results.iter().all(|result| result.is_ok());
-                        for result in related_results {
-                            match result {
-                                Ok(message) => details.push(message.clone()),
-                                Err(error) => details.push(error.clone()),
-                            }
-                        }
-                    }
-
-                    let tool_text = format!(
-                        "{} [{}]\n{}",
-                        outcome.name,
-                        if tool_ok { "ok" } else { "error" },
-                        details.join("\n\n")
-                    );
-                    self.agent_panel.conversation.push(AgentMessage {
-                        role: AgentMessageRole::Tool,
-                        content: tool_text.clone(),
-                        tool_name: Some(outcome.name.clone()),
-                    });
-                    self.agent_panel.transcript.push(AgentTranscriptEntry {
-                        role: "tool".to_string(),
-                        text: tool_text,
-                    });
-                }
+                self.record_agent_tool_outcomes(&result.tool_outcomes, Some(&action_results));
                 if !result.text.trim().is_empty() {
                     self.agent_panel.transcript.push(AgentTranscriptEntry {
                         role: "assistant".to_string(),
@@ -984,13 +948,14 @@ impl App {
             }
             Ok(Err(error)) => {
                 self.agent_panel.pending_request = None;
+                self.record_agent_tool_outcomes(&error.tool_outcomes, None);
                 self.agent_panel.transcript.push(AgentTranscriptEntry {
                     role: "error".to_string(),
-                    text: error.clone(),
+                    text: error.message.clone(),
                 });
                 self.agent_panel.scroll_offset = 0;
                 self.editor.status_message =
-                    Some((format!("Agent error: {error}"), Instant::now()));
+                    Some((format!("Agent error: {}", error.message), Instant::now()));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -998,6 +963,53 @@ impl App {
                 self.editor.status_message =
                     Some(("Agent worker crashed".to_string(), Instant::now()));
             }
+        }
+    }
+
+    fn record_agent_tool_outcomes(
+        &mut self,
+        tool_outcomes: &[ToolCallOutcome],
+        action_results: Option<&[Result<String, String>]>,
+    ) {
+        let mut action_result_idx = 0usize;
+        for outcome in tool_outcomes {
+            let action_count = outcome.pending_actions.len();
+            let mut tool_ok = outcome.ok;
+            let mut details = vec![outcome.summary.clone()];
+
+            if !outcome.content.trim().is_empty() && outcome.content.trim() != outcome.summary.trim()
+            {
+                details.push(outcome.content.clone());
+            }
+
+            if let Some(action_results) = action_results.filter(|_| action_count > 0) {
+                let end = action_result_idx + action_count;
+                let related_results = &action_results[action_result_idx..end];
+                action_result_idx = end;
+                tool_ok = related_results.iter().all(|result| result.is_ok());
+                for result in related_results {
+                    match result {
+                        Ok(message) => details.push(message.clone()),
+                        Err(error) => details.push(error.clone()),
+                    }
+                }
+            }
+
+            let tool_text = format!(
+                "{} [{}]\n{}",
+                outcome.name,
+                if tool_ok { "ok" } else { "error" },
+                details.join("\n\n")
+            );
+            self.agent_panel.conversation.push(AgentMessage {
+                role: AgentMessageRole::Tool,
+                content: tool_text.clone(),
+                tool_name: Some(outcome.name.clone()),
+            });
+            self.agent_panel.transcript.push(AgentTranscriptEntry {
+                role: "tool".to_string(),
+                text: tool_text,
+            });
         }
     }
 
@@ -1043,9 +1055,16 @@ impl App {
     fn apply_agent_action(&mut self, action: AgentAppAction) -> Result<String, String> {
         match action {
             AgentAppAction::CreateInstrumentTrack { name, source } => {
+                let previous_source = crate::lisp_effect::load_instrument_source(&name).ok();
                 crate::lisp_effect::save_instrument(&name, &source)
                     .map_err(|error| format!("Failed to save instrument '{}': {error}", name))?;
-                let track_idx = self.add_saved_instrument_track_sync(&name)?;
+                let track_idx = match self.add_saved_instrument_track_sync(&name) {
+                    Ok(track_idx) => track_idx,
+                    Err(error) => {
+                        self.restore_instrument_source(&name, previous_source.as_deref())?;
+                        return Err(error);
+                    }
+                };
                 Ok(format!(
                     "Created instrument track '{}' at track {}.",
                     name,
@@ -1069,9 +1088,13 @@ impl App {
                             .unwrap_or_else(|| "current track".to_string())
                     )
                 })?;
+                let previous_source = crate::lisp_effect::load_effect_source(&name).ok();
                 crate::lisp_effect::save_effect(&name, &source)
                     .map_err(|error| format!("Failed to save effect '{}': {error}", name))?;
-                self.load_saved_effect_to_slot_sync(track, slot_idx, &name)?;
+                if let Err(error) = self.load_saved_effect_to_slot_sync(track, slot_idx, &name) {
+                    self.restore_effect_source(&name, previous_source.as_deref())?;
+                    return Err(error);
+                }
                 Ok(format!(
                     "Applied effect '{}' to track '{}' in slot {}.",
                     name,
@@ -1083,15 +1106,63 @@ impl App {
                 ))
             }
             AgentAppAction::UpdateCurrentEffect { name, source } => {
-                self.replace_current_effect_sync(&name, &source)?;
+                let previous_source = crate::lisp_effect::load_effect_source(&name).ok();
+                if let Err(error) = self.replace_current_effect_sync(&name, &source) {
+                    self.restore_effect_source(&name, previous_source.as_deref())?;
+                    return Err(error);
+                }
                 Ok(format!("Updated current effect to '{}'.", name))
             }
             AgentAppAction::UpdateCurrentInstrument { name, source } => {
+                let previous_source = crate::lisp_effect::load_instrument_source(&name).ok();
                 crate::lisp_effect::save_instrument(&name, &source)
                     .map_err(|error| format!("Failed to save instrument '{}': {error}", name))?;
-                self.replace_current_custom_instrument_sync(&name, &source)?;
+                if let Err(error) = self.replace_current_custom_instrument_sync(&name, &source) {
+                    self.restore_instrument_source(&name, previous_source.as_deref())?;
+                    return Err(error);
+                }
                 Ok(format!("Updated current instrument track to '{}'.", name))
             }
+        }
+    }
+
+    fn restore_instrument_source(
+        &self,
+        name: &str,
+        previous_source: Option<&str>,
+    ) -> Result<(), String> {
+        match previous_source {
+            Some(source) => crate::lisp_effect::save_instrument(name, source)
+                .map_err(|error| format!("Failed to restore instrument '{}': {error}", name)),
+            None => std::fs::remove_file(format!("instruments/{name}.lisp"))
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| format!("Failed to remove instrument '{}': {error}", name)),
+        }
+    }
+
+    fn restore_effect_source(
+        &self,
+        name: &str,
+        previous_source: Option<&str>,
+    ) -> Result<(), String> {
+        match previous_source {
+            Some(source) => crate::lisp_effect::save_effect(name, source)
+                .map_err(|error| format!("Failed to restore effect '{}': {error}", name)),
+            None => std::fs::remove_file(format!("effects/{name}.lisp"))
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| format!("Failed to remove effect '{}': {error}", name)),
         }
     }
 

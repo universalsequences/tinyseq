@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::effects::EffectSlotSnapshot;
 use crate::sequencer::{
     ChordSnapshot, InstrumentType, PatternSnapshot, SwingResolution, Timebase, TrackParamsSnapshot,
-    TrackSoundState, NUM_PARAMS, TRACK_PATTERN_WORDS,
+    TrackSoundState, MAX_STEPS, NUM_PARAMS, TRACK_PATTERN_WORDS,
 };
 
 const PROJECTS_DIR: &str = "projects";
@@ -54,14 +54,25 @@ pub enum ProjectTrack {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProjectPattern {
     pub track_bits: Vec<[u64; TRACK_PATTERN_WORDS]>,
-    #[serde(deserialize_with = "deserialize_step_data")]
+    #[serde(
+        serialize_with = "serialize_step_data",
+        deserialize_with = "deserialize_step_data"
+    )]
     pub step_data: Vec<Vec<[f32; NUM_PARAMS]>>,
     pub track_params: Vec<ProjectTrackParams>,
     pub effect_slots: Vec<Vec<ProjectEffectSlot>>,
     pub instrument_slots: Vec<ProjectEffectSlot>,
     pub instrument_base_note_offsets: Vec<f32>,
     pub track_sound_states: Vec<ProjectTrackSoundState>,
+    #[serde(
+        serialize_with = "serialize_chord_snapshots",
+        deserialize_with = "deserialize_chord_snapshots"
+    )]
     pub chord_snapshots: Vec<Vec<Vec<f32>>>,
+    #[serde(
+        serialize_with = "serialize_timebase_plock_snapshots",
+        deserialize_with = "deserialize_timebase_plock_snapshots"
+    )]
     pub timebase_plock_snapshots: Vec<Vec<Option<u32>>>,
     pub instrument_types: Vec<ProjectInstrumentType>,
     pub sample_paths: Vec<Option<String>>,
@@ -94,7 +105,7 @@ pub struct ProjectTrackParams {
     pub fts_scale: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ProjectEffectSlot {
     pub num_params: u32,
     pub defaults: Vec<f32>,
@@ -301,7 +312,7 @@ pub fn save_project(name: &str, project: &ProjectFile) -> std::io::Result<PathBu
     ensure_projects_dir()?;
     let file_name = sanitize_project_name(name);
     let path = projects_dir().join(format!("{file_name}.json"));
-    let json = serde_json::to_string_pretty(project).map_err(|error| {
+    let json = serde_json::to_string(project).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Failed to serialize project '{}': {error}", path.display()),
@@ -349,34 +360,152 @@ fn deserialize_step_data<'de, D>(deserializer: D) -> Result<Vec<Vec<[f32; NUM_PA
 where
     D: Deserializer<'de>,
 {
-    let raw = Vec::<Vec<Vec<f32>>>::deserialize(deserializer)?;
-    let mut tracks = Vec::with_capacity(raw.len());
-    for track in raw {
-        let mut steps = Vec::with_capacity(track.len());
-        for values in track {
-            let mut params = [0.0; NUM_PARAMS];
-            for (idx, param) in crate::sequencer::StepParam::ALL.into_iter().enumerate() {
-                params[idx] = param.default_value();
-            }
-            if values.len() == NUM_PARAMS - 1 {
-                for (idx, value) in values.into_iter().enumerate() {
-                    let target_idx = if idx >= crate::sequencer::StepParam::Pan.index() {
-                        idx + 1
-                    } else {
-                        idx
-                    };
-                    params[target_idx] = value;
+    let raw = StepDataRepr::deserialize(deserializer)?;
+    match raw {
+        StepDataRepr::Dense(raw) => {
+            let mut tracks = Vec::with_capacity(raw.len());
+            for track in raw {
+                let mut steps = Vec::with_capacity(track.len());
+                for values in track {
+                    steps.push(step_values_from_vec(values));
                 }
-            } else {
-                for (idx, value) in values.into_iter().enumerate().take(NUM_PARAMS) {
-                    params[idx] = value;
-                }
+                tracks.push(steps);
             }
-            steps.push(params);
+            Ok(tracks)
         }
-        tracks.push(steps);
+        StepDataRepr::Sparse(raw) => {
+            let mut tracks = Vec::with_capacity(raw.len());
+            for track in raw {
+                let mut steps = vec![default_step_values(); MAX_STEPS];
+                for entry in track.entries {
+                    if entry.step < steps.len() {
+                        steps[entry.step] = step_values_from_vec(entry.values);
+                    }
+                }
+                tracks.push(steps);
+            }
+            Ok(tracks)
+        }
     }
-    Ok(tracks)
+}
+
+fn serialize_step_data<S>(
+    step_data: &[Vec<[f32; NUM_PARAMS]>],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let default = default_step_values();
+    let sparse = step_data
+        .iter()
+        .map(|track| SparseStepTrack {
+            entries: track
+                .iter()
+                .enumerate()
+                .filter_map(|(step, values)| {
+                    (values != &default).then(|| SparseStepDataEntry {
+                        step,
+                        values: values.to_vec(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+    sparse.serialize(serializer)
+}
+
+fn serialize_chord_snapshots<S>(
+    chord_snapshots: &[Vec<Vec<f32>>],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let sparse = chord_snapshots
+        .iter()
+        .map(|track| SparseChordTrack {
+            entries: track
+                .iter()
+                .enumerate()
+                .filter_map(|(step, notes)| {
+                    (!notes.is_empty()).then(|| SparseChordEntry {
+                        step,
+                        notes: notes.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+    sparse.serialize(serializer)
+}
+
+fn deserialize_chord_snapshots<'de, D>(deserializer: D) -> Result<Vec<Vec<Vec<f32>>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = ChordSnapshotsRepr::deserialize(deserializer)?;
+    match raw {
+        ChordSnapshotsRepr::Dense(raw) => Ok(raw),
+        ChordSnapshotsRepr::Sparse(raw) => {
+            let mut tracks = Vec::with_capacity(raw.len());
+            for track in raw {
+                let mut steps = vec![Vec::new(); MAX_STEPS];
+                for entry in track.entries {
+                    if entry.step < steps.len() {
+                        steps[entry.step] = entry.notes;
+                    }
+                }
+                tracks.push(steps);
+            }
+            Ok(tracks)
+        }
+    }
+}
+
+fn serialize_timebase_plock_snapshots<S>(
+    snapshots: &[Vec<Option<u32>>],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let sparse = snapshots
+        .iter()
+        .map(|track| SparseTimebaseTrack {
+            entries: track
+                .iter()
+                .enumerate()
+                .filter_map(|(step, value)| value.map(|value| SparseTimebaseEntry { step, value }))
+                .collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+    sparse.serialize(serializer)
+}
+
+fn deserialize_timebase_plock_snapshots<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Vec<Option<u32>>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = TimebaseSnapshotsRepr::deserialize(deserializer)?;
+    match raw {
+        TimebaseSnapshotsRepr::Dense(raw) => Ok(raw),
+        TimebaseSnapshotsRepr::Sparse(raw) => {
+            let mut tracks = Vec::with_capacity(raw.len());
+            for track in raw {
+                let mut steps = vec![None; MAX_STEPS];
+                for entry in track.entries {
+                    if entry.step < steps.len() {
+                        steps[entry.step] = Some(entry.value);
+                    }
+                }
+                tracks.push(steps);
+            }
+            Ok(tracks)
+        }
+    }
 }
 
 fn default_accum_limit() -> f32 {
@@ -393,6 +522,194 @@ fn default_swing_resolution() -> u8 {
 
 fn default_master_volume() -> f32 {
     1.0
+}
+
+fn default_step_values() -> [f32; NUM_PARAMS] {
+    let mut params = [0.0; NUM_PARAMS];
+    for (idx, param) in crate::sequencer::StepParam::ALL.into_iter().enumerate() {
+        params[idx] = param.default_value();
+    }
+    params
+}
+
+fn step_values_from_vec(values: Vec<f32>) -> [f32; NUM_PARAMS] {
+    let mut params = default_step_values();
+    if values.len() == NUM_PARAMS - 1 {
+        for (idx, value) in values.into_iter().enumerate() {
+            let target_idx = if idx >= crate::sequencer::StepParam::Pan.index() {
+                idx + 1
+            } else {
+                idx
+            };
+            params[target_idx] = value;
+        }
+    } else {
+        for (idx, value) in values.into_iter().enumerate().take(NUM_PARAMS) {
+            params[idx] = value;
+        }
+    }
+    params
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseStepDataEntry {
+    step: usize,
+    values: Vec<f32>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseStepTrack {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entries: Vec<SparseStepDataEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StepDataRepr {
+    Dense(Vec<Vec<Vec<f32>>>),
+    Sparse(Vec<SparseStepTrack>),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseChordEntry {
+    step: usize,
+    notes: Vec<f32>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseChordTrack {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entries: Vec<SparseChordEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChordSnapshotsRepr {
+    Dense(Vec<Vec<Vec<f32>>>),
+    Sparse(Vec<SparseChordTrack>),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseTimebaseEntry {
+    step: usize,
+    value: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SparseTimebaseTrack {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    entries: Vec<SparseTimebaseEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TimebaseSnapshotsRepr {
+    Dense(Vec<Vec<Option<u32>>>),
+    Sparse(Vec<SparseTimebaseTrack>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct SparseEffectSlotPlock {
+    step: usize,
+    param: usize,
+    value: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SparseProjectEffectSlot {
+    num_params: u32,
+    defaults: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    plocks_sparse: Vec<SparseEffectSlotPlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    param_node_indices: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct DenseProjectEffectSlot {
+    num_params: u32,
+    defaults: Vec<f32>,
+    plocks: Vec<Vec<Option<f32>>>,
+    param_node_indices: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProjectEffectSlotRepr {
+    Sparse(SparseProjectEffectSlot),
+    Dense(DenseProjectEffectSlot),
+    Empty(()),
+}
+
+impl Serialize for ProjectEffectSlot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let plocks_sparse = self
+            .plocks
+            .iter()
+            .enumerate()
+            .flat_map(|(step, row)| {
+                row.iter().enumerate().filter_map(move |(param, value)| {
+                    value.map(|value| SparseEffectSlotPlock { step, param, value })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if self.num_params == 0
+            && self.defaults.is_empty()
+            && self.param_node_indices.is_empty()
+            && plocks_sparse.is_empty()
+        {
+            return Option::<()>::None.serialize(serializer);
+        }
+
+        SparseProjectEffectSlot {
+            num_params: self.num_params,
+            defaults: self.defaults.clone(),
+            plocks_sparse,
+            param_node_indices: self.param_node_indices.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectEffectSlot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = ProjectEffectSlotRepr::deserialize(deserializer)?;
+        Ok(match repr {
+            ProjectEffectSlotRepr::Sparse(slot) => {
+                let mut plocks = vec![vec![None; slot.defaults.len()]; MAX_STEPS];
+                for entry in slot.plocks_sparse {
+                    if entry.step < plocks.len() && entry.param < slot.defaults.len() {
+                        plocks[entry.step][entry.param] = Some(entry.value);
+                    }
+                }
+                Self {
+                    num_params: slot.num_params,
+                    defaults: slot.defaults,
+                    plocks,
+                    param_node_indices: slot.param_node_indices,
+                }
+            }
+            ProjectEffectSlotRepr::Dense(slot) => Self {
+                num_params: slot.num_params,
+                defaults: slot.defaults,
+                plocks: slot.plocks,
+                param_node_indices: slot.param_node_indices,
+            },
+            ProjectEffectSlotRepr::Empty(_) => Self {
+                num_params: 0,
+                defaults: Vec::new(),
+                plocks: vec![Vec::new(); MAX_STEPS],
+                param_node_indices: Vec::new(),
+            },
+        })
+    }
 }
 
 pub fn chord_snapshot_from_steps(steps: Vec<Vec<f32>>) -> ChordSnapshot {
@@ -575,5 +892,31 @@ mod tests {
         assert_eq!(step[crate::sequencer::StepParam::Transpose.index()], 7.0);
         assert_eq!(step[crate::sequencer::StepParam::Pan.index()], 0.0);
         assert_eq!(step[crate::sequencer::StepParam::Chop.index()], 1.0);
+    }
+
+    #[test]
+    fn project_serializes_sparse_step_and_plock_data() {
+        let project = sample_project();
+        let json = serde_json::to_string(&project).expect("serialize sparse project");
+
+        assert!(json.contains("\"plocks_sparse\""));
+        assert!(json.contains("\"step\":0"));
+        assert!(!json.contains("\"plocks\":[[null"));
+    }
+
+    #[test]
+    fn sparse_effect_slot_deserializes() {
+        let json = r#"{
+            "num_params": 2,
+            "defaults": [0.1, 0.2],
+            "plocks_sparse": [{"step": 3, "param": 1, "value": 0.8}],
+            "param_node_indices": [0, 1]
+        }"#;
+
+        let slot: ProjectEffectSlot = serde_json::from_str(json).expect("deserialize sparse slot");
+        assert_eq!(slot.num_params, 2);
+        assert_eq!(slot.defaults, vec![0.1, 0.2]);
+        assert_eq!(slot.plocks[3][1], Some(0.8));
+        assert_eq!(slot.plocks[0][1], None);
     }
 }

@@ -56,10 +56,18 @@ impl AgentToolRuntime {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Operator, attribute, topic, or example search term." },
+                        "query": { "type": "string", "description": "Single operator, attribute, topic, or example search term." },
+                        "queries": {
+                            "type": "array",
+                            "description": "List of operators, attributes, topics, or example search terms to look up in one call.",
+                            "items": { "type": "string" }
+                        },
                         "limit": { "type": "integer", "minimum": 1, "default": 5 }
                     },
-                    "required": ["query"]
+                    "anyOf": [
+                        { "required": ["query"] },
+                        { "required": ["queries"] }
+                    ]
                 }),
             },
             ToolSpec {
@@ -228,9 +236,9 @@ impl AgentToolRuntime {
     }
 
     fn execute_lookup_docs(&self, arguments: &Value) -> Result<ToolResult, String> {
-        let query = required_string(arguments, "query")?;
+        let queries = lookup_queries(arguments)?;
         let limit = optional_usize(arguments, "limit").unwrap_or(5);
-        Ok(self.registry.lookup_dgen_docs(query, limit))
+        Ok(self.registry.lookup_dgen_docs(&queries, limit))
     }
 
     fn execute_list_examples(&self, arguments: &Value) -> Result<ToolResult, String> {
@@ -432,6 +440,32 @@ fn optional_kind(value: &Value, key: &str) -> Result<Option<ExampleKind>, String
     }
 }
 
+fn lookup_queries(value: &Value) -> Result<Vec<String>, String> {
+    if let Some(query) = value
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        return Ok(vec![query.to_string()]);
+    }
+
+    if let Some(items) = value.get("queries").and_then(Value::as_array) {
+        let queries = items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !queries.is_empty() {
+            return Ok(queries);
+        }
+    }
+
+    Err("Missing required string field 'query' or non-empty string array field 'queries'.".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -470,6 +504,33 @@ mod tests {
         );
         assert!(outcome.ok);
         assert!(outcome.content.contains("compressor"));
+    }
+
+    #[test]
+    fn execute_lookup_docs_accepts_multiple_queries() {
+        let runtime = AgentToolRuntime::load_default().expect("load runtime");
+        let outcome = runtime.execute(
+            ToolCall {
+                name: "lookup_dgen_docs".to_string(),
+                arguments: json!({ "queries": ["biquad", "compressor"], "limit": 2 }),
+            },
+            &AgentSessionContext {
+                has_tracks: false,
+                current_track_name: None,
+                current_track_index: None,
+                can_apply_effect_to_current_track: false,
+                current_effect_name: None,
+                current_effect_source: None,
+                current_effect_slot: None,
+                can_update_current_effect: false,
+                current_instrument_name: None,
+                current_instrument_source: None,
+                can_update_current_instrument: false,
+            },
+        );
+        assert!(outcome.ok);
+        assert!(outcome.content.contains("query: biquad"));
+        assert!(outcome.content.contains("query: compressor"));
     }
 
     #[test]

@@ -648,6 +648,7 @@ pub(super) fn draw_effects_column(
     let Some(slot_idx) = app.selected_effect_slot() else {
         return;
     };
+    app.clamp_effect_scroll(inner);
 
     let is_custom_slot = slot_idx >= BUILTIN_SLOT_COUNT;
     let chain = &app.state.pattern.effect_chains[track];
@@ -684,104 +685,100 @@ pub(super) fn draw_effects_column(
     }
     let slot = &chain[slot_idx];
     let is_entering_value = editor_focused && app.ui.input_mode == InputMode::ValueEntry;
+    let total_rows = desc.params.len();
+    let rows_per_column = app.synth_rows_per_column(inner);
+    let partition_rows = app.instrument_partition_rows_per_column(inner, total_rows);
+    let column_width = app.instrument_column_width(inner, total_rows);
 
-    for (i, param_desc) in desc.params.iter().enumerate() {
-        let row_y = inner.y + i as u16;
-        if row_y >= inner.y + inner.height {
-            break;
-        }
-
-        let default_val = slot.defaults.get(i);
-        let is_cursor_row = editor_focused && app.ui.effect_param_cursor == i;
-        let cursor = if is_cursor_row { "> " } else { "  " };
-        let cursor_style = if is_cursor_row {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        let label_width = 12;
-        let value_width = 14;
-
-        if is_cursor_row && is_entering_value {
-            let target_label = if !app.ui.visual_steps.is_empty() {
-                format!("p-lock {} steps", app.ui.visual_steps.len())
-            } else if app.ui.selection_anchor.is_some() {
-                let (lo, hi) = app.selected_range();
-                format!("p-lock steps {}-{}", lo + 1, hi + 1)
-            } else {
-                "default".to_string()
-            };
-            let spans = vec![
-                Span::styled(cursor, cursor_style),
-                Span::styled(
-                    format!("{:<width$}", param_desc.name, width = label_width),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(
-                    format!("{}\u{2588}", app.ui.value_buffer),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .bg(Color::Rgb(60, 60, 20))
-                        .bold(),
-                ),
-                Span::styled(
-                    format!("  ({target_label})  Enter: set  Esc: cancel"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ];
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect::new(inner.x, row_y, inner.width, 1),
-            );
-            continue;
-        }
-
-        let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
-            let plock_val = slot.plocks.get(app.ui.cursor_step, i);
-            match plock_val {
-                Some(v) => (v, Some(" (p-lock)")),
-                None => (default_val, None),
+    for column in 0..app.instrument_column_count(inner, total_rows) {
+        for local_row in 0..rows_per_column {
+            let i = column * partition_rows + app.ui.effect_scroll_offset + local_row;
+            if i >= total_rows {
+                continue;
             }
-        } else {
-            (default_val, None)
-        };
 
-        let formatted = param_desc.format_value(display_val);
+            let row_y = inner.y + local_row as u16;
+            let row_x = inner.x + column as u16 * (column_width + SYNTH_COLUMN_GAP);
+            let row_area = Rect::new(row_x, row_y, column_width, 1);
+            let param_desc = &desc.params[i];
+            let default_val = slot.defaults.get(i);
+            let is_cursor_row = editor_focused && app.ui.effect_param_cursor == i;
+            let cursor = if is_cursor_row { "> " } else { "  " };
+            let cursor_style = if is_cursor_row {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
 
-        let mut spans = vec![
-            Span::styled(cursor, cursor_style),
-            Span::styled(
-                format!("{:<width$}", param_desc.name, width = label_width),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::styled(
-                format!("{formatted:<width$}", width = value_width),
-                cursor_style,
-            ),
-        ];
+            let label_width = if column_width >= 44 { 14 } else { 11 };
+            let value_width = if column_width >= 40 { 12 } else { 9 };
+            let slider_width =
+                (column_width as usize).saturating_sub(label_width + value_width + 6);
+            let label = fit_cell(&param_desc.name, label_width);
 
-        if let Some(lbl) = plock_label {
-            spans.push(Span::styled(lbl, Style::default().fg(Color::White)));
-        }
-
-        if !param_desc.is_boolean() {
-            let range = param_desc.max - param_desc.min;
-            if range > 0.0 {
-                let (slider_val, is_plock) = if app.has_selection() {
-                    let pv = slot.plocks.get(app.ui.cursor_step, i);
-                    (pv.unwrap_or(default_val), pv.is_some())
-                } else if app.state.is_playing() {
-                    let step = app.state.track_step(app.ui.cursor_track);
-                    let pv = slot.plocks.get(step, i);
-                    (pv.unwrap_or(default_val), pv.is_some())
+            if is_cursor_row && is_entering_value {
+                let target_label = if !app.ui.visual_steps.is_empty() {
+                    format!("p-lock {} steps", app.ui.visual_steps.len())
+                } else if app.ui.selection_anchor.is_some() {
+                    let (lo, hi) = app.selected_range();
+                    format!("p-lock steps {}-{}", lo + 1, hi + 1)
                 } else {
-                    (default_val, false)
+                    "default".to_string()
                 };
-                let norm = param_desc.normalize(slider_val);
-                let slider_width =
-                    (inner.width as usize).saturating_sub(label_width + value_width + 6);
-                if slider_width > 2 {
+                let spans = vec![
+                    Span::styled(cursor, cursor_style),
+                    Span::styled(label.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}\u{2588}", app.ui.value_buffer),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 60, 20))
+                            .bold(),
+                    ),
+                    Span::styled(
+                        format!("  ({target_label})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+                continue;
+            }
+
+            let (display_val, plock_label) = if app.has_selection() && is_cursor_row {
+                let plock_val = slot.plocks.get(app.ui.cursor_step, i);
+                match plock_val {
+                    Some(v) => (v, Some(" (p-lock)")),
+                    None => (default_val, None),
+                }
+            } else {
+                (default_val, None)
+            };
+
+            let formatted = param_desc.format_value(display_val);
+            let mut spans = vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::styled(fit_cell(&formatted, value_width), cursor_style),
+            ];
+
+            if let Some(lbl) = plock_label {
+                spans.push(Span::styled(lbl, Style::default().fg(Color::White)));
+            }
+
+            if !param_desc.is_boolean() {
+                let range = param_desc.max - param_desc.min;
+                if range > 0.0 && slider_width > 2 {
+                    let (slider_val, is_plock) = if app.has_selection() {
+                        let pv = slot.plocks.get(app.ui.cursor_step, i);
+                        (pv.unwrap_or(default_val), pv.is_some())
+                    } else if app.state.is_playing() {
+                        let step = app.state.track_step(app.ui.cursor_track);
+                        let pv = slot.plocks.get(step, i);
+                        (pv.unwrap_or(default_val), pv.is_some())
+                    } else {
+                        (default_val, false)
+                    };
+                    let norm = param_desc.normalize(slider_val);
                     let filled = ((norm * slider_width as f32).round() as usize).min(slider_width);
                     let bar: String =
                         "\u{2550}".repeat(filled) + &" ".repeat(slider_width - filled);
@@ -792,11 +789,24 @@ pub(super) fn draw_effects_column(
                     ));
                 }
             }
-        }
 
+            frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        }
+    }
+
+    if partition_rows > rows_per_column && inner.width > 12 {
+        let end = (app.ui.effect_scroll_offset + rows_per_column).min(partition_rows);
+        let summary = format!(
+            "{}-{}/{}",
+            app.ui.effect_scroll_offset + 1,
+            end,
+            partition_rows
+        );
+        let summary_len = summary.len() as u16;
+        let x = inner.x + inner.width.saturating_sub(summary_len);
         frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, row_y, inner.width, 1),
+            Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+            Rect::new(x, inner.y, summary_len, 1),
         );
     }
 

@@ -20,6 +20,12 @@ pub struct AgentTurnResult {
     pub pending_actions: Vec<AgentAppAction>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentTurnError {
+    pub message: String,
+    pub tool_outcomes: Vec<ToolCallOutcome>,
+}
+
 pub struct AgentNetworkClient {
     http: Client,
     tools: AgentToolRuntime,
@@ -43,7 +49,7 @@ impl AgentNetworkClient {
         system_prompt: &str,
         messages: &[AgentMessage],
         session_context: AgentSessionContext,
-    ) -> Result<AgentTurnResult, String> {
+    ) -> Result<AgentTurnResult, AgentTurnError> {
         let request = AgentTurnRequest {
             model: model.to_string(),
             system_prompt: system_prompt.to_string(),
@@ -58,9 +64,14 @@ impl AgentNetworkClient {
         }
     }
 
-    fn execute_openai_turn(&self, request: &AgentTurnRequest) -> Result<AgentTurnResult, String> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "Missing required OPENAI_API_KEY.".to_string())?;
+    fn execute_openai_turn(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> Result<AgentTurnResult, AgentTurnError> {
+        let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| AgentTurnError {
+            message: "Missing required OPENAI_API_KEY.".to_string(),
+            tool_outcomes: Vec::new(),
+        })?;
         let mut messages = openai_messages(request);
         let tools = openai_tools(&request.tools);
         let mut tool_outcomes = Vec::new();
@@ -84,17 +95,29 @@ impl AgentNetworkClient {
                 .header(CONTENT_TYPE, "application/json")
                 .json(&payload)
                 .send()
-                .map_err(|error| format!("OpenAI request failed: {error}"))?
+                .map_err(|error| AgentTurnError {
+                    message: format!("OpenAI request failed: {error}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?
                 .error_for_status()
-                .map_err(|error| format!("OpenAI request failed: {error}"))?
+                .map_err(|error| AgentTurnError {
+                    message: format!("OpenAI request failed: {error}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?
                 .json()
-                .map_err(|error| format!("Failed to decode OpenAI response: {error}"))?;
+                .map_err(|error| AgentTurnError {
+                    message: format!("Failed to decode OpenAI response: {error}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?;
 
             let message = response
                 .choices
                 .into_iter()
                 .next()
-                .ok_or_else(|| "OpenAI returned no choices.".to_string())?
+                .ok_or_else(|| AgentTurnError {
+                    message: "OpenAI returned no choices.".to_string(),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?
                 .message;
 
             let tool_calls = message.tool_calls.unwrap_or_default();
@@ -110,7 +133,8 @@ impl AgentNetworkClient {
                 if repeated_tool_call_rounds >= MAX_REPEAT_TOOL_CALL_ROUNDS {
                     return Err(format!(
                         "Agent repeated the same tool-call plan: {tool_signature}"
-                    ));
+                    )
+                    .into_error(tool_outcomes));
                 }
 
                 messages.push(json!({
@@ -128,10 +152,13 @@ impl AgentNetworkClient {
                         } else {
                             serde_json::from_str(&tool_call.function.arguments).map_err(
                                 |error| {
-                                    format!(
-                                        "OpenAI tool arguments for '{}' were invalid JSON: {error}",
-                                        tool_call.function.name
-                                    )
+                                    AgentTurnError {
+                                        message: format!(
+                                            "OpenAI tool arguments for '{}' were invalid JSON: {error}",
+                                            tool_call.function.name
+                                        ),
+                                        tool_outcomes: tool_outcomes.clone(),
+                                    }
                                 },
                             )?
                         },
@@ -168,7 +195,8 @@ impl AgentNetworkClient {
                     if repeated_failure_rounds >= MAX_REPEAT_TOOL_FAILURES {
                         return Err(format!(
                             "Agent repeated the same failing tool call: {signature}"
-                        ));
+                        )
+                        .into_error(tool_outcomes));
                     }
                 } else {
                     repeated_failure_rounds = 0;
@@ -184,12 +212,20 @@ impl AgentNetworkClient {
             });
         }
 
-        Err("OpenAI tool loop exceeded maximum rounds.".to_string())
+        Err(
+            format_tool_loop_error("OpenAI", MAX_TOOL_ROUNDS, last_tool_signature.as_deref())
+                .into_error(tool_outcomes),
+        )
     }
 
-    fn execute_gemini_turn(&self, request: &AgentTurnRequest) -> Result<AgentTurnResult, String> {
-        let api_key = std::env::var("GEMINI_API_KEY")
-            .map_err(|_| "Missing required GEMINI_API_KEY.".to_string())?;
+    fn execute_gemini_turn(
+        &self,
+        request: &AgentTurnRequest,
+    ) -> Result<AgentTurnResult, AgentTurnError> {
+        let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| AgentTurnError {
+            message: "Missing required GEMINI_API_KEY.".to_string(),
+            tool_outcomes: Vec::new(),
+        })?;
         let endpoint = format!("{GEMINI_API_BASE}/{}:generateContent", request.model);
         let mut contents = gemini_contents(request);
         let tools = gemini_tools(&request.tools);
@@ -218,26 +254,41 @@ impl AgentNetworkClient {
                 .header(CONTENT_TYPE, "application/json")
                 .json(&payload)
                 .send()
-                .map_err(|error| format!("Gemini request failed: {error}"))?;
+                .map_err(|error| AgentTurnError {
+                    message: format!("Gemini request failed: {error}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?;
             let status = response.status();
             if !status.is_success() {
                 let body = response
                     .text()
                     .unwrap_or_else(|_| "<failed to read response body>".to_string());
-                return Err(format!("Gemini request failed: HTTP {status} body: {body}"));
+                return Err(AgentTurnError {
+                    message: format!("Gemini request failed: HTTP {status} body: {body}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                });
             }
             let response: GeminiGenerateContentResponse = response
                 .json()
-                .map_err(|error| format!("Failed to decode Gemini response: {error}"))?;
+                .map_err(|error| AgentTurnError {
+                    message: format!("Failed to decode Gemini response: {error}"),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?;
 
             let candidate = response
                 .candidates
                 .into_iter()
                 .next()
-                .ok_or_else(|| "Gemini returned no candidates.".to_string())?;
+                .ok_or_else(|| AgentTurnError {
+                    message: "Gemini returned no candidates.".to_string(),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?;
             let content = candidate
                 .content
-                .ok_or_else(|| "Gemini returned no content.".to_string())?;
+                .ok_or_else(|| AgentTurnError {
+                    message: "Gemini returned no content.".to_string(),
+                    tool_outcomes: tool_outcomes.clone(),
+                })?;
             let function_calls = extract_gemini_function_calls(&content.parts);
             let assistant_text = extract_gemini_text(&content.parts);
 
@@ -264,7 +315,8 @@ impl AgentNetworkClient {
             if repeated_tool_call_rounds >= MAX_REPEAT_TOOL_CALL_ROUNDS {
                 return Err(format!(
                     "Agent repeated the same tool-call plan: {tool_signature}"
-                ));
+                )
+                .into_error(tool_outcomes));
             }
 
             let mut response_parts = Vec::new();
@@ -313,7 +365,8 @@ impl AgentNetworkClient {
                 if repeated_failure_rounds >= MAX_REPEAT_TOOL_FAILURES {
                     return Err(format!(
                         "Agent repeated the same failing tool call: {signature}"
-                    ));
+                    )
+                    .into_error(tool_outcomes));
                 }
             } else {
                 repeated_failure_rounds = 0;
@@ -326,7 +379,23 @@ impl AgentNetworkClient {
             }));
         }
 
-        Err("Gemini tool loop exceeded maximum rounds.".to_string())
+        Err(
+            format_tool_loop_error("Gemini", MAX_TOOL_ROUNDS, last_tool_signature.as_deref())
+                .into_error(tool_outcomes),
+        )
+    }
+}
+
+trait IntoAgentTurnError {
+    fn into_error(self, tool_outcomes: Vec<ToolCallOutcome>) -> AgentTurnError;
+}
+
+impl IntoAgentTurnError for String {
+    fn into_error(self, tool_outcomes: Vec<ToolCallOutcome>) -> AgentTurnError {
+        AgentTurnError {
+            message: self,
+            tool_outcomes,
+        }
     }
 }
 
@@ -483,6 +552,15 @@ fn gemini_tool_call_signature(tool_calls: &[GeminiFunctionCall]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn format_tool_loop_error(provider: &str, max_rounds: usize, last_tool_signature: Option<&str>) -> String {
+    match last_tool_signature {
+        Some(signature) => format!(
+            "{provider} tool loop exceeded maximum rounds ({max_rounds}). Last tool-call plan: {signature}"
+        ),
+        None => format!("{provider} tool loop exceeded maximum rounds ({max_rounds})."),
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -856,13 +856,34 @@ fn draw_dropdown_items(
 
 pub(super) fn draw_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<&str> = app.dropdown_labels().iter().map(|s| s.as_str()).collect();
-    draw_dropdown_items(
-        frame,
-        &items,
-        app.ui.dropdown_cursor,
-        area,
-        app.ui.effect_param_cursor as u16,
-    );
+    let anchor = match app.ui.effect_tab {
+        super::EffectTab::Synth => app.partition_cursor_anchor_row(
+            area,
+            app.synth_row_count(),
+            app.ui.instrument_param_cursor,
+            app.ui.synth_scroll_offset,
+        ),
+        super::EffectTab::Mod => app.partition_cursor_anchor_row(
+            area,
+            app.mod_row_count(),
+            app.ui.mod_param_cursor,
+            app.ui.mod_scroll_offset,
+        ),
+        super::EffectTab::Sources => app.partition_cursor_anchor_row(
+            area,
+            app.source_row_count(),
+            app.source_display_row_for_param_row(app.ui.source_param_cursor),
+            app.ui.source_scroll_offset,
+        ),
+        super::EffectTab::Slot(_) => app.partition_cursor_anchor_row(
+            area,
+            app.effect_row_count(),
+            app.ui.effect_param_cursor,
+            app.ui.effect_scroll_offset,
+        ),
+        super::EffectTab::Reverb => app.ui.reverb_param_cursor as u16,
+    };
+    draw_dropdown_items(frame, &items, app.ui.dropdown_cursor, area, anchor);
 }
 
 pub(super) fn draw_track_param_dropdown(frame: &mut Frame, app: &App, area: Rect) {

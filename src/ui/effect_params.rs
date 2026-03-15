@@ -55,8 +55,49 @@ impl App {
             self.ui.reverb_param_cursor = 0;
         } else {
             self.ui.effect_param_cursor = 0;
+            self.ui.effect_scroll_offset = 0;
         }
         self.sync_effect_tab_cursor();
+    }
+
+    pub(super) fn effect_row_count(&self) -> usize {
+        self.current_slot_descriptor()
+            .map(|desc| desc.params.len())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn clamp_effect_scroll(&mut self, area: ratatui::prelude::Rect) {
+        self.ui.effect_scroll_offset = self.partition_scroll_offset(
+            area,
+            self.effect_row_count(),
+            self.ui.effect_scroll_offset,
+        );
+    }
+
+    pub(super) fn ensure_effect_cursor_visible(&mut self) {
+        let area = self.ui.layout.effects_inner;
+        (self.ui.effect_param_cursor, self.ui.effect_scroll_offset) = self
+            .ensure_partition_cursor_visible(
+                area,
+                self.effect_row_count(),
+                self.ui.effect_param_cursor,
+                self.ui.effect_scroll_offset,
+            );
+    }
+
+    pub(super) fn effect_row_at_position(
+        &self,
+        area: ratatui::prelude::Rect,
+        col: u16,
+        row: u16,
+    ) -> Option<usize> {
+        self.partition_row_at_position(
+            area,
+            col,
+            row,
+            self.effect_row_count(),
+            self.ui.effect_scroll_offset,
+        )
     }
 
     fn activate_effect_pane_cursor_entry(&mut self) {
@@ -243,6 +284,7 @@ impl App {
                     self.adjust_slot_param(1.0);
                 } else if self.ui.effect_param_cursor > 0 {
                     self.ui.effect_param_cursor -= 1;
+                    self.ensure_effect_cursor_visible();
                 }
             }
             KeyCode::Down => {
@@ -252,6 +294,7 @@ impl App {
                     let max = desc.params.len().saturating_sub(1);
                     if self.ui.effect_param_cursor < max {
                         self.ui.effect_param_cursor += 1;
+                        self.ensure_effect_cursor_visible();
                     }
                 }
             }

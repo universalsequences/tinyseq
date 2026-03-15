@@ -516,6 +516,7 @@ impl App {
                     self.apply_effect_to_slot(track, slot_idx, node_id, &r.name, &r.manifest);
                     self.ui.effect_tab = EffectTab::Slot(slot_idx);
                     self.ui.effect_param_cursor = 0;
+                    self.ui.effect_scroll_offset = 0;
                     self.ui.focused_region = Region::Params;
                     self.ui.params_column = 1;
                     self.editor.lisp_libs.push(r.lib);
@@ -580,6 +581,7 @@ impl App {
                 self.editor.lisp_libs.push(result.lib);
                 self.ui.effect_tab = EffectTab::Slot(slot_idx);
                 self.ui.effect_param_cursor = 0;
+                self.ui.effect_scroll_offset = 0;
                 self.ui.focused_region = Region::Params;
                 self.ui.params_column = 1;
                 self.editor.status_message = Some((format!("Loaded '{}'", name), Instant::now()));

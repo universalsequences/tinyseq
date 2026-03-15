@@ -324,6 +324,200 @@ fn output_dir() -> PathBuf {
     std::env::temp_dir().join("sequencer_dgenlisp")
 }
 
+fn normalize_lisp_source(source: &str) -> String {
+    source
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn source_matches_repo_file(source: &str, relative_path: &str) -> bool {
+    let repo_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join(relative_path);
+    let Ok(repo_source) = std::fs::read_to_string(repo_path) else {
+        return false;
+    };
+    normalize_lisp_source(source) == normalize_lisp_source(&repo_source)
+}
+
+fn should_build_guarded_instrument_dylib(source: &str) -> bool {
+    // Temporary debug hook for instrument index-guard dylibs. Leave disabled now
+    // that the DGen wrap fix is in, but keep the helper available for future regressions.
+    let _ = source;
+    return false;
+    #[allow(unreachable_code)]
+    match std::env::var("TINYSEQ_DGEN_GUARD_INSTRUMENTS") {
+        Ok(value) => {
+            let value = value.trim();
+            if value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+            {
+                return true;
+            }
+        }
+        Err(_) => {}
+    }
+    source_matches_repo_file(source, "instruments/flute.lisp")
+}
+
+fn guard_rewrite_memory_index(inner: &str) -> Option<String> {
+    let (base, expr_part) = inner.split_once(" + ")?;
+    let base = base.trim();
+    let expr_part = expr_part.trim();
+
+    if let Some(expr) = expr_part.strip_prefix("(int)") {
+        let expr = expr.trim();
+        return Some(format!(
+            "{base} + dgen_guard_delay_index_f32(({expr}), 88000, {expr:?}, __LINE__)"
+        ));
+    }
+
+    const FINITE_PREFIX: &str = "(isfinite((int) ";
+    const FINITE_MID: &str = ") ? (int) ";
+    const FINITE_SUFFIX: &str = " : 0)";
+    if expr_part.starts_with(FINITE_PREFIX) && expr_part.ends_with(FINITE_SUFFIX) {
+        let tail = &expr_part[FINITE_PREFIX.len()..expr_part.len() - FINITE_SUFFIX.len()];
+        let (lhs, rhs) = tail.split_once(FINITE_MID)?;
+        let lhs = lhs.trim();
+        let rhs = rhs.trim();
+        if lhs == rhs {
+            return Some(format!(
+                "{base} + dgen_guard_delay_index_f32(({lhs}), 88000, {lhs:?}, __LINE__)"
+            ));
+        }
+    }
+
+    None
+}
+
+fn rewrite_generated_c_memory_guards(source: &str) -> Result<String, String> {
+    let helper = r#"
+#include <stdlib.h>
+
+static inline int dgen_guard_delay_index_f32(float idx, int limit, const char *expr, int line) {
+  if (!isfinite(idx) || idx < 0.0f || idx >= (float)limit) {
+    fprintf(stderr,
+            "DGen delay index guard tripped: expr=%s idx=%f limit=%d line=%d\n",
+            expr, idx, limit, line);
+    abort();
+  }
+  return (int)idx;
+}
+
+"#;
+    let injected = if source.contains("dgen_guard_delay_index_f32(") {
+        source.to_string()
+    } else if source.contains("const int VOICE_COUNT =") {
+        source.replacen("const int VOICE_COUNT =", &format!("{helper}const int VOICE_COUNT ="), 1)
+    } else {
+        return Err("Generated C did not contain VOICE_COUNT anchor for guard injection".into());
+    };
+
+    let mut rewritten = String::with_capacity(injected.len() + 1024);
+    for line in injected.lines() {
+        if !line.contains("memory[") {
+            rewritten.push_str(line);
+            rewritten.push('\n');
+            continue;
+        }
+
+        let mut cursor = 0usize;
+        let mut changed = String::with_capacity(line.len() + 64);
+        while let Some(rel_start) = line[cursor..].find("memory[") {
+            let start = cursor + rel_start;
+            let open = start + "memory[".len();
+            let mut depth = 1i32;
+            let mut close = None;
+            for (off, ch) in line[open..].char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + off);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close_idx) = close else {
+                return Err(format!("Failed to find closing ] in generated C line: {line}"));
+            };
+            changed.push_str(&line[cursor..open]);
+            let inner = &line[open..close_idx];
+            if let Some(rewritten_inner) = guard_rewrite_memory_index(inner) {
+                changed.push_str(&rewritten_inner);
+            } else {
+                changed.push_str(inner);
+            }
+            changed.push(']');
+            cursor = close_idx + 1;
+        }
+        changed.push_str(&line[cursor..]);
+        rewritten.push_str(&changed);
+        rewritten.push('\n');
+    }
+
+    Ok(rewritten)
+}
+
+fn compile_guarded_dylib(c_path: &Path, dylib_path: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/clang")
+        .args(["-O3", "-fno-fast-math", "-mcpu=native", "-flto=thin"])
+        .args(["-fPIC", "-shared"])
+        .args(["-framework", "Accelerate"])
+        .args(["-std=c11", "-x", "c"])
+        .args(["-o", dylib_path.to_str().ok_or("Invalid dylib output path")?])
+        .arg(c_path)
+        .output()
+        .map_err(|e| format!("Failed to run clang for guarded dylib: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("Guarded dylib compile failed:\n{stderr}{stdout}"));
+    }
+
+    Ok(())
+}
+
+fn maybe_rebuild_guarded_instrument_dylib(source: &str, manifest_json: &str) -> Result<(), String> {
+    if !should_build_guarded_instrument_dylib(source) {
+        return Ok(());
+    }
+
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|e| format!("Failed to parse DGen manifest for guard rebuild: {e}"))?;
+    let c_source_path = manifest["cSourcePath"]
+        .as_str()
+        .ok_or("DGen manifest missing cSourcePath for guard rebuild")?;
+    let dylib_name = manifest["dylib"]
+        .as_str()
+        .ok_or("DGen manifest missing dylib for guard rebuild")?;
+    let c_source_path = PathBuf::from(c_source_path);
+    let dylib_path = c_source_path
+        .parent()
+        .unwrap_or(output_dir().as_path())
+        .join(dylib_name);
+    let generated_c = std::fs::read_to_string(&c_source_path)
+        .map_err(|e| format!("Failed to read generated C for guard rebuild: {e}"))?;
+    let guarded_c = rewrite_generated_c_memory_guards(&generated_c)?;
+    let stem = c_source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dgen_guarded");
+    let guarded_c_path = c_source_path.with_file_name(format!("{stem}.guarded.c"));
+    std::fs::write(&guarded_c_path, guarded_c)
+        .map_err(|e| format!("Failed to write guarded DGen C: {e}"))?;
+    compile_guarded_dylib(&guarded_c_path, &dylib_path)
+}
+
 pub fn compile_lisp(source: &str, sample_rate: u32) -> Result<String, String> {
     let dir = output_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create output dir: {e}"))?;
@@ -1128,6 +1322,7 @@ pub fn compile_instrument(source: &str, sample_rate: u32) -> Result<String, Stri
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    maybe_rebuild_guarded_instrument_dylib(source, &stdout)?;
     Ok(stdout)
 }
 

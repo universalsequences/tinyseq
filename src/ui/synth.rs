@@ -350,6 +350,137 @@ impl App {
         area.height as usize
     }
 
+    pub(super) fn partition_scroll_offset(
+        &self,
+        area: Rect,
+        total_rows: usize,
+        scroll_offset: usize,
+    ) -> usize {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
+            return 0;
+        }
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total_rows);
+        let max_scroll = rows_per_column.saturating_sub(visible_rows);
+        scroll_offset.min(max_scroll)
+    }
+
+    pub(super) fn scroll_partition_offset(
+        &self,
+        area: Rect,
+        total_rows: usize,
+        scroll_offset: usize,
+        delta: isize,
+    ) -> usize {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
+            return 0;
+        }
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total_rows);
+        let max_scroll = rows_per_column.saturating_sub(visible_rows);
+        if delta < 0 {
+            scroll_offset.saturating_sub((-delta) as usize)
+        } else {
+            (scroll_offset + delta as usize).min(max_scroll)
+        }
+    }
+
+    pub(super) fn ensure_partition_cursor_visible(
+        &self,
+        area: Rect,
+        total_rows: usize,
+        cursor: usize,
+        scroll_offset: usize,
+    ) -> (usize, usize) {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
+            return (cursor.min(total_rows.saturating_sub(1)), 0);
+        }
+
+        let cursor = cursor.min(total_rows.saturating_sub(1));
+        let mut scroll_offset = self.partition_scroll_offset(area, total_rows, scroll_offset);
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total_rows);
+        let row_in_column = cursor % rows_per_column;
+        if row_in_column < scroll_offset {
+            scroll_offset = row_in_column;
+        } else if row_in_column >= scroll_offset + visible_rows {
+            scroll_offset = row_in_column + 1 - visible_rows;
+        }
+
+        (
+            cursor,
+            self.partition_scroll_offset(area, total_rows, scroll_offset),
+        )
+    }
+
+    pub(super) fn partition_row_at_position(
+        &self,
+        area: Rect,
+        col: u16,
+        row: u16,
+        total_rows: usize,
+        scroll_offset: usize,
+    ) -> Option<usize> {
+        if area.height == 0
+            || col < area.x
+            || col >= area.x + area.width
+            || row < area.y
+            || row >= area.y + area.height
+        {
+            return None;
+        }
+
+        let columns = self.instrument_column_count(area, total_rows);
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
+            return None;
+        }
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total_rows);
+        let column_width = self.instrument_column_width(area, total_rows);
+        if column_width == 0 {
+            return None;
+        }
+
+        let rel_x = col - area.x;
+        let stride = column_width + SYNTH_COLUMN_GAP;
+        let column = (rel_x / stride) as usize;
+        if column >= columns {
+            return None;
+        }
+        let local_x = rel_x.saturating_sub(column as u16 * stride);
+        if local_x >= column_width {
+            return None;
+        }
+
+        let rel_y = (row - area.y) as usize;
+        if rel_y >= visible_rows {
+            return None;
+        }
+
+        let absolute = self.partition_scroll_offset(area, total_rows, scroll_offset)
+            + column * rows_per_column
+            + rel_y;
+        (absolute < total_rows).then_some(absolute)
+    }
+
+    pub(super) fn partition_cursor_anchor_row(
+        &self,
+        area: Rect,
+        total_rows: usize,
+        cursor: usize,
+        scroll_offset: usize,
+    ) -> u16 {
+        let visible_rows = self.synth_rows_per_column(area);
+        if visible_rows == 0 {
+            return 0;
+        }
+        let cursor = cursor.min(total_rows.saturating_sub(1));
+        let scroll_offset = self.partition_scroll_offset(area, total_rows, scroll_offset);
+        let rows_per_column = self.instrument_partition_rows_per_column(area, total_rows);
+        let row_in_column = cursor % rows_per_column;
+        row_in_column.saturating_sub(scroll_offset) as u16
+    }
+
     pub(super) fn instrument_partition_rows_per_column(
         &self,
         area: Rect,
@@ -370,85 +501,43 @@ impl App {
     }
 
     pub(super) fn clamp_synth_scroll(&mut self, area: Rect) {
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            self.ui.synth_scroll_offset = 0;
-            return;
-        }
-        let rows_per_column =
-            self.instrument_partition_rows_per_column(area, self.synth_row_count());
-        let max_scroll = rows_per_column.saturating_sub(visible_rows);
-        self.ui.synth_scroll_offset = self.ui.synth_scroll_offset.min(max_scroll);
+        self.ui.synth_scroll_offset =
+            self.partition_scroll_offset(area, self.synth_row_count(), self.ui.synth_scroll_offset);
     }
 
     pub(super) fn clamp_mod_scroll(&mut self, area: Rect) {
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            self.ui.mod_scroll_offset = 0;
-            return;
-        }
-        let rows_per_column = self.instrument_partition_rows_per_column(area, self.mod_row_count());
-        let max_scroll = rows_per_column.saturating_sub(visible_rows);
-        self.ui.mod_scroll_offset = self.ui.mod_scroll_offset.min(max_scroll);
+        self.ui.mod_scroll_offset =
+            self.partition_scroll_offset(area, self.mod_row_count(), self.ui.mod_scroll_offset);
     }
 
     pub(super) fn clamp_source_scroll(&mut self, area: Rect) {
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            self.ui.source_scroll_offset = 0;
-            return;
-        }
-        let rows_per_column =
-            self.instrument_partition_rows_per_column(area, self.source_row_count());
-        let max_scroll = rows_per_column.saturating_sub(visible_rows);
-        self.ui.source_scroll_offset = self.ui.source_scroll_offset.min(max_scroll);
+        self.ui.source_scroll_offset = self.partition_scroll_offset(
+            area,
+            self.source_row_count(),
+            self.ui.source_scroll_offset,
+        );
     }
 
     pub(super) fn ensure_synth_cursor_visible(&mut self) {
         let area = self.ui.layout.effects_inner;
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            self.ui.synth_scroll_offset = 0;
-            return;
-        }
-
-        let max_cursor = self.synth_row_count().saturating_sub(1);
-        self.ui.instrument_param_cursor = self.ui.instrument_param_cursor.min(max_cursor);
-        self.clamp_synth_scroll(area);
-
-        let rows_per_column =
-            self.instrument_partition_rows_per_column(area, self.synth_row_count());
-        let row_in_column = self.ui.instrument_param_cursor % rows_per_column;
-        if row_in_column < self.ui.synth_scroll_offset {
-            self.ui.synth_scroll_offset = row_in_column;
-        } else if row_in_column >= self.ui.synth_scroll_offset + visible_rows {
-            self.ui.synth_scroll_offset = row_in_column + 1 - visible_rows;
-        }
-
-        self.clamp_synth_scroll(area);
+        (self.ui.instrument_param_cursor, self.ui.synth_scroll_offset) = self
+            .ensure_partition_cursor_visible(
+                area,
+                self.synth_row_count(),
+                self.ui.instrument_param_cursor,
+                self.ui.synth_scroll_offset,
+            );
     }
 
     pub(super) fn ensure_mod_cursor_visible(&mut self) {
         let area = self.ui.layout.effects_inner;
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            self.ui.mod_scroll_offset = 0;
-            return;
-        }
-
-        let max_cursor = self.mod_row_count().saturating_sub(1);
-        self.ui.mod_param_cursor = self.ui.mod_param_cursor.min(max_cursor);
-        self.clamp_mod_scroll(area);
-
-        let rows_per_column = self.instrument_partition_rows_per_column(area, self.mod_row_count());
-        let row_in_column = self.ui.mod_param_cursor % rows_per_column;
-        if row_in_column < self.ui.mod_scroll_offset {
-            self.ui.mod_scroll_offset = row_in_column;
-        } else if row_in_column >= self.ui.mod_scroll_offset + visible_rows {
-            self.ui.mod_scroll_offset = row_in_column + 1 - visible_rows;
-        }
-
-        self.clamp_mod_scroll(area);
+        (self.ui.mod_param_cursor, self.ui.mod_scroll_offset) = self
+            .ensure_partition_cursor_visible(
+                area,
+                self.mod_row_count(),
+                self.ui.mod_param_cursor,
+                self.ui.mod_scroll_offset,
+            );
     }
 
     pub(super) fn ensure_source_cursor_visible(&mut self) {
@@ -477,73 +566,34 @@ impl App {
     }
 
     pub(super) fn synth_row_at_position(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
-        self.instrument_row_at_position(area, col, row, TabRowKind::Synth)
+        self.partition_row_at_position(
+            area,
+            col,
+            row,
+            self.synth_row_count(),
+            self.ui.synth_scroll_offset,
+        )
     }
 
     pub(super) fn mod_row_at_position(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
-        self.instrument_row_at_position(area, col, row, TabRowKind::Mod)
+        self.partition_row_at_position(
+            area,
+            col,
+            row,
+            self.mod_row_count(),
+            self.ui.mod_scroll_offset,
+        )
     }
 
     pub(super) fn source_row_at_position(&self, area: Rect, col: u16, row: u16) -> Option<usize> {
-        let display_row = self.instrument_row_at_position(area, col, row, TabRowKind::Sources)?;
+        let display_row = self.partition_row_at_position(
+            area,
+            col,
+            row,
+            self.source_row_count(),
+            self.ui.source_scroll_offset,
+        )?;
         self.source_param_row_for_display(display_row)
-    }
-
-    fn instrument_row_at_position(
-        &self,
-        area: Rect,
-        col: u16,
-        row: u16,
-        row_kind: TabRowKind,
-    ) -> Option<usize> {
-        if area.height == 0
-            || col < area.x
-            || col >= area.x + area.width
-            || row < area.y
-            || row >= area.y + area.height
-        {
-            return None;
-        }
-
-        let total = match row_kind {
-            TabRowKind::Synth => self.synth_row_count(),
-            TabRowKind::Mod => self.mod_row_count(),
-            TabRowKind::Sources => self.source_row_count(),
-        };
-        let columns = self.instrument_column_count(area, total);
-        let visible_rows = self.synth_rows_per_column(area);
-        if visible_rows == 0 {
-            return None;
-        }
-        let rows_per_column = self.instrument_partition_rows_per_column(area, total);
-
-        let column_width = self.instrument_column_width(area, total);
-        if column_width == 0 {
-            return None;
-        }
-
-        let rel_x = col - area.x;
-        let stride = column_width + SYNTH_COLUMN_GAP;
-        let column = (rel_x / stride) as usize;
-        if column >= columns {
-            return None;
-        }
-        let local_x = rel_x.saturating_sub(column as u16 * stride);
-        if local_x >= column_width {
-            return None;
-        }
-
-        let rel_y = (row - area.y) as usize;
-        if rel_y >= visible_rows {
-            return None;
-        }
-        let (scroll, total) = match row_kind {
-            TabRowKind::Synth => (self.ui.synth_scroll_offset, self.synth_row_count()),
-            TabRowKind::Mod => (self.ui.mod_scroll_offset, self.mod_row_count()),
-            TabRowKind::Sources => (self.ui.source_scroll_offset, self.source_row_count()),
-        };
-        let absolute = scroll + column * rows_per_column + rel_y;
-        (absolute < total).then_some(absolute)
     }
 
     pub(super) fn handle_synth_tab_input(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -1166,11 +1216,4 @@ impl App {
             self.set_instrument_param_or_plock(track, param_idx, new_val);
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum TabRowKind {
-    Synth,
-    Mod,
-    Sources,
 }

@@ -180,6 +180,28 @@ impl App {
     }
 
     fn handle_normal(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.sidebar_text_input_active()
+            && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            match code {
+                KeyCode::Char(_)
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Enter
+                | KeyCode::Esc => {
+                    BrowserState::handle_sidebar_input(self, code);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Global keys first
         match code {
             KeyCode::Char('q') => {
@@ -551,6 +573,18 @@ impl App {
             Region::Cirklon => self.handle_cirklon_input(code, modifiers),
             Region::Sidebar => BrowserState::handle_sidebar_input(self, code),
             Region::Params => self.handle_params_input(code, modifiers),
+        }
+    }
+
+    fn sidebar_text_input_active(&self) -> bool {
+        if self.ui.focused_region != Region::Sidebar {
+            return false;
+        }
+
+        match self.ui.sidebar_tab {
+            SidebarTab::Agent => true,
+            SidebarTab::Sounds => self.effective_sidebar_mode() != SidebarMode::InstrumentPicker,
+            SidebarTab::Tools => false,
         }
     }
 
@@ -1058,11 +1092,14 @@ impl App {
                     }
                 }
             } else if let Some(desc) = self.current_slot_descriptor() {
-                let row_idx = (row - l.effects_inner.y) as usize;
+                let Some(row_idx) = self.effect_row_at_position(l.effects_inner, col, row) else {
+                    return;
+                };
                 if row_idx < desc.params.len() {
                     self.ui.focused_region = Region::Params;
                     self.ui.params_column = 1;
                     self.ui.effect_param_cursor = row_idx;
+                    self.ensure_effect_cursor_visible();
                     if let Some(slot_idx) = self.selected_effect_slot() {
                         if let Some(start_display_value) =
                             self.effect_row_display_value(self.ui.cursor_track, slot_idx, row_idx)
@@ -1184,54 +1221,33 @@ impl App {
 
         if rect_contains(l.effects_inner, col, row) {
             if self.ui.effect_tab == EffectTab::Synth {
-                let visible_rows = self.synth_rows_per_column(l.effects_inner);
-                if visible_rows == 0 {
-                    return;
-                }
-                let partition_rows = self
-                    .instrument_partition_rows_per_column(l.effects_inner, self.synth_row_count());
-                let max_scroll = partition_rows.saturating_sub(visible_rows);
-                if delta < 0 {
-                    self.ui.synth_scroll_offset = self
-                        .ui
-                        .synth_scroll_offset
-                        .saturating_sub((-delta) as usize);
-                } else {
-                    self.ui.synth_scroll_offset =
-                        (self.ui.synth_scroll_offset + delta as usize).min(max_scroll);
-                }
+                self.ui.synth_scroll_offset = self.scroll_partition_offset(
+                    l.effects_inner,
+                    self.synth_row_count(),
+                    self.ui.synth_scroll_offset,
+                    delta,
+                );
             } else if self.ui.effect_tab == EffectTab::Mod {
-                let visible_rows = self.synth_rows_per_column(l.effects_inner);
-                if visible_rows == 0 {
-                    return;
-                }
-                let partition_rows = self
-                    .instrument_partition_rows_per_column(l.effects_inner, self.mod_row_count());
-                let max_scroll = partition_rows.saturating_sub(visible_rows);
-                if delta < 0 {
-                    self.ui.mod_scroll_offset =
-                        self.ui.mod_scroll_offset.saturating_sub((-delta) as usize);
-                } else {
-                    self.ui.mod_scroll_offset =
-                        (self.ui.mod_scroll_offset + delta as usize).min(max_scroll);
-                }
+                self.ui.mod_scroll_offset = self.scroll_partition_offset(
+                    l.effects_inner,
+                    self.mod_row_count(),
+                    self.ui.mod_scroll_offset,
+                    delta,
+                );
             } else if self.ui.effect_tab == EffectTab::Sources {
-                let visible_rows = self.synth_rows_per_column(l.effects_inner);
-                if visible_rows == 0 {
-                    return;
-                }
-                let partition_rows = self
-                    .instrument_partition_rows_per_column(l.effects_inner, self.source_row_count());
-                let max_scroll = partition_rows.saturating_sub(visible_rows);
-                if delta < 0 {
-                    self.ui.source_scroll_offset = self
-                        .ui
-                        .source_scroll_offset
-                        .saturating_sub((-delta) as usize);
-                } else {
-                    self.ui.source_scroll_offset =
-                        (self.ui.source_scroll_offset + delta as usize).min(max_scroll);
-                }
+                self.ui.source_scroll_offset = self.scroll_partition_offset(
+                    l.effects_inner,
+                    self.source_row_count(),
+                    self.ui.source_scroll_offset,
+                    delta,
+                );
+            } else if matches!(self.ui.effect_tab, EffectTab::Slot(_)) {
+                self.ui.effect_scroll_offset = self.scroll_partition_offset(
+                    l.effects_inner,
+                    self.effect_row_count(),
+                    self.ui.effect_scroll_offset,
+                    delta,
+                );
             }
         }
     }
